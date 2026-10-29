@@ -1,0 +1,5 @@
+# Team integration contract
+
+Shared interfaces are defined in `include/merklechain/types.hpp`. Canonical relative paths use generic slash separators, reject absolute paths, alternate data stream colons, and `.`/`..` components, and hashes use lowercase hexadecimal SHA-256. Operations are ADD, MODIFY, DELETE, UNCHANGED, and internal PRESERVE; execution states are explicit in `JobState`.
+
+Ownership proposal from the brief: Aayush owns content indexing/reference tracking; Pranav owns hashing/Merkle and block sync; Mugdha owns scheduler; Pawan owns versions; Pranjali owns TCP/networking. The current implementation provides shared types, hashing/Merkle, Local Mode copy path, a full snapshot object store with SQLite reference counts, and approved restore. The scheduler, chunk sync, network, and UI modules remain outstanding. New modules should consume these contracts rather than define competing file identity or path rules. No remote module should trust UI role claims; authorization must be checked by backend services before any write.

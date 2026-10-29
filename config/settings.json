@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "default_mode": "local",
+  "default_direction": "folder_a_to_folder_b",
+  "manual_approval": true,
+  "confirm_deletions": true,
+  "conflict_policy": "preserve_destination_backup",
+  "hash_algorithm": "SHA-256",
+  "chunking_mode": "whole_file",
+  "fixed_chunk_size_bytes": 1048576,
+  "worker_threads": 4,
+  "network_retry_limit": 3,
+  "network_connection_timeout_seconds": 10,
+  "version_retention_count": 10,
+  "full_snapshot_interval": 10,
+  "file_activity_retention_days": 90,
+  "excluded_application_directory": ".merklechain",
+  "skip_symbolic_links": true,
+  "network": {
+    "implemented": false,
+    "listen_interface": "127.0.0.1",
+    "port": 47831
+  }
+}

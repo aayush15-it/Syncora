@@ -1,0 +1,2290 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>MerkleChain — Peer Network &amp; Synchronization Console</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <aside class="sidebar" aria-label="Primary navigation">
+    <div class="sidebar-header-box">
+      <a class="brand" href="#home" data-view="home" title="Return to Mode Selection">
+        <span class="brand-mark">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2">
+            <path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/>
+            <path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/>
+          </svg>
+        </span>
+        <div class="brand-text">
+          <b>MerkleChain</b>
+          <small id="sidebar-workspace-label">Local Workspace</small>
+        </div>
+      </a>
+      <a href="#home" class="btn-mode-select" data-go="home" title="Switch between Local Sync and Network Sync">
+        <span>← Mode Selection</span>
+      </a>
+    </div>
+
+    <!-- LOCAL WORKSPACE NAV GROUP -->
+    <div class="nav-group workspace-group-local" id="nav-group-local">
+      <div class="nav-label">LOCAL WORKSPACE</div>
+      <a class="nav-link" id="nav-local-overview" href="#local-overview" data-view="local-overview"><span>⌂</span>Overview</a>
+      <a class="nav-link" id="nav-synchronize" href="#synchronize" data-view="synchronize"><span>⇄</span>Synchronize</a>
+      <a class="nav-link" id="nav-versions" href="#versions" data-view="versions"><span>◷</span>Versions &amp; Recovery</a>
+      <div class="nav-accordion">
+        <a class="nav-link" id="nav-algorithm" href="#algorithm" data-view="algorithm"><span>⌘</span>Algorithm Explorer</a>
+        <div class="nav-sub-items">
+          <a class="nav-sub" id="nav-merkle" href="#merkle" data-view="merkle">Merkle tree</a>
+          <a class="nav-sub" id="nav-chunks" href="#chunks" data-view="chunks">Chunks &amp; reuse</a>
+          <a class="nav-sub" id="nav-scheduler" href="#scheduler" data-view="scheduler">Scheduler</a>
+        </div>
+      </div>
+      <a class="nav-link" id="nav-activity" href="#activity" data-view="activity"><span>☷</span>Activity &amp; Diagnostics</a>
+    </div>
+
+    <!-- HOST DASHBOARD NAV GROUP -->
+    <div class="nav-group workspace-group-host" id="nav-group-host" style="display:none;">
+      <div class="nav-label">HOST DASHBOARD</div>
+      <a class="nav-link" id="nav-host-overview" href="#host-overview" data-view="host-overview"><span>&#8962;</span>Host Overview</a>
+      <a class="nav-link" id="nav-host-clients" href="#host-clients" data-view="host-clients"><span>&#128101;</span>Client Management</a>
+      <a class="nav-link" id="nav-host-submissions" href="#host-submissions" data-view="host-submissions"><span>&#128229;</span>Submissions</a>
+      <a class="nav-link" id="nav-host-workspace" href="#host-workspace" data-view="host-workspace"><span>&#128193;</span>Host Workspace</a>
+      <a class="nav-link" id="nav-host-review" href="#host-review" data-view="host-review"><span>&#128269;</span>Change Review</a>
+      <a class="nav-link" id="nav-host-publish" href="#host-publish" data-view="host-publish"><span>&#128640;</span>Publish Updates</a>
+      <a class="nav-link" id="nav-host-versions" href="#host-versions" data-view="host-versions"><span>&#127991;</span>Versions</a>
+      <a class="nav-link" id="nav-host-activity" href="#host-activity" data-view="host-activity"><span>&#128737;</span>Activity &amp; Security</a>
+    </div>
+
+    <!-- CLIENT WORKSPACE NAV GROUP -->
+    <div class="nav-group workspace-group-client" id="nav-group-client" style="display:none;">
+      <div class="nav-label">CLIENT WORKSPACE</div>
+      <a class="nav-link" id="nav-client-overview" href="#client-overview" data-view="client-overview"><span>&#8962;</span>Client Overview</a>
+      <a class="nav-link" id="nav-client-submit" href="#client-submit" data-view="client-submit"><span>&#128228;</span>Submit Folder</a>
+      <a class="nav-link" id="nav-client-submissions" href="#client-submissions" data-view="client-submissions"><span>&#128203;</span>My Submissions</a>
+      <a class="nav-link" id="nav-client-review" href="#client-review" data-view="client-review"><span>&#128276;</span>Review Updates</a>
+      <a class="nav-link" id="nav-client-receive" href="#client-receive" data-view="client-receive"><span>&#128229;</span>Receive Updates</a>
+      <a class="nav-link" id="nav-client-versions" href="#client-versions" data-view="client-versions"><span>&#9719;</span>Version History</a>
+      <a class="nav-link" id="nav-client-account" href="#client-account" data-view="client-account"><span>&#128100;</span>Account &amp; Access</a>
+    </div>
+
+    <!-- PEER NETWORK NAV GROUP -->
+    <div class="nav-group workspace-group-peer" id="nav-group-peer">
+      <div class="nav-label">PEER NETWORK</div>
+      <a class="nav-link" id="nav-overview" href="#overview" data-view="overview"><span>⌂</span>Overview</a>
+      <a class="nav-link" id="nav-pairing" href="#pairing" data-view="pairing"><span>▣</span>Device Pairing</a>
+      <a class="nav-link" id="nav-connection" href="#connection" data-view="connection"><span>⚡</span>Peer Connection</a>
+      <a class="nav-link" id="nav-peer-sync" href="#peer-sync" data-view="peer-sync"><span>⇄</span>Sync Center</a>
+      <a class="nav-link" id="nav-approval" href="#approval" data-view="approval"><span>✓</span>Approval Workflow</a>
+      <a class="nav-link" id="nav-progress" href="#progress" data-view="progress"><span>◷</span>Transfer Progress</a>
+      <a class="nav-link" id="nav-peer-activity" href="#peer-activity" data-view="peer-activity"><span>☷</span>Activity &amp; Recovery</a>
+    </div>
+
+    <div class="sidebar-bottom">
+      <div class="workspace-switch-card">
+        <button type="button" class="btn-switch-workspace" id="btn-toggle-workspace" data-go="overview">
+          Switch to Peer Network <span>⇄</span>
+        </button>
+      </div>
+      <a class="nav-link" id="nav-settings" href="#settings" data-view="settings"><span>⚙</span>Settings</a>
+      <div class="local-card">
+        <i id="connection-dot"></i>
+        <div>
+          <b id="connection-status">Connecting…</b>
+          <small id="connection-substatus">127.0.0.1 · Loopback</small>
+        </div>
+      </div>
+      <div class="sidebar-foot">
+        MerkleChain <span>v1.0.0</span><br>
+        Verified Merkle Tree Engine
+      </div>
+    </div>
+  </aside>
+
+  <main class="main-shell">
+    <header class="topbar" id="app-topbar">
+      <div class="crumb">
+        <span id="breadcrumb-section">Local Workspace</span>
+        <b>›</b>
+        <strong id="breadcrumb-current">Overview</strong>
+      </div>
+      <div class="top-right">
+        <div id="topbar-peer-controls" class="topbar-actions-group">
+          <button class="btn neutral btn-xs" id="btn-topbar-pairing" data-go="pairing">Device Setup</button>
+          <button class="btn forest-btn btn-xs" id="btn-topbar-conn" data-go="connection">Connection Panel →</button>
+        </div>
+        <span id="role-badge" class="mode-badge role-none">STANDBY</span>
+        <span id="workspace-mode-badge" class="state-pill active">Offline Mode</span>
+        <button class="icon-btn-minimal" data-go="settings" title="Settings" aria-label="Settings">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    
+    <!-- VIEW 0: LANDING PAGE -->
+    <section class="view active" id="view-home" data-title="Home" data-section="Landing">
+      <div class="landing-shell">
+
+                <!-- Dedicated botanical and organic background wrapper -->
+        <div class="landing-bg-decor" aria-hidden="true">
+          <!-- Subtle low-contrast organic background contours behind hero -->
+          <svg class="landing-organic-waves" viewBox="0 0 1440 900" preserveAspectRatio="none" fill="none">
+            <path d="M-60 280 C 260 160, 540 320, 880 200 C 1140 110, 1360 220, 1520 170 L 1520 0 L -60 0 Z" fill="rgba(235, 241, 233, 0.45)" />
+            <path d="M-100 420 C 320 300, 680 440, 1020 320 C 1260 230, 1420 340, 1540 300 L 1540 0 L -100 0 Z" fill="rgba(225, 234, 223, 0.32)" />
+            <path d="M-40 600 C 380 500, 720 620, 1100 520 C 1320 460, 1440 510, 1520 490 L 1520 900 L -40 900 Z" fill="rgba(238, 244, 236, 0.42)" />
+            <path d="M-50 780 C 300 700, 650 820, 1050 740 C 1280 690, 1450 750, 1520 720 L 1520 900 L -50 900 Z" fill="rgba(230, 238, 228, 0.35)" />
+          </svg>
+
+          <!-- Botanical foliage clusters growing from bottom corners -->
+          <div class="botanical-corner botanical-corner-left">
+<svg class="botanical-corner-svg" viewBox="0 0 340 380" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <defs>
+        <linearGradient id="cornerLeafGradL1" x1="0" y1="1" x2="1" y2="0">
+          <stop offset="0%" stop-color="#24442e"/>
+          <stop offset="60%" stop-color="#3c6548"/>
+          <stop offset="100%" stop-color="#547d5f"/>
+        </linearGradient>
+        <linearGradient id="cornerLeafGradL2" x1="0" y1="1" x2="1" y2="0">
+          <stop offset="0%" stop-color="#2e4e37"/>
+          <stop offset="70%" stop-color="#4a7356"/>
+          <stop offset="100%" stop-color="#6a9376"/>
+        </linearGradient>
+        <linearGradient id="cornerLeafGradL3" x1="0" y1="1" x2="1" y2="0">
+          <stop offset="0%" stop-color="#385b41"/>
+          <stop offset="50%" stop-color="#598165"/>
+          <stop offset="100%" stop-color="#7c9f86"/>
+        </linearGradient>
+        <filter id="leafShadowL" x="-10%" y="-10%" width="130%" height="130%">
+          <feDropShadow dx="2" dy="4" stdDeviation="4" flood-color="#1b3322" flood-opacity="0.12"/>
+        </filter>
+      </defs>
+
+      <!-- Deep background foliage layer (soft translucent sage) -->
+      <g opacity="0.45" filter="url(#leafShadowL)">
+        <path d="M 0 380 C 20 320 50 250 90 190 C 120 145 155 110 180 80" stroke="#3d6247" stroke-width="2.2" stroke-linecap="round"/>
+        <path d="M 90 190 C 70 170 65 140 80 115 C 95 130 105 160 90 190 Z" fill="#6d9178"/>
+        <path d="M 130 145 C 125 115 140 90 165 75 C 168 100 155 125 130 145 Z" fill="#5f836b"/>
+        <path d="M 180 80 C 190 55 215 40 235 45 C 225 70 205 85 180 80 Z" fill="#71947b"/>
+      </g>
+
+      <!-- Primary main branch rising from bottom-left corner -->
+      <g filter="url(#leafShadowL)">
+        <path d="M -10 390 C 35 340 70 270 110 195 C 135 150 160 100 190 50" stroke="#25432f" stroke-width="3.5" stroke-linecap="round"/>
+
+        <!-- Leaf 1 (wide base leaf near bottom edge) -->
+        <g opacity="0.95">
+          <path d="M 25 365 C 55 375 90 365 115 345 C 95 325 60 325 25 340 Z" fill="url(#cornerLeafGradL1)"/>
+          <path d="M 25 352 C 55 352 85 350 115 345" stroke="rgba(255,255,255,0.25)" stroke-width="1.3" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 2 (upward broad leaf) -->
+        <g opacity="0.96">
+          <path d="M 45 330 C 70 320 95 295 110 265 C 85 260 55 275 35 305 Z" fill="url(#cornerLeafGradL2)"/>
+          <path d="M 40 317 C 65 302 88 285 110 265" stroke="rgba(255,255,255,0.28)" stroke-width="1.3" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 3 (extending inward toward card) -->
+        <g opacity="0.92">
+          <path d="M 75 300 C 115 315 160 310 190 285 C 165 265 125 265 85 282 Z" fill="url(#cornerLeafGradL1)"/>
+          <path d="M 80 291 C 115 296 155 292 190 285" stroke="rgba(255,255,255,0.22)" stroke-width="1.2" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 4 (mid ascending leaf) -->
+        <g opacity="0.95">
+          <path d="M 85 245 C 75 205 85 170 115 145 C 125 175 120 215 95 240 Z" fill="url(#cornerLeafGradL3)"/>
+          <path d="M 90 242 C 95 210 102 180 115 145" stroke="rgba(255,255,255,0.26)" stroke-width="1.2" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 5 (inward reach leaf) -->
+        <g opacity="0.94">
+          <path d="M 105 205 C 145 205 185 190 210 165 C 185 148 145 155 115 185 Z" fill="url(#cornerLeafGradL2)"/>
+          <path d="M 110 195 C 140 190 175 180 210 165" stroke="rgba(255,255,255,0.25)" stroke-width="1.3" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 6 (upper outer leaf) -->
+        <g opacity="0.90">
+          <path d="M 125 165 C 110 130 115 95 140 70 C 152 100 150 135 135 160 Z" fill="url(#cornerLeafGradL1)"/>
+          <path d="M 130 162 C 128 135 132 105 140 70" stroke="rgba(255,255,255,0.24)" stroke-width="1.2" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 7 (top graceful leaf extending inward) -->
+        <g opacity="0.93">
+          <path d="M 155 115 C 190 105 220 85 235 60 C 210 55 175 68 155 95 Z" fill="url(#cornerLeafGradL3)"/>
+          <path d="M 155 105 C 180 95 208 80 235 60" stroke="rgba(255,255,255,0.25)" stroke-width="1.2" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 8 (terminal apex leaf) -->
+        <g opacity="0.95">
+          <path d="M 185 58 C 195 35 210 20 225 10 C 220 30 210 48 192 60 Z" fill="url(#cornerLeafGradL2)"/>
+          <path d="M 188 56 C 200 42 212 28 225 10" stroke="rgba(255,255,255,0.28)" stroke-width="1.0" stroke-linecap="round"/>
+        </g>
+      </g>
+
+      <!-- Small delicate foreground sprout -->
+      <g opacity="0.88">
+        <path d="M 10 380 C 35 360 65 355 90 350" stroke="#31533b" stroke-width="2" stroke-linecap="round"/>
+        <path d="M 50 365 C 60 350 75 348 85 352 C 78 362 65 368 50 365 Z" fill="#587e63"/>
+      </g>
+    </svg>
+          </div>
+          <div class="botanical-corner botanical-corner-right">
+<svg class="botanical-corner-svg" viewBox="0 0 340 380" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <defs>
+        <linearGradient id="cornerLeafGradR1" x1="1" y1="1" x2="0" y2="0">
+          <stop offset="0%" stop-color="#24442e"/>
+          <stop offset="60%" stop-color="#3c6548"/>
+          <stop offset="100%" stop-color="#547d5f"/>
+        </linearGradient>
+        <linearGradient id="cornerLeafGradR2" x1="1" y1="1" x2="0" y2="0">
+          <stop offset="0%" stop-color="#2e4e37"/>
+          <stop offset="70%" stop-color="#4a7356"/>
+          <stop offset="100%" stop-color="#6a9376"/>
+        </linearGradient>
+        <linearGradient id="cornerLeafGradR3" x1="1" y1="1" x2="0" y2="0">
+          <stop offset="0%" stop-color="#385b41"/>
+          <stop offset="50%" stop-color="#598165"/>
+          <stop offset="100%" stop-color="#7c9f86"/>
+        </linearGradient>
+        <filter id="leafShadowR" x="-10%" y="-10%" width="130%" height="130%">
+          <feDropShadow dx="-2" dy="4" stdDeviation="4" flood-color="#1b3322" flood-opacity="0.12"/>
+        </filter>
+      </defs>
+
+      <!-- Deep background foliage layer (soft translucent sage) -->
+      <g opacity="0.45" filter="url(#leafShadowR)">
+        <path d="M 340 380 C 315 315 285 245 245 185 C 215 140 180 105 155 75" stroke="#3d6247" stroke-width="2.2" stroke-linecap="round"/>
+        <path d="M 245 185 C 265 165 270 135 255 110 C 240 125 230 155 245 185 Z" fill="#6d9178"/>
+        <path d="M 205 140 C 210 110 195 85 170 70 C 168 95 180 120 205 140 Z" fill="#5f836b"/>
+        <path d="M 155 75 C 145 50 120 35 100 40 C 110 65 130 80 155 75 Z" fill="#71947b"/>
+      </g>
+
+      <!-- Primary main branch rising from bottom-right corner -->
+      <g filter="url(#leafShadowR)">
+        <path d="M 350 390 C 300 335 265 265 225 190 C 200 145 175 95 145 45" stroke="#25432f" stroke-width="3.5" stroke-linecap="round"/>
+
+        <!-- Leaf 1 (wide base leaf near bottom edge) -->
+        <g opacity="0.95">
+          <path d="M 315 365 C 285 375 250 365 225 345 C 245 325 280 325 315 340 Z" fill="url(#cornerLeafGradR1)"/>
+          <path d="M 315 352 C 285 352 255 350 225 345" stroke="rgba(255,255,255,0.25)" stroke-width="1.3" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 2 (upward broad leaf) -->
+        <g opacity="0.96">
+          <path d="M 295 330 C 270 320 245 295 230 265 C 255 260 285 275 305 305 Z" fill="url(#cornerLeafGradR2)"/>
+          <path d="M 300 317 C 275 302 252 285 230 265" stroke="rgba(255,255,255,0.28)" stroke-width="1.3" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 3 (extending inward toward card) -->
+        <g opacity="0.92">
+          <path d="M 265 300 C 225 315 180 310 150 285 C 175 265 215 265 255 282 Z" fill="url(#cornerLeafGradR1)"/>
+          <path d="M 260 291 C 225 296 185 292 150 285" stroke="rgba(255,255,255,0.22)" stroke-width="1.2" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 4 (mid ascending leaf) -->
+        <g opacity="0.95">
+          <path d="M 255 245 C 265 205 255 170 225 145 C 215 175 220 215 245 240 Z" fill="url(#cornerLeafGradR3)"/>
+          <path d="M 250 242 C 245 210 238 180 225 145" stroke="rgba(255,255,255,0.26)" stroke-width="1.2" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 5 (inward reach leaf) -->
+        <g opacity="0.94">
+          <path d="M 235 205 C 195 205 155 190 130 165 C 155 148 195 155 225 185 Z" fill="url(#cornerLeafGradR2)"/>
+          <path d="M 230 195 C 200 190 165 180 130 165" stroke="rgba(255,255,255,0.25)" stroke-width="1.3" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 6 (upper outer leaf) -->
+        <g opacity="0.90">
+          <path d="M 215 165 C 230 130 225 95 200 70 C 188 100 190 135 205 160 Z" fill="url(#cornerLeafGradR1)"/>
+          <path d="M 210 162 C 212 135 208 105 200 70" stroke="rgba(255,255,255,0.24)" stroke-width="1.2" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 7 (top graceful leaf extending inward) -->
+        <g opacity="0.93">
+          <path d="M 185 115 C 150 105 120 85 105 60 C 130 55 165 68 185 95 Z" fill="url(#cornerLeafGradR3)"/>
+          <path d="M 185 105 C 160 95 132 80 105 60" stroke="rgba(255,255,255,0.25)" stroke-width="1.2" stroke-linecap="round"/>
+        </g>
+
+        <!-- Leaf 8 (terminal apex leaf) -->
+        <g opacity="0.95">
+          <path d="M 155 58 C 145 35 130 20 115 10 C 120 30 130 48 148 60 Z" fill="url(#cornerLeafGradR2)"/>
+          <path d="M 152 56 C 140 42 128 28 115 10" stroke="rgba(255,255,255,0.28)" stroke-width="1.0" stroke-linecap="round"/>
+        </g>
+      </g>
+
+      <!-- Small delicate foreground sprout -->
+      <g opacity="0.88">
+        <path d="M 330 380 C 305 360 275 355 250 350" stroke="#31533b" stroke-width="2" stroke-linecap="round"/>
+        <path d="M 290 365 C 280 350 265 348 255 352 C 262 362 275 368 290 365 Z" fill="#587e63"/>
+      </g>
+    </svg>
+          </div>
+        </div>
+
+        <header class="landing-top-bar">
+          <div class="landing-brand">
+            <svg class="landing-leaf" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/>
+              <path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/>
+            </svg>
+            <span class="landing-brand-name">MerkleChain</span>
+          </div>
+          <div class="landing-top-right">
+            <nav class="landing-top-nav" aria-label="Direct workspace access">
+              <a href="#local-overview" data-go="local-overview" class="btn neutral btn-xs">Local Workspace</a>
+              <a href="#network-select" data-go="network-select" class="btn forest-btn btn-xs">Network Model (Host / Client)</a>
+              <a href="#overview" data-go="overview" class="btn neutral btn-xs">Peer Network</a>
+            </nav>
+            <span class="landing-kicker-desc">FILE SYNCHRONIZATION ENGINE</span>
+            <button class="icon-btn-minimal" data-go="settings" title="Engine Settings" aria-label="Settings">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <div class="landing-hero-center">
+          <h1 class="landing-serif-headline">Your files. In sync.<br>Every change verified.</h1>
+          <p class="landing-serif-subhead">Synchronize folders locally or across trusted devices, with hash-based integrity verification and controlled recovery.</p>
+
+          <div class="landing-cards-row">
+            <!-- 1. Local Workspace Card -->
+            <article class="landing-mode-card" id="landing-card-local">
+              <div class="mode-illu-container">
+                <div class="folder-illu-art">
+                  <div class="folder-illu-tab"></div>
+                  <div class="folder-illu-back"></div>
+                  <div class="folder-illu-front">
+                    <div class="sync-disc-badge">
+                      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                      </svg>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="mode-info">
+                <div class="mode-tag-pill">LOCAL ENGINE</div>
+                <h2>Local Workspace</h2>
+                <p>Synchronize two local folders, detect file changes, verify integrity, and inspect synchronization history.</p>
+                <a href="#local-overview" class="btn forest-btn" id="btn-landing-local" data-go="local-overview">Open Local Workspace <span>→</span></a>
+              </div>
+            </article>
+
+            <!-- 2. Network Model (Host-Client Collaboration) Card -->
+            <article class="landing-mode-card" id="landing-card-collab">
+              <div class="mode-illu-container">
+                <div class="network-illu-art collab-illu-wrap">
+                  <div class="laptop-device laptop-left">
+                    <div class="laptop-screen"></div>
+                    <div class="laptop-base"></div>
+                  </div>
+                  <div class="network-shield-badge collab-badge-accent">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+                      <circle cx="9" cy="7" r="4"/>
+                      <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+                      <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                    </svg>
+                  </div>
+                  <div class="laptop-device laptop-right">
+                    <div class="laptop-screen"></div>
+                    <div class="laptop-base"></div>
+                  </div>
+                </div>
+              </div>
+              <div class="mode-info">
+                <div class="mode-tag-pill mode-tag-highlight">TEAM COLLABORATION</div>
+                <h2>Network Model</h2>
+                <p>Share folders with authorized clients, review submitted files, edit working copies, publish versions, and distribute approved updates.</p>
+                <a href="#network-select" class="btn forest-btn" id="btn-landing-collab" data-go="network-select">Open Network Model <span>→</span></a>
+              </div>
+            </article>
+
+            <!-- 3. Peer Network (TLS P2P) Card -->
+            <article class="landing-mode-card" id="landing-card-network">
+              <div class="mode-illu-container">
+                <div class="network-illu-art">
+                  <div class="laptop-device laptop-left">
+                    <div class="laptop-screen"></div>
+                    <div class="laptop-base"></div>
+                  </div>
+                  <div class="network-shield-badge">
+                    <svg class="wifi-radiate" viewBox="0 0 24 24" width="22" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                      <path d="M5 12.55a11 11 0 0 1 14.08 0M8.5 15.55a6 6 0 0 1 7.08 0"/>
+                    </svg>
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                      <path d="m9 12 2 2 4-4"/>
+                    </svg>
+                  </div>
+                  <div class="laptop-device laptop-right">
+                    <div class="laptop-screen"></div>
+                    <div class="laptop-base"></div>
+                  </div>
+                </div>
+              </div>
+              <div class="mode-info">
+                <div class="mode-tag-pill">P2P DEVICE PAIRING</div>
+                <h2>Peer Network</h2>
+                <p>Pair trusted devices and synchronize through mutual TLS authenticated connections with certificate pinning.</p>
+                <a href="#overview" class="btn neutral" id="btn-landing-network" data-go="overview">Open Peer Network <span>→</span></a>
+              </div>
+            </article>
+          </div>
+
+          <!-- Feature Strip -->
+          <div class="landing-feature-strip">
+            <div class="landing-feature-col">
+              <div class="feat-icon-wrap">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/>
+                  <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9M12 12v3"/>
+                </svg>
+              </div>
+              <div class="feat-labels">
+                <b>Merkle Trees</b>
+                <small>Integrity verification</small>
+              </div>
+            </div>
+
+            <div class="landing-feature-col">
+              <div class="feat-icon-wrap">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                  <polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/>
+                </svg>
+              </div>
+              <div class="feat-labels">
+                <b>Chunk Reuse</b>
+                <small>Efficient synchronization</small>
+              </div>
+            </div>
+
+            <div class="landing-feature-col">
+              <div class="feat-icon-wrap">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                  <path d="m9 12 2 2 4-4"/>
+                </svg>
+              </div>
+              <div class="feat-labels">
+                <b>Secure by Design</b>
+                <small>mTLS &amp; certificate pinning</small>
+              </div>
+            </div>
+
+            <div class="landing-feature-col">
+              <div class="feat-icon-wrap">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+                </svg>
+              </div>
+              <div class="feat-labels">
+                <b>Versioned History</b>
+                <small>Safe recovery</small>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- VIEW 0.5: LOCAL WORKSPACE OVERVIEW -->
+    <section class="view" id="view-local-overview" data-title="Overview" data-section="Local Workspace">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">LOCAL WORKSPACE</div>
+          <h1 class="serif-title">Local Workspace</h1>
+          <p>Select two folders, compare changes, and synchronize safely with full verification.</p>
+        </div>
+        <div class="heading-actions">
+          <button class="btn neutral" data-go="home">← Mode Selection</button>
+          <button class="btn forest-btn" data-go="synchronize">Synchronize Folders →</button>
+        </div>
+      </div>
+
+      <!-- 4 Action Cards -->
+      <div class="workspace-action-grid">
+        <article class="action-summary-card" data-go="synchronize">
+          <div class="action-card-icon">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+              <path d="M12 11v6m3-3H9"/>
+            </svg>
+          </div>
+          <h3>Synchronize</h3>
+          <p class="muted">Choose files, compare changes, and sync</p>
+          <span class="action-arrow">→</span>
+        </article>
+
+        <article class="action-summary-card" data-go="versions">
+          <div class="action-card-icon">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="12 2 2 7 12 12 22 7 12 2"/>
+              <polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>
+            </svg>
+          </div>
+          <h3>Versions &amp; Recovery</h3>
+          <p class="muted">Browse snapshots and restore</p>
+          <span class="action-arrow">→</span>
+        </article>
+
+        <article class="action-summary-card" data-go="algorithm">
+          <div class="action-card-icon">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/>
+              <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9M12 12v3"/>
+            </svg>
+          </div>
+          <h3>Algorithm Explorer</h3>
+          <p class="muted">Merkle Tree, Chunks, Scheduler</p>
+          <span class="action-arrow">→</span>
+        </article>
+
+        <article class="action-summary-card" data-go="activity">
+          <div class="action-card-icon">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+            </svg>
+          </div>
+          <h3>Activity &amp; Diagnostics</h3>
+          <p class="muted">View logs, results and integrity checks</p>
+          <span class="action-arrow">→</span>
+        </article>
+      </div>
+
+      <!-- Recent Synchronizations Card -->
+      <article class="card table-card" style="margin-top: 1.5rem;">
+        <div class="table-head">
+          <div>
+            <div class="kicker">HISTORY</div>
+            <h3>Recent Synchronizations</h3>
+          </div>
+          <button class="btn neutral btn-xs" data-go="activity">View All →</button>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Source Folder</th>
+                <th>Destination Folder</th>
+                <th>Status</th>
+                <th>Changes</th>
+              </tr>
+            </thead>
+            <tbody id="recent-sync-rows">
+              <!-- Populated from real SQLite records or truthful empty state -->
+            </tbody>
+          </table>
+          <p id="recent-sync-empty" class="empty">No recent local synchronizations recorded. Configure and run a comparison in Synchronize.</p>
+        </div>
+      </article>
+    </section>
+
+    <!-- VIEW 1: OVERVIEW -->
+    <section class="view" id="view-overview" data-title="Overview" data-section="Peer Network">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">DEVICE IDENTITY &amp; SYNCHRONIZATION STATUS</div>
+          <h1>Network Overview</h1>
+          <p>Current device role, peer link status, last verified synchronization, and integrity summary.</p>
+        </div>
+        <div class="heading-actions">
+          <button class="btn neutral" data-go="pairing">Device Setup</button>
+          <button class="btn primary" data-go="connection">Connection Panel <span>→</span></button>
+        </div>
+      </div>
+
+      <div class="overview-grid">
+        <article class="card overview-state">
+          <div class="card-head">
+            <div>
+              <div class="kicker">LOCAL DEVICE PROFILE</div>
+              <h2 id="overview-device-id">Unconfigured</h2>
+            </div>
+            <span id="overview-role-badge" class="badge">NO ROLE</span>
+          </div>
+          <div class="profile-details">
+            <div class="detail-row">
+              <small>PEER SERVICE STATE</small>
+              <b id="overview-peer-state">IDLE</b>
+            </div>
+            <div class="detail-row">
+              <small>SYNC ROOT FOLDER</small>
+              <code id="overview-sync-root">Not configured</code>
+            </div>
+            <div class="detail-row">
+              <small>PEER ENDPOINT</small>
+              <code id="overview-peer-endpoint">—</code>
+            </div>
+          </div>
+          <div class="card-foot">
+            <span id="overview-last-sync-time">No peer sync recorded this session</span>
+            <button class="link-button" data-go="progress">View progress →</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-head">
+            <div>
+              <div class="kicker">INTEGRITY &amp; SECURITY</div>
+              <h2>Peer Security Status</h2>
+            </div>
+            <span class="badge badge-subtle">mTLS Pinning</span>
+          </div>
+          <div class="security-list">
+            <div class="sec-item">
+              <div class="sec-dot" id="sec-cert-dot"></div>
+              <div>
+                <b>Local Certificate Pin</b>
+                <code id="overview-local-pin">—</code>
+              </div>
+            </div>
+            <div class="sec-item">
+              <div class="sec-dot" id="sec-peer-dot"></div>
+              <div>
+                <b>Expected Peer Pin</b>
+                <code id="overview-expected-pin">—</code>
+              </div>
+            </div>
+            <div class="sec-item">
+              <div class="sec-dot" id="sec-handshake-dot"></div>
+              <div>
+                <b>Mutual TLS Handshake</b>
+                <span id="overview-handshake-text" class="muted">Awaiting connection</span>
+              </div>
+            </div>
+          </div>
+          <div class="muted foot-note">Leaf certificate SHA-256 fingerprint verified bidirectionally before plan exchange.</div>
+        </article>
+      </div>
+
+      <div class="overview-grid lower">
+        <article class="card">
+          <div class="card-head">
+            <div>
+              <div class="kicker">ACTIVE SYNCHRONIZATION PLAN</div>
+              <h2>Current Proposed Operations</h2>
+            </div>
+            <button class="link-button" data-go="peer-sync">Open Sync Center →</button>
+          </div>
+          <div id="overview-peer-counts" class="count-row">
+            <p class="empty">No active plan in negotiation.</p>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-head">
+            <div>
+              <div class="kicker">RECENT PEER TRANSACTIONS</div>
+              <h2>Persisted Session History</h2>
+            </div>
+            <button class="link-button" data-go="peer-activity">Full History →</button>
+          </div>
+          <div id="overview-peer-recent" class="mini-list">
+            <p class="empty">No peer sessions recorded in SQLite.</p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- VIEW 2: DEVICE PAIRING -->
+    <section class="view" id="view-pairing" data-title="Device Pairing" data-section="Peer Network">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">TWO-LAPTOP SETUP &amp; CREDENTIALS</div>
+          <h1>Device Pairing &amp; Configuration</h1>
+          <p>Configure local identity, mTLS certificates, expected peer SHA-256 pin, and network addresses.</p>
+        </div>
+        <button id="btn-validate-config" class="btn neutral">Validate Configuration</button>
+      </div>
+
+      <form id="pairing-form" class="config-form">
+        <div class="form-grid">
+          <article class="card">
+            <div class="card-head">
+              <h3>1. Role &amp; Local Identity</h3>
+            </div>
+            <div class="field-group">
+              <label for="cfg-role">Device Role</label>
+              <select id="cfg-role">
+                <option value="host">Host (Listen on network port for peer connection)</option>
+                <option value="client">Client (Initiate connection to host peer)</option>
+              </select>
+              <small class="field-help">Choose Host for the listening machine; Client for the initiating machine.</small>
+            </div>
+            <div class="field-group">
+              <label for="cfg-device-id">Local Device Identifier</label>
+              <input id="cfg-device-id" type="text" placeholder="e.g. laptop-alpha" required>
+              <small class="field-help">Alphanumeric ID sent in peer handshake for mutual verification.</small>
+            </div>
+            <div class="field-group">
+              <label for="cfg-sync-root">Sync Root Directory</label>
+              <div class="path-line">
+                <input id="cfg-sync-root" type="text" placeholder="C:\path\to\sync_folder" required>
+                <button type="button" class="btn neutral browse-peer-root">Browse</button>
+              </div>
+              <small class="field-help">Local folder replicated with peer. Must exist and be accessible.</small>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>2. Network Endpoint</h3>
+            </div>
+            <div class="field-group">
+              <label for="cfg-peer-addr">Peer Host / Listen Address</label>
+              <input id="cfg-peer-addr" type="text" placeholder="e.g. 192.168.1.105 (Client) or 0.0.0.0 (Host)">
+              <small class="field-help">For Host: 0.0.0.0 or LAN IP. For Client: IPv4 address of Laptop A.</small>
+            </div>
+            <div class="field-group">
+              <label for="cfg-peer-port">Peer Service Port</label>
+              <input id="cfg-peer-port" type="number" min="1024" max="65535" value="47832">
+              <small class="field-help">Dedicated mTLS port for peer data transfer (default 47832).</small>
+            </div>
+          </article>
+
+          <article class="card full-width">
+            <div class="card-head">
+              <h3>3. Mutual TLS Certificates &amp; Pinning</h3>
+              <span class="badge badge-subtle">Never exposes private keys</span>
+            </div>
+            <div class="cert-grid">
+              <div class="field-group">
+                <label for="cfg-cert-path">Local Certificate (PEM)</label>
+                <input id="cfg-cert-path" type="text" placeholder="certs/host.crt or certs/client.crt">
+                <small class="field-help">Public X.509 certificate presented to peer.</small>
+              </div>
+              <div class="field-group">
+                <label for="cfg-key-path">Local Private Key (PEM)</label>
+                <input id="cfg-key-path" type="text" placeholder="certs/host.key or certs/client.key">
+                <small class="field-help">Kept strictly in C++ engine memory; never logged or returned by API.</small>
+              </div>
+              <div class="field-group">
+                <label for="cfg-ca-path">CA Certificate (PEM)</label>
+                <input id="cfg-ca-path" type="text" placeholder="certs/ca.crt">
+                <small class="field-help">Common Root CA verifying both certificates.</small>
+              </div>
+              <div class="field-group">
+                <label for="cfg-expected-pin">Expected Peer Certificate Pin (SHA-256 Hex)</label>
+                <input id="cfg-expected-pin" type="text" placeholder="64-character SHA-256 fingerprint of peer certificate" maxlength="64">
+                <small class="field-help">Mandatory certificate-pinning: handshake aborts if peer pin mismatches.</small>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <div id="validation-report" class="card validation-card hidden">
+          <div class="card-head">
+            <h3>Configuration Validation Report</h3>
+            <span id="val-badge" class="badge">Checking…</span>
+          </div>
+          <div id="val-details" class="val-details"></div>
+          <div class="val-fingerprint-box">
+            <small>THIS DEVICE'S CERTIFICATE PIN (Share with other laptop):</small>
+            <div class="pin-copy-row">
+              <code id="val-local-pin">—</code>
+              <button type="button" id="btn-copy-pin" class="btn neutral">Copy Pin</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <p id="pairing-status" class="status-msg" role="status"></p>
+          <button type="submit" id="btn-save-config" class="btn primary">Save &amp; Activate Configuration <span>→</span></button>
+        </div>
+      </form>
+    </section>
+
+    <!-- VIEW 3: PEER CONNECTION -->
+    <section class="view" id="view-connection" data-title="Peer Connection" data-section="Peer Network">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">SERVICE LIFECYCLE &amp; AUTHENTICATION</div>
+          <h1>Peer Connection Control</h1>
+          <p>Start listener on Host or initiate authenticated synchronization connection from Client.</p>
+        </div>
+        <span id="conn-state-badge" class="badge">STOPPED</span>
+      </div>
+
+      <div class="overview-grid">
+        <article class="card">
+          <div class="card-head">
+            <div>
+              <div class="kicker">CONNECTION CONTROLS</div>
+              <h2>Service Control</h2>
+            </div>
+            <span id="conn-role-pill" class="pill">—</span>
+          </div>
+
+          <div class="conn-action-box">
+            <p id="conn-instruction" class="muted">Configure role and credentials in Device Pairing before starting.</p>
+            <div class="button-bar">
+              <button id="btn-start-service" class="btn primary">Start Service <span>▶</span></button>
+              <button id="btn-stop-service" class="btn danger" disabled>Stop / Abort <span>■</span></button>
+            </div>
+          </div>
+
+          <div class="conn-metrics">
+            <div class="metric-col">
+              <small>CURRENT PHASE</small>
+              <b id="conn-phase">Idle</b>
+            </div>
+            <div class="metric-col">
+              <small>SESSION ID</small>
+              <code id="conn-session-id">—</code>
+            </div>
+            <div class="metric-col">
+              <small>REMOTE PEER</small>
+              <b id="conn-remote-id">—</b>
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-head">
+            <div>
+              <div class="kicker">SECURITY &amp; HANDSHAKE LOG</div>
+              <h2>Authentication Results</h2>
+            </div>
+          </div>
+
+          <div class="auth-box">
+            <div class="auth-row">
+              <span>Mutual TLS Negotiated:</span>
+              <b id="auth-tls-status">Not connected</b>
+            </div>
+            <div class="auth-row">
+              <span>Peer Certificate Pin:</span>
+              <b id="auth-pin-status">—</b>
+            </div>
+            <div class="auth-row">
+              <span>Peer Identity Validated:</span>
+              <b id="auth-identity-status">—</b>
+            </div>
+            <div class="auth-row">
+              <span>Last Error / Diagnostics:</span>
+              <span id="auth-error" class="error-text">None</span>
+            </div>
+          </div>
+        </article>
+      </div>
+
+      <article class="card live-status-card">
+        <div class="card-head">
+          <div class="kicker">LIVE ENGINE STATUS</div>
+          <h3>Real-time Service Activity</h3>
+        </div>
+        <div id="conn-live-log" class="conn-live-log">
+          <div class="log-entry">Engine awaiting start command.</div>
+        </div>
+      </article>
+    </section>
+
+    <!-- VIEW 4: SYNCHRONIZATION CENTER -->
+    <section class="view" id="view-peer-sync" data-title="Sync Center" data-section="Peer Network">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">MERKLE COMPARISON &amp; REPLICATION PLAN</div>
+          <h1>Synchronization Center</h1>
+          <p>Review the exact bilateral synchronization plan negotiated with the peer.</p>
+        </div>
+        <div class="heading-actions">
+          <button id="btn-refresh-plan" class="btn neutral">Refresh Plan</button>
+          <button class="btn primary" data-go="approval">Review Approval <span>→</span></button>
+        </div>
+      </div>
+
+      <div id="peer-conflict-banner" class="alert-banner alert-danger hidden" role="alert">
+        <span class="alert-icon">⚠</span>
+        <div>
+          <b>Unresolved Conflicts Detected</b>
+          <p>One or more files have been modified independently on both machines. Under MerkleChain safety rules, commit is strictly blocked until conflicts are resolved.</p>
+        </div>
+      </div>
+
+      <div class="summary-cards six" id="peer-plan-metrics">
+        <div class="summary-card"><small>ADD LOCAL</small><b id="cnt-add-local">0</b></div>
+        <div class="summary-card"><small>UPDATE LOCAL</small><b id="cnt-update-local">0</b></div>
+        <div class="summary-card"><small>DELETE LOCAL</small><b id="cnt-del-local" class="danger-text">0</b></div>
+        <div class="summary-card"><small>ADD REMOTE</small><b id="cnt-add-remote">0</b></div>
+        <div class="summary-card"><small>UPDATE REMOTE</small><b id="cnt-update-remote">0</b></div>
+        <div class="summary-card"><small>CONFLICTS</small><b id="cnt-conflicts" class="warning-text">0</b></div>
+      </div>
+
+      <article class="card table-card">
+        <div class="table-head">
+          <div>
+            <h3>Proposed Changes <span id="peer-plan-count">(0)</span></h3>
+            <p id="peer-plan-summary" class="muted">No active plan.</p>
+          </div>
+          <div class="table-tools">
+            <input id="search-peer-files" type="search" placeholder="⌕ Search relative paths…">
+            <select id="filter-peer-op">
+              <option value="ALL">All Actions</option>
+              <option value="AddLocal">Add Local</option>
+              <option value="UpdateLocal">Update Local</option>
+              <option value="DeleteLocal">Delete Local</option>
+              <option value="AddRemote">Add Remote</option>
+              <option value="UpdateRemote">Update Remote</option>
+              <option value="DeleteRemote">Delete Remote</option>
+              <option value="Conflict">Conflict</option>
+              <option value="PreserveBoth">Preserve Both</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Relative Path</th>
+                <th>Action</th>
+                <th>Local Size</th>
+                <th>Remote Size</th>
+                <th>Conflict</th>
+                <th>Digest</th>
+              </tr>
+            </thead>
+            <tbody id="peer-plan-rows"></tbody>
+          </table>
+          <p id="empty-peer-plan" class="empty">No synchronization plan currently loaded from peer session.</p>
+        </div>
+        <div class="table-note">
+          MerkleChain computes content digests using SHA-256. Actions require explicit cryptographic authorization before disk writes occur.
+        </div>
+      </article>
+    </section>
+
+    <!-- VIEW 5: APPROVAL WORKFLOW -->
+    <section class="view" id="view-approval" data-title="Approval Workflow" data-section="Peer Network">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">CRYPTOGRAPHIC AUTHORIZATION</div>
+          <h1>Approval Workflow</h1>
+          <p>Cryptographically verify and authorize or decline the exact negotiated plan before execution.</p>
+        </div>
+        <span id="approval-session-badge" class="badge">AWAITING REVIEW</span>
+      </div>
+
+      <div class="overview-grid">
+        <article class="card">
+          <div class="card-head">
+            <div>
+              <div class="kicker">SESSION BINDING</div>
+              <h2>Plan Cryptographic Hashes</h2>
+            </div>
+            <span class="badge badge-subtle">SHA-256 Plan Hash</span>
+          </div>
+          <div class="approval-meta-grid">
+            <div class="meta-row">
+              <small>SESSION ID</small>
+              <code id="appr-session-id">—</code>
+            </div>
+            <div class="meta-row">
+              <small>PLAN HASH</small>
+              <code id="appr-plan-hash">—</code>
+            </div>
+            <div class="meta-row">
+              <small>REMOTE MERKLE ROOT</small>
+              <code id="appr-remote-root">—</code>
+            </div>
+            <div class="meta-row">
+              <small>LOCAL MERKLE ROOT</small>
+              <code id="appr-local-root">—</code>
+            </div>
+          </div>
+          <div class="muted foot-note">
+            The plan hash cryptographically binds every proposed file mutation. If either endpoint alters files prior to commit, the hash fails verification.
+          </div>
+        </article>
+
+        <article class="card approval-decision-card">
+          <div class="card-head">
+            <div>
+              <div class="kicker">MANDATORY AUTHORIZATION</div>
+              <h2>Authorize Mutations</h2>
+            </div>
+          </div>
+
+          <div class="approval-form-body">
+            <p class="muted">
+              By checking the box below, you authorize MerkleChain to apply the planned additions and modifications.
+            </p>
+
+            <label class="check-line">
+              <input id="chk-peer-approve" type="checkbox">
+              <span></span>
+              <strong>I approve the planned file additions and modifications.</strong>
+            </label>
+
+            <div id="peer-deletion-prompt" class="deletion-alert-box hidden">
+              <label class="check-line danger-check">
+                <input id="chk-peer-confirm-del" type="checkbox">
+                <span></span>
+                <strong class="danger-text">I separately confirm the permanent deletion of <span id="del-count-display">0</span> files.</strong>
+              </label>
+              <small class="danger-sub">Destructive action: deleted files cannot be restored unless a previous snapshot exists.</small>
+            </div>
+
+            <div class="decision-buttons">
+              <button id="btn-peer-decline" class="btn neutral danger-hover">Decline / Cancel Plan</button>
+              <button id="btn-peer-commit" class="btn primary" disabled>Approve &amp; Proceed to Transfer <span>→</span></button>
+            </div>
+
+            <p id="approval-feedback" class="status-msg" role="status"></p>
+          </div>
+        </article>
+      </div>
+
+      <article id="peer-approval-result" class="card result hidden" aria-live="polite"></article>
+    </section>
+
+    <!-- VIEW 6: TRANSFER PROGRESS -->
+    <section class="view" id="view-progress" data-title="Transfer Progress" data-section="Peer Network">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">HONEST EXECUTION METRICS</div>
+          <h1>Transfer Progress</h1>
+          <p>Live, honest status reported by the C++ peer engine without fabricated percentages.</p>
+        </div>
+        <span id="progress-phase-badge" class="badge">IDLE</span>
+      </div>
+
+      <div class="progress-container card">
+        <div class="progress-phase-track">
+          <div class="track-step" id="pstep-listen"><span>1</span><small>Listen / Connect</small></div>
+          <div class="track-line"></div>
+          <div class="track-step" id="pstep-handshake"><span>2</span><small>mTLS Handshake</small></div>
+          <div class="track-line"></div>
+          <div class="track-step" id="pstep-manifest"><span>3</span><small>Manifest Exchange</small></div>
+          <div class="track-line"></div>
+          <div class="track-step" id="pstep-plan"><span>4</span><small>Merkle Plan</small></div>
+          <div class="track-line"></div>
+          <div class="track-step" id="pstep-approve"><span>5</span><small>Plan Approval</small></div>
+          <div class="track-line"></div>
+          <div class="track-step" id="pstep-transfer"><span>6</span><small>File Transfer</small></div>
+          <div class="track-line"></div>
+          <div class="track-step" id="pstep-commit"><span>7</span><small>Bilateral Commit</small></div>
+        </div>
+
+        <div class="progress-stats-grid">
+          <div class="pstat-box">
+            <small>CURRENT FILE</small>
+            <code id="prog-current-file">None</code>
+          </div>
+          <div class="pstat-box">
+            <small>BYTES TRANSFERRED</small>
+            <b id="prog-bytes">0 B / 0 B</b>
+          </div>
+          <div class="pstat-box">
+            <small>FILES TRANSFERRED</small>
+            <b id="prog-files">0 / 0</b>
+          </div>
+          <div class="pstat-box">
+            <small>THROUGHPUT / RATE</small>
+            <b id="prog-throughput">0 B/s</b>
+          </div>
+        </div>
+
+        <div class="bar-shell">
+          <div id="prog-bar-fill" class="bar-fill"></div>
+        </div>
+        <div class="bar-labels">
+          <span id="prog-phase-desc">Engine is currently idle.</span>
+          <span id="prog-percent-text">0%</span>
+        </div>
+      </div>
+
+      <article class="card live-events-card">
+        <div class="card-head">
+          <h3>Progress Events Stream</h3>
+          <button id="btn-clear-events" class="link-button">Clear</button>
+        </div>
+        <div id="progress-event-stream" class="event-stream">
+          <p class="empty">No events yet.</p>
+        </div>
+      </article>
+    </section>
+
+    <!-- VIEW 7: ACTIVITY & RECOVERY -->
+    <section class="view" id="view-peer-activity" data-title="Activity & Recovery" data-section="Peer Network">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">SQLITE LEDGER &amp; TRANSACTION AUDIT</div>
+          <h1>Activity &amp; Recovery</h1>
+          <p>Persisted peer session history, file-level transaction audit, and crash recovery diagnostics.</p>
+        </div>
+        <div class="heading-actions">
+          <button id="btn-refresh-peer-act" class="btn neutral">Refresh Records</button>
+          <button id="btn-run-diag" class="btn neutral">Run Diagnostics</button>
+        </div>
+      </div>
+
+      <div class="overview-grid">
+        <article class="card recovery-diag-card">
+          <div class="card-head">
+            <div>
+              <div class="kicker">SYSTEM HEALTH &amp; WAL JOURNAL</div>
+              <h2>Engine Diagnostics</h2>
+            </div>
+            <span id="diag-state-badge" class="badge">CLEAN</span>
+          </div>
+          <div class="diag-body">
+            <div class="diag-item">
+              <span>Unfinished / Crashed Sessions:</span>
+              <b id="diag-unfinished-count">0</b>
+            </div>
+            <div class="diag-item">
+              <span>SQLite Journal Mode:</span>
+              <b>WAL (Write-Ahead Logging)</b>
+            </div>
+            <div class="diag-item">
+              <span>Baseline Verification:</span>
+              <b>Enforced on every session commit</b>
+            </div>
+            <div class="diag-item">
+              <span>Recovery Advice:</span>
+              <span id="diag-advice" class="muted">No unfinished sessions detected. System clean.</span>
+            </div>
+          </div>
+        </article>
+
+        <article class="card session-summary-card">
+          <div class="card-head">
+            <div>
+              <div class="kicker">PERSISTENCE AUDIT</div>
+              <h2>Session Statistics</h2>
+            </div>
+          </div>
+          <div class="session-stats-grid">
+            <div><small>RECORDED SESSIONS</small><b id="stat-total-sessions">0</b></div>
+            <div><small>TOTAL COMMITTED</small><b id="stat-committed-sessions">0</b></div>
+            <div><small>TOTAL CANCELLED</small><b id="stat-cancelled-sessions">0</b></div>
+            <div><small>FAILED SESSIONS</small><b id="stat-failed-sessions" class="danger-text">0</b></div>
+          </div>
+        </article>
+      </div>
+
+      <article class="card table-card">
+        <div class="table-head">
+          <div>
+            <h3>Persisted Peer Sessions</h3>
+            <p class="muted">History from local SQLite activity ledger</p>
+          </div>
+          <input id="search-peer-act" type="search" placeholder="Filter by Session ID or Peer…">
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Session ID</th>
+                <th>Role</th>
+                <th>Peer Identity</th>
+                <th>Started</th>
+                <th>Completed</th>
+                <th>Files</th>
+                <th>Bytes</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="peer-act-rows"></tbody>
+          </table>
+          <p id="empty-peer-act" class="empty">No peer activity records found in database.</p>
+        </div>
+      </article>
+    </section>
+
+    <!-- ========================================================== -->
+    <!-- PRESERVED LOCAL WORKSPACE VIEWS (FOR CLI / ENGINE SMOKE)  -->
+    <!-- ========================================================== -->
+
+    <!-- LOCAL SYNCHRONIZE VIEW -->
+    <section class="view" id="view-synchronize" data-title="Synchronize" data-section="Peer Network">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">LOCAL REPLICATION · A → B</div>
+          <h1>Synchronize</h1>
+          <p>Review changes between two local folders and safely apply them to keep Folder B in sync with Folder A.</p>
+        </div>
+        <span class="local-tag"><i></i>Local workspace</span>
+      </div>
+      <div class="steps" aria-label="Synchronization workflow">
+        <div class="step complete" id="step-config"><b>1</b><span><strong>Configure</strong><small>Select folders</small></span></div>
+        <i></i>
+        <div class="step" id="step-compare"><b>2</b><span><strong>Compare</strong><small>Scan &amp; detect changes</small></span></div>
+        <i></i>
+        <div class="step" id="step-review"><b>3</b><span><strong>Review</strong><small>Inspect and approve</small></span></div>
+        <i></i>
+        <div class="step" id="step-apply"><b>4</b><span><strong>Apply</strong><small>Execute synchronization</small></span></div>
+        <i></i>
+        <div class="step" id="step-verify"><b>5</b><span><strong>Verify</strong><small>Check integrity</small></span></div>
+      </div>
+      <article class="card folder-card">
+        <div class="folder-grid">
+          <div class="folder-box">
+            <div class="folder-title">
+              <span class="folder-symbol">▱</span>
+              <span><small>SOURCE · FOLDER A</small><b>Source folder</b></span>
+            </div>
+            <div class="path-line">
+              <label class="sr-only" for="folder-a">Folder A source path</label>
+              <input id="folder-a" autocomplete="off" placeholder="Choose or enter a folder path">
+              <button class="btn neutral browse" data-slot="a">Browse</button>
+            </div>
+            <p class="folder-meta" id="folder-a-meta">Select an existing folder; scanning is read-only.</p>
+          </div>
+          <button class="swap" id="swap-folders" type="button" aria-label="Swap folders">⇄</button>
+          <div class="folder-box">
+            <div class="folder-title">
+              <span class="folder-symbol destination">▱</span>
+              <span><small>DESTINATION · FOLDER B</small><b>Destination folder</b></span>
+            </div>
+            <div class="path-line">
+              <label class="sr-only" for="folder-b">Folder B destination path</label>
+              <input id="folder-b" autocomplete="off" placeholder="Choose or enter a folder path">
+              <button class="btn neutral browse" data-slot="b">Browse</button>
+            </div>
+            <p class="folder-meta" id="folder-b-meta">Destination-only files are preserved.</p>
+          </div>
+        </div>
+        <div class="scope-selection-wrapper">
+          <div class="scope-mode-bar">
+            <span class="scope-label">Scope:</span>
+            <div class="scope-mode-options">
+              <label class="radio-label">
+                <input type="radio" name="sync-scope-mode" value="all" id="scope-mode-all" checked>
+                <span>All files</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="sync-scope-mode" value="selective" id="scope-mode-selective">
+                <span>Selective file &amp; folder scope</span>
+              </label>
+            </div>
+            <span id="scope-summary-badge" class="state-pill">Full sync</span>
+          </div>
+
+          <div id="scope-tree-panel" class="scope-tree-panel hidden">
+            <div class="tree-toolbar">
+              <input id="scope-tree-search" type="search" placeholder="⌕ Filter folders and files…" aria-label="Filter scope tree">
+              <div class="tree-buttons">
+                <button type="button" id="tree-select-all" class="btn neutral btn-xs">Select All</button>
+                <button type="button" id="tree-deselect-all" class="btn neutral btn-xs">Deselect All</button>
+                <button type="button" id="tree-expand-all" class="btn neutral btn-xs">Expand All</button>
+                <button type="button" id="tree-collapse-all" class="btn neutral btn-xs">Collapse All</button>
+              </div>
+            </div>
+            <div id="scope-tree-container" class="scope-tree-scroll" role="tree" aria-label="Source folder files and subfolders">
+              <p id="scope-tree-empty" class="muted">Enter or browse a source folder to populate the selective tree.</p>
+            </div>
+            <div class="tree-footer">
+              <span id="scope-stats-text" class="muted">0 files selected</span>
+              <span class="tree-note muted">Excluded files remain untouched on destination and are never deleted.</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="folder-actions">
+          <p id="folder-error" class="error" role="alert"></p>
+          <button id="scan-button" class="btn primary">Compare folders <span>→</span></button>
+        </div>
+      </article>
+
+      <div id="comparison-section" class="hidden">
+        <div class="root-grid">
+          <div class="root-panel"><small>FOLDER A · SOURCE ROOT</small><code id="root-a">—</code></div>
+          <div class="root-panel"><small>FOLDER B · DESTINATION ROOT</small><code id="root-b">—</code></div>
+        </div>
+        <div class="section-bar">
+          <div><div class="kicker">COMPARISON RESULTS</div><h2>Change plan</h2></div>
+          <span class="muted" id="plan-expiry">Exact plan expires after 10 minutes</span>
+        </div>
+        <div id="metrics" class="summary-cards"></div>
+        <div class="review-grid">
+          <article class="card table-card">
+            <div class="table-head">
+              <div>
+                <h3>Changed files <span id="file-count"></span></h3>
+                <p id="file-summary" class="muted"></p>
+              </div>
+              <div class="table-tools">
+                <input id="search-files" type="search" placeholder="⌕ Search files…" aria-label="Search file paths">
+                <select id="filter-operation" aria-label="Filter operations">
+                  <option value="ALL">All types</option>
+                  <option>ADD</option>
+                  <option>MODIFY</option>
+                  <option>DELETE</option>
+                  <option>UNCHANGED</option>
+                  <option>PRESERVE</option>
+                </select>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr><th>Path</th><th>Operation</th><th>Size</th><th>Last modified</th><th>State</th></tr>
+                </thead>
+                <tbody id="file-rows"></tbody>
+              </table>
+              <p id="empty-files" class="empty hidden">No files match this filter.</p>
+            </div>
+            <div class="table-note">B-only files are preserved. Current Local Mode does not schedule deletion.</div>
+          </article>
+          <aside id="selected-file-inspector" class="card inspector">
+            <div class="kicker">FILE DETAILS</div>
+            <h3 id="inspector-name">Select a file</h3>
+            <p class="muted" id="inspector-path">Choose a row to inspect metadata and hashes.</p>
+            <span id="inspector-operation" class="operation-chip">—</span>
+            <div class="inspector-tabs">
+              <button class="tab selected" data-inspector-tab="metadata">Metadata</button>
+              <button class="tab" data-inspector-tab="hashes">Hashes</button>
+              <button class="tab" data-inspector-tab="transfer">Transfer</button>
+            </div>
+            <div id="inspector-content" class="inspector-content">
+              <p class="empty">No file selected.</p>
+            </div>
+          </aside>
+        </div>
+        <article class="card approval-card">
+          <div>
+            <div class="kicker">REVIEW &amp; AUTHORIZE</div>
+            <h2>Approve this exact plan</h2>
+            <p class="muted">The C++ executor revalidates both folders and every mutation. Content is staged, hash-checked, backed up, and verified before the final root check.</p>
+          </div>
+          <div class="approval-controls">
+            <label class="check-line"><input id="approve-changes" type="checkbox"><span></span>I approve the listed changes to Folder B.</label>
+            <label id="deletion-row" class="check-line hidden"><input id="confirm-deletions" type="checkbox"><span></span>I separately confirm every listed deletion.</label>
+            <button id="sync-button" class="btn primary" disabled>Approve and start synchronization <span>→</span></button>
+            <p id="sync-status" role="status" class="muted"></p>
+          </div>
+        </article>
+        <article id="sync-result" class="card result hidden" aria-live="polite"></article>
+      </div>
+    </section>
+
+    <!-- LOCAL DEVICES & ACCESS VIEW -->
+    <section class="view" id="view-devices" data-title="Devices &amp; Access" data-section="Local Workspace">
+      <div class="page-heading"><div><div class="kicker">IDENTITY / AUTHORIZATION</div><h1>Devices &amp; Access</h1><p>Configure device pairing, credentials, and authorization controls.</p></div></div>
+      <article class="card"><div class="card-head"><h3>Pairing Status</h3></div><p>Use the <a href="#pairing" data-view="pairing">Device Pairing</a> view to configure mTLS credentials and certificates for peer synchronization.</p></article>
+    </section>
+
+    <!-- LOCAL VERSIONS VIEW -->
+    <section class="view" id="view-versions" data-title="Versions" data-section="Local Workspace">
+      <div class="page-heading">
+        <div><div class="kicker">CONTENT-ADDRESSED SNAPSHOTS</div><h1>Versions</h1><p>Stored manifests, parent relationships, integrity hashes, and guarded restoration.</p></div>
+        <button id="refresh-versions" class="btn neutral">Refresh versions</button>
+      </div>
+      <div class="path-context"><small>DESTINATION</small><code id="version-destination">Set Folder B in Synchronize.</code></div>
+      <article class="card"><div id="versions-list" class="record-list"><p class="empty">Choose Folder B and load saved versions.</p></div></article>
+      <p class="notice">Snapshots retain complete file content objects. Parent links record history; patch/delta storage is not implemented.</p>
+    </section>
+
+    <!-- ALGORITHM EXPLORER VIEWS -->
+    <section class="view" id="view-algorithm" data-title="Algorithm Explorer" data-section="Local Workspace">
+      <div class="page-heading"><div><div class="kicker">IMPLEMENTED ALGORITHMS</div><h1>Algorithm Explorer</h1><p>Inspect the real manifest, chunk reuse, and scheduling outputs from the Local Mode engine.</p></div></div>
+      <div class="algorithm-grid">
+        <a class="card algorithm-card" href="#merkle" data-view="merkle"><span>01</span><h2>Merkle tree</h2><p>Manifest roots and file leaves returned by the scanner; internal nodes are not exposed.</p><b>Inspect leaves →</b></a>
+        <a class="card algorithm-card" href="#chunks" data-view="chunks"><span>02</span><h2>Chunks &amp; reuse</h2><p>Per-operation fixed-size chunk accounting persisted by the Local Mode executor.</p><b>Inspect transfer →</b></a>
+        <a class="card algorithm-card" href="#scheduler" data-view="scheduler"><span>03</span><h2>Scheduler</h2><p>Binary max-heap queue preview and completed execution priority/state.</p><b>Inspect queue →</b></a>
+      </div>
+    </section>
+
+    <section class="view" id="view-merkle" data-title="Merkle tree" data-section="Local Workspace">
+      <div class="page-heading"><div><div class="kicker">ALGORITHM EXPLORER / MANIFEST LEAVES</div><h1>Merkle tree</h1><p>Actual folder roots and file SHA-256 values. Intermediate tree nodes are not exposed by the scanner API.</p></div><button class="btn neutral" data-go="synchronize">Open comparison →</button></div>
+      <div class="root-grid"><div class="root-panel"><small>SOURCE ROOT</small><code id="explorer-root-a">—</code></div><div class="root-panel"><small>DESTINATION ROOT</small><code id="explorer-root-b">—</code></div></div>
+      <div id="merkle-status-card" class="card" style="margin-bottom: 1.5rem;">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:1rem;">
+          <div>
+            <div class="kicker">MERKLE ROOT STATUS</div>
+            <h3 id="merkle-status-heading">Awaiting comparison</h3>
+            <p id="merkle-status-desc" class="muted">Run a folder comparison in Synchronize to inspect Merkle tree structures, roots, and leaf digests.</p>
+          </div>
+          <span id="merkle-match-badge" class="state-pill">—</span>
+        </div>
+        <div id="merkle-levels-container" class="hidden" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border);">
+          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">
+            <div><small class="muted">SOURCE TREE DEPTH</small><div id="merkle-source-depth" style="font-weight:600; margin-top:0.25rem;">—</div></div>
+            <div><small class="muted">DESTINATION TREE DEPTH</small><div id="merkle-dest-depth" style="font-weight:600; margin-top:0.25rem;">—</div></div>
+            <div><small class="muted">DIFFERING LEAF NODES</small><div id="merkle-diff-count" style="font-weight:600; margin-top:0.25rem;">—</div></div>
+          </div>
+        </div>
+      </div>
+      <article class="card table-card"><div class="table-head"><div><div class="kicker">FILE LEAVES</div><h3>Manifest digests &amp; leaf hashes</h3></div><input id="merkle-search" type="search" placeholder="Filter path or hash…"></div><div class="table-scroll"><table><thead><tr><th>Path</th><th>Change state</th><th>Source SHA-256</th><th>Destination SHA-256</th><th>Source Leaf Hash</th><th>Destination Leaf Hash</th><th>Difference Reason</th></tr></thead><tbody id="merkle-rows"></tbody></table><p id="merkle-empty" class="empty">Run a comparison to inspect actual leaves.</p></div></article>
+    </section>
+
+    <section class="view" id="view-chunks" data-title="Chunks &amp; reuse" data-section="Local Workspace">
+      <div class="page-heading"><div><div class="kicker">ALGORITHM EXPLORER / FIXED-SIZE CHUNKING</div><h1>Chunks &amp; reuse</h1><p>Measured counters from actual Local Mode sync jobs, not estimated disk I/O or network traffic.</p></div><span class="state-pill">1 MiB default</span></div>
+      <div class="summary-cards six"><div class="summary-card"><small>PAYLOAD</small><b id="chunk-payload">—</b></div><div class="summary-card"><small>SOURCE PROCESSED</small><b id="chunk-processed">—</b></div><div class="summary-card"><small>REUSED</small><b id="chunk-reused">—</b></div><div class="summary-card"><small>STAGING WRITTEN</small><b id="chunk-written">—</b></div><div class="summary-card"><small>CHUNKS REUSED / TOTAL</small><b id="chunk-count">—</b></div><div class="summary-card"><small>VERIFICATION</small><b id="chunk-integrity">Awaiting sync</b></div></div>
+      <article class="card"><div class="kicker">RECORDED TRANSFERS</div><div id="chunk-rows" class="record-list"><p class="empty">No completed transfer metrics loaded.</p></div></article>
+    </section>
+
+    <section class="view" id="view-scheduler" data-title="Scheduler" data-section="Local Workspace">
+      <div class="page-heading"><div><div class="kicker">BINARY MAX-HEAP / EXECUTION ORDER</div><h1>Scheduler</h1><p>Current plan preview and actual priority/state values recorded after execution.</p></div><span id="scheduler-count" class="state-pill">No queued jobs</span></div>
+      <article class="card table-card"><div class="table-head"><h3>Priority queue</h3><span class="muted">The executor independently enforces authorization.</span></div><div class="table-scroll"><table><thead><tr><th>Order</th><th>Path</th><th>Operation</th><th>Priority</th><th>Size</th><th>Modified ticks</th><th>State</th></tr></thead><tbody id="scheduler-rows"></tbody></table><p id="scheduler-empty" class="empty">Scan a folder pair to preview scheduler order.</p></div></article>
+      <article class="card policy-card"><div class="kicker">DOCUMENTED POLICY</div><h2>Deterministic priority with aging</h2><p>Add 400, Modify 300, Delete 200 base points; +1 per MiB up to 1,000 MiB; up to +120 from modification recency; +1 per queued minute; FIFO insertion order breaks equal scores. It is not adaptive to measured throughput or system load.</p></article>
+    </section>
+
+
+    <!-- LOCAL ACTIVITY VIEW -->
+    <section class="view" id="view-activity" data-title="Activity &amp; Diagnostics" data-section="Local Workspace">
+      <div class="page-heading"><div><div class="kicker">SQLITE / RECORDED LOCAL OPERATIONS</div><h1>Activity &amp; Diagnostics</h1><p>Actual operation state, timestamps, verification, transfer accounting, and errors from Folder B.</p></div><button id="refresh-activity" class="btn neutral">Refresh activity</button></div>
+      <div class="activity-tools"><input id="activity-search" type="search" placeholder="Filter path, operation, or job ID…"><select id="activity-filter"><option value="ALL">All results</option><option value="FAILED">Failed</option><option value="VERIFIED">Verified</option></select></div>
+      <article class="card"><div id="activity-list" class="record-list"><p class="empty">Choose Folder B in Synchronize to load SQLite records.</p></div></article>
+    </section>
+
+    <!-- SETTINGS VIEW -->
+    <section class="view" id="view-settings" data-title="Settings" data-section="System">
+      <div class="page-heading"><div><div class="kicker">ENGINE &amp; SECURITY SETTINGS</div><h1>Settings</h1><p>Effective settings reported by the local C++17 MerkleChain engine.</p></div></div>
+      <article class="card settings-list">
+        <div class="setting"><div><b>Dashboard bind address</b><small>Local loopback API access only</small></div><code>127.0.0.1:<span class="port-value">47831</span></code></div>
+        <div class="setting"><div><b>Peer Service port</b><small>Dedicated mTLS listener</small></div><code id="set-peer-port">47832</code></div>
+        <div class="setting"><div><b>Network Transport Security</b><small>TLS mutual authentication with certificate pinning</small></div><span class="badge">TLS 1.3 / mTLS</span></div>
+        <div class="setting"><div><b>Integrity Hash Algorithm</b><small>Merkle tree digests and file verification</small></div><code>SHA-256</code></div>
+        <div class="setting"><div><b>Default chunk size</b><small>Chunking baseline for transfer optimization</small></div><code>1 MiB</code></div>
+        <div class="setting"><div><b>Approval Policy</b><small>Cryptographically bound plan verification before commit</small></div><code>Mandatory Interactive</code></div>
+      </article>
+    </section>
+
+        <!-- ============================================================= -->
+    <!-- NETWORK MODEL SELECTION & ROLE LOGIN GATEWAY                   -->
+    <!-- ============================================================= -->
+    <section class="view" id="view-network-select" data-title="Network Model" data-section="Network Model">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">HOST &ndash; CLIENT COLLABORATION PLATFORM</div>
+          <h1>Network Model Workspace</h1>
+          <p>Collaborate securely between Host and authorized Clients with cryptographically verified submissions, version staging, and immutable publishing.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral" data-go="home">&larr; Return to Landing</button>
+        </div>
+      </div>
+
+      <div class="gateway-grid">
+        <!-- Host Portal Card -->
+        <article class="card gateway-card host-portal-card">
+          <div class="portal-badge-tag host-tag">HOST ADMINISTRATOR</div>
+          <div class="portal-icon-circle host-circle">
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.2">
+              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+            </svg>
+          </div>
+          <h2>Host Dashboard</h2>
+          <p>Manage client credentials, inspect submitted folders, edit files in working copies, review unified diffs, publish immutable versions, and monitor security events.</p>
+          <div class="portal-meta-box">
+            <span class="meta-label">Default Workspace:</span>
+            <code>Default-Workspace (ws-default)</code>
+          </div>
+          <button class="btn forest-btn btn-lg full-w" id="btn-enter-host" data-go="host-overview">
+            Enter Host Dashboard <span>&rarr;</span>
+          </button>
+        </article>
+
+        <!-- Client Portal Card -->
+        <article class="card gateway-card client-portal-card">
+          <div class="portal-badge-tag client-tag">CLIENT COLLABORATOR</div>
+          <div class="portal-icon-circle client-circle">
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.2">
+              <circle cx="12" cy="7" r="4"/>
+              <path d="M5.5 21a6.5 6.5 0 0 1 13 0"/>
+            </svg>
+          </div>
+          <h2>Client Workspace</h2>
+          <p>Sign in using credentials provisioned by the Host. Submit project folders, review published versions, and receive verified updates into your local folder.</p>
+          
+          <form id="client-quick-login-form" class="client-auth-form" onsubmit="return false;">
+            <div class="form-row-compact">
+              <label for="login-client-username">Username</label>
+              <input type="text" id="login-client-username" value="client_alice" placeholder="client_username" required>
+            </div>
+            <div class="form-row-compact">
+              <label for="login-client-password">Password</label>
+              <input type="password" id="login-client-password" value="AliceClient2026!" placeholder="Password" required>
+            </div>
+            <button type="submit" class="btn forest-btn full-w" id="btn-submit-client-login">
+              Sign In as Client <span>&rarr;</span>
+            </button>
+          </form>
+          <div id="client-login-error" class="login-msg error-msg" style="display:none;"></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- HOST DASHBOARD VIEWS (8 PAGES)                                 -->
+    <!-- ============================================================= -->
+
+    <!-- HOST VIEW 1: HOST OVERVIEW -->
+    <section class="view" id="view-host-overview" data-title="Host Overview" data-section="Host Dashboard">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">HOST CONTROL CONSOLE</div>
+          <h1>Host Overview</h1>
+          <p>Executive metrics, client account management, pending submissions, and published immutable releases.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral" id="btn-host-refresh-overview">Refresh Data</button>
+          <button class="btn forest-btn" data-go="host-workspace">Open Workspace &rarr;</button>
+        </div>
+      </div>
+
+      <div class="stats-row">
+        <article class="stat-card">
+          <div class="kicker">CLIENT ACCOUNTS</div>
+          <b id="host-stat-clients">2</b>
+          <span class="muted">Provisioned users</span>
+        </article>
+        <article class="stat-card">
+          <div class="kicker">PENDING SUBMISSIONS</div>
+          <b id="host-stat-pending-subs">0</b>
+          <span class="muted">Awaiting host review</span>
+        </article>
+        <article class="stat-card">
+          <div class="kicker">PUBLISHED VERSIONS</div>
+          <b id="host-stat-published-versions">0</b>
+          <span class="muted">Immutable releases</span>
+        </article>
+        <article class="stat-card">
+          <div class="kicker">CLIENT UPDATES</div>
+          <b id="host-stat-pending-updates">0</b>
+          <span class="muted">Pending acceptance</span>
+        </article>
+      </div>
+
+      <div class="grid-2col">
+        <article class="card">
+          <div class="table-head">
+            <h3>Quick Actions</h3>
+            <span class="muted">Collaboration shortcuts</span>
+          </div>
+          <div class="action-grid-buttons">
+            <button class="btn neutral full-w" data-go="host-clients">&#128101; Manage Client Accounts</button>
+            <button class="btn neutral full-w" data-go="host-submissions">&#128229; Review Client Submissions</button>
+            <button class="btn neutral full-w" data-go="host-workspace">&#128193; Browse Working Copy Files</button>
+            <button class="btn neutral full-w" data-go="host-review">&#128269; Review Working Copy Changes</button>
+            <button class="btn forest-btn full-w" data-go="host-publish">&#128640; Publish New Version</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="table-head">
+            <h3>Active Workspace</h3>
+            <span class="badge" id="host-active-ws-badge">Default-Workspace</span>
+          </div>
+          <div class="kv-grid">
+            <div><span class="muted">Workspace ID:</span> <code>ws-default</code></div>
+            <div><span class="muted">Description:</span> Primary collaboration workspace</div>
+            <div><span class="muted">Working Files:</span> <b id="host-stat-working-files">0 files</b></div>
+            <div><span class="muted">Working Merkle:</span> <code id="host-stat-working-root" class="hash-code-inline">&mdash;</code></div>
+          </div>
+        </article>
+      </div>
+
+      <article class="card table-card">
+        <div class="table-head">
+          <h3>Recent Security &amp; Audit Events</h3>
+          <button class="btn neutral btn-xs" data-go="host-activity">View All Events &rarr;</button>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Actor</th>
+                <th>Action</th>
+                <th>Resource</th>
+                <th>Outcome</th>
+              </tr>
+            </thead>
+            <tbody id="host-overview-activity-rows">
+              <tr><td colspan="5" class="empty">Loading recent audit events&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- HOST VIEW 2: CLIENT MANAGEMENT -->
+    <section class="view" id="view-host-clients" data-title="Client Management" data-section="Host Dashboard">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">ACCESS CONTROL &amp; IDENTITY</div>
+          <h1>Client Management</h1>
+          <p>Create client credentials, configure workspace permissions, and suspend or restore client access.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn forest-btn" id="btn-toggle-new-client-form">+ Create New Client</button>
+        </div>
+      </div>
+
+      <!-- Expandable New Client Form Card -->
+      <article class="card" id="card-new-client" style="display:none; margin-bottom: 20px;">
+        <div class="table-head">
+          <h3>Provision Client Account</h3>
+          <button class="dialog-close" type="button" id="btn-close-new-client">&times;</button>
+        </div>
+        <form id="form-create-client" class="styled-form" onsubmit="return false;">
+          <div class="form-row-2col">
+            <div>
+              <label for="new-client-username">Username</label>
+              <input type="text" id="new-client-username" placeholder="e.g. client_bob" required>
+            </div>
+            <div>
+              <label for="new-client-password">Initial Password (PBKDF2-hashed)</label>
+              <input type="password" id="new-client-password" placeholder="Minimum 8 characters" required>
+            </div>
+          </div>
+          <div class="form-row-2col">
+            <div>
+              <label>Workspace Assignment</label>
+              <input type="text" readonly value="Default-Workspace (ws-default)">
+            </div>
+            <div>
+              <label>Role</label>
+              <input type="text" readonly value="Client Collaborator">
+            </div>
+          </div>
+          <div class="permissions-fieldset">
+            <span class="muted">Assigned Permissions:</span>
+            <label><input type="checkbox" checked disabled> Submit Folders</label>
+            <label><input type="checkbox" checked disabled> View Published Versions</label>
+            <label><input type="checkbox" checked disabled> Accept &amp; Receive Updates</label>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="btn forest-btn" id="btn-save-new-client">Create Client Account</button>
+            <button type="button" class="btn neutral" id="btn-cancel-new-client">Cancel</button>
+          </div>
+        </form>
+      </article>
+
+      <article class="card table-card">
+        <div class="table-head">
+          <h3>Registered Client Accounts</h3>
+          <span class="muted">PBKDF2 Salted Authentication</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Username</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Last Active</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="host-clients-table-rows">
+              <tr><td colspan="6" class="empty">Loading clients&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- HOST VIEW 3: SUBMISSIONS -->
+    <section class="view" id="view-host-submissions" data-title="Submissions" data-section="Host Dashboard">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">CLIENT SUBMISSION REVIEW</div>
+          <h1>Submissions</h1>
+          <p>Review incoming folder submissions from authorized clients. Accepting a submission creates the workspace baseline and working copy.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral" id="btn-refresh-submissions">Refresh</button>
+        </div>
+      </div>
+
+      <article class="card table-card">
+        <div class="table-head">
+          <h3>Submission Queue</h3>
+          <span class="muted">Guarded workflow &ndash; original submissions remain immutable</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Submission ID</th>
+                <th>Client</th>
+                <th>Files</th>
+                <th>Size</th>
+                <th>Merkle Root</th>
+                <th>Submitted</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="host-submissions-table-rows">
+              <tr><td colspan="8" class="empty">No submissions found.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- HOST VIEW 4: HOST WORKSPACE -->
+    <section class="view" id="view-host-workspace" data-title="Host Workspace" data-section="Host Dashboard">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">COLLABORATION WORKSPACE &amp; WORKING COPY</div>
+          <h1>Host Workspace</h1>
+          <p>Browse and edit working copy files. Edits never touch the original client submission.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral" id="btn-host-refresh-files">Refresh Files</button>
+          <button class="btn forest-btn" data-go="host-review">Review Changes &rarr;</button>
+        </div>
+      </div>
+
+      <div class="workspace-editor-layout">
+        <!-- Left: File List -->
+        <div class="workspace-file-pane card">
+          <div class="table-head">
+            <h3>Files in Working Copy</h3>
+            <button class="btn neutral btn-xs" id="btn-host-new-file-prompt">+ New File</button>
+          </div>
+          <div class="file-search-wrap">
+            <input type="search" id="host-file-search" placeholder="Filter files&hellip;">
+          </div>
+          <div class="file-list-scroll" id="host-workspace-file-list">
+            <p class="empty">No files in working copy. Accept a client submission first.</p>
+          </div>
+        </div>
+
+        <!-- Right: Text Editor -->
+        <div class="workspace-editor-pane card">
+          <div class="editor-header">
+            <div>
+              <span class="muted">Editing:</span>
+              <strong id="host-editor-filepath">&mdash;</strong>
+            </div>
+            <div class="editor-actions">
+              <span id="host-editor-status" class="state-pill">Ready</span>
+              <button class="btn forest-btn btn-sm" id="btn-host-editor-save" disabled>Save File</button>
+              <button class="btn danger btn-sm" id="btn-host-editor-delete" disabled>Delete</button>
+            </div>
+          </div>
+          <textarea id="host-editor-textarea" class="code-editor-area" placeholder="Select a file from the left to view or edit its content&hellip;" spellcheck="false" disabled></textarea>
+        </div>
+      </div>
+    </section>
+
+    <!-- HOST VIEW 5: CHANGE REVIEW -->
+    <section class="view" id="view-host-review" data-title="Change Review" data-section="Host Dashboard">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">AUDIT &amp; DIFF ENGINE</div>
+          <h1>Change Review</h1>
+          <p>Compare working copy modifications against the accepted baseline before publishing an immutable release.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral" id="btn-refresh-diff">Recompute Diff</button>
+          <button class="btn forest-btn" data-go="host-publish">Proceed to Publish &rarr;</button>
+        </div>
+      </div>
+
+      <div class="stats-row diff-stats-row">
+        <article class="stat-card">
+          <div class="kicker">ADDED FILES</div>
+          <b id="review-count-added" class="text-emerald">0</b>
+          <span class="muted">New files created</span>
+        </article>
+        <article class="stat-card">
+          <div class="kicker">MODIFIED FILES</div>
+          <b id="review-count-modified" class="text-amber">0</b>
+          <span class="muted">Content changed</span>
+        </article>
+        <article class="stat-card">
+          <div class="kicker">DELETED FILES</div>
+          <b id="review-count-deleted" class="text-crimson">0</b>
+          <span class="muted">Files removed</span>
+        </article>
+        <article class="stat-card">
+          <div class="kicker">UNCHANGED FILES</div>
+          <b id="review-count-unchanged">0</b>
+          <span class="muted">Matching baseline</span>
+        </article>
+      </div>
+
+      <div class="grid-2col">
+        <!-- Changed Files List -->
+        <article class="card table-card">
+          <div class="table-head">
+            <h3>Changed Files</h3>
+            <span class="muted">Click file to view diff</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Path</th>
+                  <th>Change</th>
+                  <th>Baseline SHA-256</th>
+                  <th>Working SHA-256</th>
+                </tr>
+              </thead>
+              <tbody id="host-diff-files-rows">
+                <tr><td colspan="4" class="empty">No changes detected. Working copy matches baseline.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <!-- Diff Viewer -->
+        <article class="card">
+          <div class="table-head">
+            <h3>Unified Line-by-Line Diff</h3>
+            <code id="host-diff-active-path">&mdash;</code>
+          </div>
+          <div class="diff-viewer-box" id="host-diff-viewer">
+            <p class="empty">Select a modified file from the left to inspect unified diff lines.</p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- HOST VIEW 6: PUBLISH UPDATES -->
+    <section class="view" id="view-host-publish" data-title="Publish Updates" data-section="Host Dashboard">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">IMMUTABLE RELEASE WORKFLOW</div>
+          <h1>Publish Updates</h1>
+          <p>Package the verified working copy into an immutable version and notify authorized clients.</p>
+        </div>
+      </div>
+
+      <div class="publish-layout card">
+        <article class="card policy-card" style="margin-bottom: 20px;">
+          <div class="kicker">IMMUTABILITY CONTRACT</div>
+          <h2>Published Versions Are Permanent</h2>
+          <p>Once published, a version snapshot is permanently locked with its computed Merkle root digest. Authorized clients will be notified that an update is available to review and apply.</p>
+        </article>
+
+        <form id="form-publish-version" class="styled-form" onsubmit="return false;">
+          <div class="form-row-2col">
+            <div>
+              <label for="publish-title">Version Title / Release Tag</label>
+              <input type="text" id="publish-title" placeholder="e.g. v1.1 &ndash; Updated Documentation" required>
+            </div>
+            <div>
+              <label>Target Workspace</label>
+              <input type="text" readonly value="Default-Workspace (ws-default)">
+            </div>
+          </div>
+          <div class="form-row">
+            <label for="publish-notes">Release Notes &amp; Summary of Changes</label>
+            <textarea id="publish-notes" rows="4" placeholder="Describe the changes, fixes, and improvements in this release&hellip;" required></textarea>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="btn forest-btn btn-lg" id="btn-submit-publish">Publish Immutable Version</button>
+          </div>
+        </form>
+
+        <div id="publish-result-card" class="card result-card" style="display:none; margin-top:20px;">
+          <div class="table-head">
+            <h3 class="text-emerald">&#10003; Version Published Successfully</h3>
+          </div>
+          <div class="kv-grid">
+            <div><span class="muted">Version ID:</span> <code id="pub-result-id">&mdash;</code></div>
+            <div><span class="muted">Title:</span> <b id="pub-result-title">&mdash;</b></div>
+            <div><span class="muted">Merkle Root:</span> <code id="pub-result-root" class="hash-code-inline">&mdash;</code></div>
+            <div><span class="muted">Files / Size:</span> <span id="pub-result-meta">&mdash;</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- HOST VIEW 7: VERSIONS -->
+    <section class="view" id="view-host-versions" data-title="Versions" data-section="Host Dashboard">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">VERSION ARCHIVE</div>
+          <h1>Published Versions</h1>
+          <p>Immutable catalog of all releases published for this workspace.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral" id="btn-refresh-host-versions">Refresh</button>
+        </div>
+      </div>
+
+      <article class="card table-card">
+        <div class="table-head">
+          <h3>Published Releases</h3>
+          <span class="muted">SHA-256 Merkle root verified</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Version Tag</th>
+                <th>Published At</th>
+                <th>Files</th>
+                <th>Size</th>
+                <th>Merkle Root</th>
+                <th>Published By</th>
+                <th>Release Notes</th>
+              </tr>
+            </thead>
+            <tbody id="host-versions-table-rows">
+              <tr><td colspan="7" class="empty">No published versions yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- HOST VIEW 8: ACTIVITY & SECURITY -->
+    <section class="view" id="view-host-activity" data-title="Activity &amp; Security" data-section="Host Dashboard">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">DURABLE AUDIT TRAIL</div>
+          <h1>Activity &amp; Security Log</h1>
+          <p>Cryptographically recorded audit events including logins, client provisioning, submissions, diffs, and publishes.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral" id="btn-refresh-host-activity">Refresh Log</button>
+        </div>
+      </div>
+
+      <article class="card table-card">
+        <div class="table-head">
+          <h3>Security Audit Events</h3>
+          <span class="muted">Immutable SQLite event stream</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Actor</th>
+                <th>Action</th>
+                <th>Resource</th>
+                <th>Outcome</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody id="host-activity-table-rows">
+              <tr><td colspan="6" class="empty">Loading activity&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- CLIENT WORKSPACE VIEWS (7 PAGES)                               -->
+    <!-- ============================================================= -->
+
+    <!-- CLIENT VIEW 1: CLIENT OVERVIEW -->
+    <section class="view" id="view-client-overview" data-title="Client Overview" data-section="Client Workspace">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">CLIENT COLLABORATION DESK</div>
+          <h1>Client Overview</h1>
+          <p>Welcome, <strong id="client-user-display">&mdash;</strong>. View workspace status, submit project folders, and receive approved updates.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral btn-xs" id="btn-client-logout-top">Sign Out</button>
+          <button class="btn forest-btn" data-go="client-submit">Submit Folder &rarr;</button>
+        </div>
+      </div>
+
+      <div class="stats-row">
+        <article class="stat-card">
+          <div class="kicker">WORKSPACE</div>
+          <b>Default-Workspace</b>
+          <span class="muted">Assigned repository</span>
+        </article>
+        <article class="stat-card">
+          <div class="kicker">MY SUBMISSIONS</div>
+          <b id="client-stat-subs">0</b>
+          <span class="muted">Folders submitted</span>
+        </article>
+        <article class="stat-card">
+          <div class="kicker">AVAILABLE UPDATES</div>
+          <b id="client-stat-updates" class="text-amber">0</b>
+          <span class="muted">Published by Host</span>
+        </article>
+        <article class="stat-card">
+          <div class="kicker">ACCOUNT STATUS</div>
+          <span class="state-pill active" id="client-stat-status">Active</span>
+          <span class="muted">Authorized Collaborator</span>
+        </article>
+      </div>
+
+      <div class="grid-2col">
+        <article class="card">
+          <div class="table-head">
+            <h3>Quick Actions</h3>
+          </div>
+          <div class="action-grid-buttons">
+            <button class="btn forest-btn full-w" data-go="client-submit">&#128228; Submit New Folder to Host</button>
+            <button class="btn neutral full-w" data-go="client-submissions">&#128203; View My Submissions</button>
+            <button class="btn neutral full-w" data-go="client-review">&#128276; Review Available Updates</button>
+            <button class="btn neutral full-w" data-go="client-account">&#128100; View Permissions &amp; Account</button>
+          </div>
+        </article>
+
+        <article class="card" id="client-pending-update-card">
+          <div class="table-head">
+            <h3>Published Updates Notice</h3>
+          </div>
+          <p id="client-update-notice-text" class="muted">Checking for available published releases&hellip;</p>
+          <div style="margin-top: 15px;">
+            <button class="btn forest-btn full-w" data-go="client-review" id="btn-go-review-updates">Inspect Updates &rarr;</button>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- CLIENT VIEW 2: SUBMIT FOLDER -->
+    <section class="view" id="view-client-submit" data-title="Submit Folder" data-section="Client Workspace">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">FOLDER SUBMISSION</div>
+          <h1>Submit Folder to Host</h1>
+          <p>Select a local folder to submit to the Host. MerkleChain scans the directory and verifies its Merkle root before uploading.</p>
+        </div>
+      </div>
+
+      <article class="card styled-form" style="max-width: 800px;">
+        <div class="form-row">
+          <label for="client-source-folder">Local Folder Path</label>
+          <div class="input-browse-row">
+            <input type="text" id="client-source-folder" placeholder="C:\Users\&hellip;\MyProject" required>
+            <button type="button" class="btn neutral" id="btn-client-browse-folder">Browse&hellip;</button>
+          </div>
+        </div>
+        <div class="form-row">
+          <label for="client-submission-notes">Notes for Reviewer (Optional)</label>
+          <textarea id="client-submission-notes" rows="3" placeholder="Describe the contents or features in this submission&hellip;"></textarea>
+        </div>
+        <div class="form-actions">
+          <button type="button" class="btn forest-btn btn-lg" id="btn-client-send-submission">Scan &amp; Submit to Host</button>
+        </div>
+
+        <div id="client-submission-receipt" class="card result-card" style="display:none; margin-top:20px;">
+          <div class="table-head">
+            <h3 class="text-emerald">&#10003; Folder Successfully Submitted</h3>
+            <span class="badge">Pending Host Review</span>
+          </div>
+          <div class="kv-grid">
+            <div><span class="muted">Submission ID:</span> <code id="sub-receipt-id">&mdash;</code></div>
+            <div><span class="muted">Files / Total Size:</span> <span id="sub-receipt-meta">&mdash;</span></div>
+            <div><span class="muted">Merkle Root:</span> <code id="sub-receipt-root" class="hash-code-inline">&mdash;</code></div>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <!-- CLIENT VIEW 3: MY SUBMISSIONS -->
+    <section class="view" id="view-client-submissions" data-title="My Submissions" data-section="Client Workspace">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">SUBMISSION HISTORY</div>
+          <h1>My Submissions</h1>
+          <p>Track review progress and feedback for all folders you have submitted to the Host.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral" id="btn-refresh-client-subs">Refresh</button>
+        </div>
+      </div>
+
+      <article class="card table-card">
+        <div class="table-head">
+          <h3>Submissions Archive</h3>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Submitted</th>
+                <th>Files</th>
+                <th>Size</th>
+                <th>Merkle Root</th>
+                <th>Status</th>
+                <th>Reviewer Notes</th>
+              </tr>
+            </thead>
+            <tbody id="client-submissions-table-rows">
+              <tr><td colspan="7" class="empty">No submissions found.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- CLIENT VIEW 4: REVIEW UPDATES -->
+    <section class="view" id="view-client-review" data-title="Review Updates" data-section="Client Workspace">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">PUBLISHED RELEASES</div>
+          <h1>Review Available Updates</h1>
+          <p>Inspect releases published by the Host and accept them before staging and applying.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral" id="btn-refresh-client-updates">Refresh Updates</button>
+        </div>
+      </div>
+
+      <div id="client-updates-container">
+        <p class="empty">Checking for published updates&hellip;</p>
+      </div>
+    </section>
+
+    <!-- CLIENT VIEW 5: RECEIVE UPDATES -->
+    <section class="view" id="view-client-receive" data-title="Receive Updates" data-section="Client Workspace">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">GUARDED UPDATE APPLICATION</div>
+          <h1>Receive &amp; Apply Updates</h1>
+          <p>Explicitly apply accepted updates into your local project folder with SHA-256 and Merkle verification.</p>
+        </div>
+      </div>
+
+      <article class="card styled-form" style="max-width: 800px;">
+        <article class="card policy-card" style="margin-bottom: 20px;">
+          <div class="kicker">VERIFICATION &amp; SAFETY</div>
+          <h2>Safe Staging &amp; Merkle Validation</h2>
+          <p>The update files are staged and independently verified against the published SHA-256 digests. Only after complete Merkle root verification is the local folder updated.</p>
+        </article>
+
+        <div class="form-row">
+          <label for="receive-update-id">Select Accepted Update</label>
+          <select id="receive-update-id" required>
+            <option value="">-- Choose an accepted update --</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <label for="receive-target-folder">Target Local Directory</label>
+          <div class="input-browse-row">
+            <input type="text" id="receive-target-folder" placeholder="C:\Users\&hellip;\MyProject" required>
+            <button type="button" class="btn neutral" id="btn-client-browse-target">Browse&hellip;</button>
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button type="button" class="btn forest-btn btn-lg" id="btn-apply-update-exec">Apply Verified Update</button>
+        </div>
+
+        <div id="client-apply-result" class="card result-card" style="display:none; margin-top:20px;">
+          <div class="table-head">
+            <h3 class="text-emerald">&#10003; Update Successfully Applied</h3>
+          </div>
+          <div class="kv-grid">
+            <div><span class="muted">Verified Merkle Root:</span> <code id="apply-result-root" class="hash-code-inline">&mdash;</code></div>
+            <div><span class="muted">Status:</span> <b>Target Folder Matches Published Release Exactly</b></div>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <!-- CLIENT VIEW 6: VERSION HISTORY -->
+    <section class="view" id="view-client-versions" data-title="Version History" data-section="Client Workspace">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">LOCAL RELEASES &amp; HISTORY</div>
+          <h1>Version History</h1>
+          <p>Audit trail of versions received and verified on this machine.</p>
+        </div>
+      </div>
+
+      <article class="card table-card">
+        <div class="table-head">
+          <h3>Received Releases</h3>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Version ID</th>
+                <th>Title</th>
+                <th>Status</th>
+                <th>Merkle Root</th>
+                <th>Applied Timestamp</th>
+              </tr>
+            </thead>
+            <tbody id="client-history-table-rows">
+              <tr><td colspan="5" class="empty">No updates applied yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- CLIENT VIEW 7: ACCOUNT & DEVICES -->
+    <section class="view" id="view-client-account" data-title="Account &amp; Access" data-section="Client Workspace">
+      <div class="page-heading">
+        <div>
+          <div class="kicker">CLIENT CREDENTIALS</div>
+          <h1>Account &amp; Access</h1>
+          <p>Review provisioned account identity, workspace assignments, and cryptographic permissions.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn danger" id="btn-client-logout-page">Sign Out</button>
+        </div>
+      </div>
+
+      <div class="grid-2col">
+        <article class="card">
+          <div class="table-head">
+            <h3>Client Identity</h3>
+          </div>
+          <div class="kv-grid">
+            <div><span class="muted">Username:</span> <b id="account-client-username">&mdash;</b></div>
+            <div><span class="muted">User ID:</span> <code id="account-client-id">&mdash;</code></div>
+            <div><span class="muted">Role:</span> <code>client</code></div>
+            <div><span class="muted">Status:</span> <span class="state-pill active" id="account-client-status">active</span></div>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="table-head">
+            <h3>Provisioned Permissions</h3>
+          </div>
+          <div class="permissions-list" id="account-permissions-list">
+            <div class="perm-item">&#10003; <b>submit</b> &ndash; Submit local folders for host review</div>
+            <div class="perm-item">&#10003; <b>view_versions</b> &ndash; View published workspace versions</div>
+            <div class="perm-item">&#10003; <b>download_updates</b> &ndash; Stage and inspect published files</div>
+            <div class="perm-item">&#10003; <b>accept_updates</b> &ndash; Explicitly accept and apply updates</div>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer>
+      <span>MerkleChain · C++17 Peer Synchronization &amp; Merkle Verification Engine</span>
+      <span>Control API: 127.0.0.1 Loopback Only · Peer Transport: mTLS Leaf-Pinned</span>
+    </footer>
+  </main>
+
+  <dialog id="restore-dialog" class="restore-dialog">
+    <form id="restore-form">
+      <button class="dialog-close" type="button" id="restore-close" aria-label="Close">×</button>
+      <div class="kicker">GUARDED RESTORE</div>
+      <h2>Restore saved snapshot?</h2>
+      <p id="restore-description">A recovery snapshot is created before the selected version is restored.</p>
+      <label for="restore-confirmation">Type <b>RESTORE</b> to confirm</label>
+      <input id="restore-confirmation" autocomplete="off" required>
+      <div class="dialog-actions">
+        <button class="btn neutral" type="button" id="restore-cancel">Cancel</button>
+        <button class="btn danger" type="submit" id="restore-submit">Restore version</button>
+      </div>
+      <p id="restore-error" class="error" role="alert"></p>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

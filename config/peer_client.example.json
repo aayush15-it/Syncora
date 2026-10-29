@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "role": "client",
+  "identity": "laptop_b",
+  "sync_root": "C:/MerkleChain-Test/B",
+  "host_address": "192.168.1.50",
+  "port": 9443,
+  "certificate_file": "certs/client.pem",
+  "private_key_file": "certs/client-key.pem",
+  "ca_file": "certs/peer-ca.pem",
+  "expected_peer_sha256": "REPLACE_WITH_EXACT_64_HEX_LOWERCASE_DER_SHA256_OF_HOST_CERT",
+  "handshake_timeout_seconds": 10,
+  "io_timeout_seconds": 30,
+  "max_manifest_files": 100000,
+  "max_file_size_bytes": 107374182400
+}
