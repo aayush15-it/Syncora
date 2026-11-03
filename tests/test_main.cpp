@@ -11,6 +11,13 @@
 #include "merklechain/peer/peer_transport.hpp"
 #include "merklechain/peer/peer_sync.hpp"
 #include "merklechain/peer/peer_session.hpp"
+#include "merklechain/cas/cas_types.hpp"
+#include "merklechain/cas/chunker.hpp"
+#include "merklechain/cas/file_manifest.hpp"
+#include "merklechain/cas/manifest_serializer.hpp"
+#include "merklechain/cas/object_store.hpp"
+#include "merklechain/collab_store.hpp"
+#include <random>
 #include <sqlite3.h>
 #include <algorithm>
 #include <cstdlib>
@@ -55,6 +62,10 @@ void run_collab_store_lifecycle_tests(const fs::path& fixture_root, void (*check
 void run_collab_store_workspace_locking_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
 void run_collab_store_phase2_recovery_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
 }
+namespace mc::cas {
+void run_cas_tests(const mc::fs::path& fixture_root, void (*check)(bool, const char*));
+void run_cas_collab_integration_tests(const mc::fs::path& fixture_root, void (*check)(bool, const char*));
+}
 
 int main(int argc,char** argv){
     std::cout.setf(std::ios::unitbuf);
@@ -63,6 +74,111 @@ int main(int argc,char** argv){
         mc::set_restore_fault_point_for_testing(mc::RestoreFaultPointForTesting::CrashAfterFirstAppliedFile);
         mc::VersionStore store(mc::fs::u8path(argv[3]),mc::fs::u8path(argv[4]));
         (void)store.restore(argv[5],mc::fs::u8path(argv[2]),true);return 87;
+    }
+    if(argc>=6&&std::string(argv[1])=="--cas-proc-worker"){
+        const mc::fs::path store_dir=mc::fs::u8path(argv[2]);
+        const std::uint32_t seed=static_cast<std::uint32_t>(std::stoul(argv[3]));
+        const std::size_t chunk_size=std::stoull(argv[4]);
+        const int count=std::stoi(argv[5]);
+        mc::cas::ObjectStoreConfig cfg{store_dir};
+        cfg.verify_on_read=true;
+        cfg.verify_on_write=true;
+        mc::cas::ObjectStore store(cfg);
+        std::string err;
+        if(!store.initialize(err))return 101;
+        std::vector<std::uint8_t> data(chunk_size);
+        std::mt19937 rng(seed);
+        for(std::size_t i=0;i<chunk_size;++i)data[i]=static_cast<std::uint8_t>(rng()&0xFF);
+        const std::string expected_hash=mc::sha256_data(data.data(),data.size());
+        for(int i=0;i<count;++i){
+            auto res=store.put_object(data.data(),data.size(),expected_hash);
+            if(res.status!=mc::cas::PutResultStatus::StoredNew&&res.status!=mc::cas::PutResultStatus::AlreadyExists)return 102;
+            std::vector<std::uint8_t> read_back;
+            if(!store.get_object(expected_hash,read_back)||read_back!=data)return 103;
+        }
+        return 0;
+    }
+    if(argc>=6&&std::string(argv[1])=="--cas-crash-worker"){
+        const mc::fs::path store_dir=mc::fs::u8path(argv[2]);
+        const std::string fault=argv[3];
+        const std::uint32_t seed=static_cast<std::uint32_t>(std::stoul(argv[4]));
+        const std::size_t chunk_size=std::stoull(argv[5]);
+        mc::cas::ObjectStoreConfig cfg{store_dir};
+        mc::cas::ObjectStore store(cfg);
+        std::string err;
+        store.initialize(err);
+        if(fault=="temp-write"){
+            mc::cas::set_cas_fault_point_for_testing(mc::cas::CasFaultPointForTesting::CrashDuringTempWrite);
+        }else if(fault=="before-promote"){
+            mc::cas::set_cas_fault_point_for_testing(mc::cas::CasFaultPointForTesting::CrashBeforePromotion);
+        }else if(fault=="after-promote"){
+            mc::cas::set_cas_fault_point_for_testing(mc::cas::CasFaultPointForTesting::CrashAfterPromotion);
+        }
+        std::vector<std::uint8_t> data(chunk_size);
+        std::mt19937 rng(seed);
+        for(std::size_t i=0;i<chunk_size;++i)data[i]=static_cast<std::uint8_t>(rng()&0xFF);
+        store.put_object(data.data(),data.size());
+        return 0;
+    }
+    if(argc>=6&&std::string(argv[1])=="--cas-manifest-crash"){
+        const mc::fs::path store_dir=mc::fs::u8path(argv[2]);
+        const mc::fs::path manifest_path=mc::fs::u8path(argv[3]);
+        const std::uint32_t seed=static_cast<std::uint32_t>(std::stoul(argv[4]));
+        const std::size_t data_size=std::stoull(argv[5]);
+        mc::cas::ObjectStoreConfig cfg{store_dir};
+        mc::cas::ObjectStore store(cfg);
+        std::string err;
+        store.initialize(err);
+        std::vector<std::uint8_t> data(data_size);
+        std::mt19937 rng(seed);
+        for(std::size_t i=0;i<data_size;++i)data[i]=static_cast<std::uint8_t>(rng()&0xFF);
+        mc::cas::FastCDCChunker chunker;
+        auto chunks=chunker.chunk_buffer(data.data(),data.size());
+        mc::cas::FileManifest manifest(data_size,mc::sha256_data(data.data(),data.size()),chunks);
+        for(const auto& c:chunks){
+            store.put_object(data.data()+c.offset,static_cast<std::size_t>(c.size),c.hash);
+        }
+        const auto bin=mc::cas::ManifestSerializer::serialize_binary(manifest);
+        mc::fs::create_directories(manifest_path.parent_path());
+        std::ofstream out(manifest_path,std::ios::binary|std::ios::trunc);
+        const std::size_t partial=bin.size()/2;
+        if(partial>0){
+            out.write(reinterpret_cast<const char*>(bin.data()),static_cast<std::streamsize>(partial));
+            out.flush();
+        }
+        std::_Exit(94);
+    }
+    if (argc >= 7 && std::string(argv[1]) == "--collab-crash-worker") {
+        const mc::fs::path db_path = mc::fs::u8path(argv[2]);
+        const mc::fs::path storage_dir = mc::fs::u8path(argv[3]);
+        const std::string ws_id = argv[4];
+        const std::string user_id = argv[5];
+        const std::string fault_str = argv[6];
+
+        mc::CollabFaultPoint fp = mc::CollabFaultPoint::None;
+        if (fault_str == "after-snapshot-promotion") {
+            fp = mc::CollabFaultPoint::FailAfterSnapshotPromotion;
+        } else if (fault_str == "after-staging-baseline") {
+            fp = mc::CollabFaultPoint::FailAfterStagingBaseline;
+        } else if (fault_str == "after-baseline-promotion") {
+            fp = mc::CollabFaultPoint::FailAfterBaselinePromotion;
+        } else if (fault_str == "after-commit") {
+            fp = mc::CollabFaultPoint::FailAfterCommit;
+        } else if (fault_str == "during-recovery") {
+            fp = mc::CollabFaultPoint::FailDuringRecovery;
+        }
+
+        mc::set_collab_fault_point_for_testing(fp);
+        mc::set_collab_process_exit_on_fault_for_testing(true);
+
+        mc::CollabStore store(db_path, storage_dir);
+        if (fault_str == "during-recovery") {
+            store.recover_incomplete_operations();
+            return 0;
+        }
+
+        store.publish_version(ws_id, user_id, "Crash Worker Release", "Testing process termination");
+        return 0;
     }
 #else
     (void)argc;(void)argv;
@@ -331,5 +447,7 @@ int main(int argc,char** argv){
     mc::run_collab_store_lifecycle_tests(base, check);
     mc::run_collab_store_workspace_locking_tests(base, check);
     mc::run_collab_store_phase2_recovery_tests(base, check);
+    mc::cas::run_cas_tests(base, check);
+    mc::cas::run_cas_collab_integration_tests(base, check);
     mc::fs::remove_all(base,ec);std::cout<<"Test checks: "<<passes<<" passed, "<<failures<<" failed, "<<skips<<" skipped\n";return failures?1:0;
 }

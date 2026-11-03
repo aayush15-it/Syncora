@@ -146,6 +146,7 @@ std::int64_t file_ticks_to_millis(std::int64_t ticks) {
 // ---------------------------------------------------------------------------
 namespace {
 std::atomic<CollabFaultPoint> g_collab_fault_point{CollabFaultPoint::None};
+std::atomic<bool> g_collab_process_exit_on_fault{false};
 }
 
 void set_collab_fault_point_for_testing(CollabFaultPoint fp) {
@@ -156,10 +157,23 @@ CollabFaultPoint get_collab_fault_point_for_testing() {
     return g_collab_fault_point.load();
 }
 
+void set_collab_process_exit_on_fault_for_testing(bool enable) {
+    g_collab_process_exit_on_fault.store(enable);
+}
+
+bool get_collab_process_exit_on_fault_for_testing() {
+    return g_collab_process_exit_on_fault.load();
+}
+
 static void trigger_collab_fault_point(CollabFaultPoint target, const char* name) {
     const auto active = g_collab_fault_point.load();
     if (active == target ||
         (target == CollabFaultPoint::FailAfterBaselineBackup && active == CollabFaultPoint::FailAfterBackup)) {
+#ifdef MERKLECHAIN_TESTING
+        if (g_collab_process_exit_on_fault.load()) {
+            std::_Exit(95);
+        }
+#endif
         throw CollabFaultPointInjected(name);
     }
 }
@@ -225,6 +239,16 @@ CollabStore::CollabStore(const fs::path& db_path, const fs::path& base_storage_d
     // db_mutex_ not required here: single-threaded construction phase.
     execute_sql("PRAGMA journal_mode = WAL;");
     execute_sql("PRAGMA foreign_keys = ON;");
+
+    // Initialize Content-Addressed Storage (CAS)
+    cas::ObjectStoreConfig cas_cfg{cas_root_dir()};
+    cas_cfg.verify_on_read = true;
+    cas_cfg.verify_on_write = true;
+    cas_store_ = std::make_unique<cas::ObjectStore>(std::move(cas_cfg));
+    std::string cas_err;
+    if (!cas_store_->initialize(cas_err)) {
+        throw std::runtime_error("Failed to initialize CAS store: " + cas_err);
+    }
 
     init_schema();
     seed_default_accounts_if_empty();
@@ -501,6 +525,44 @@ void CollabStore::init_schema() {
         CREATE INDEX IF NOT EXISTS idx_workspace_ops_ws ON workspace_operations(workspace_id);
         CREATE INDEX IF NOT EXISTS idx_workspace_ops_state ON workspace_operations(state);
         CREATE INDEX IF NOT EXISTS idx_security_timestamp ON security_events(timestamp_ms);
+
+        -- Milestone 3.2: Content-Addressed Storage (CAS) Metadata
+        CREATE TABLE IF NOT EXISTS cas_chunks (
+            chunk_hash TEXT PRIMARY KEY,
+            chunk_size INTEGER NOT NULL,
+            reference_count INTEGER NOT NULL DEFAULT 0 CHECK(reference_count >= 0),
+            created_at_ms INTEGER NOT NULL,
+            verified_at_ms INTEGER NOT NULL,
+            storage_state TEXT NOT NULL DEFAULT 'COMMITTED'
+        );
+        CREATE INDEX IF NOT EXISTS idx_cas_chunks_ref ON cas_chunks(reference_count);
+        CREATE INDEX IF NOT EXISTS idx_cas_chunks_state ON cas_chunks(storage_state);
+
+        CREATE TABLE IF NOT EXISTS version_manifests (
+            manifest_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+            version_id TEXT NOT NULL REFERENCES published_versions(id) ON DELETE CASCADE,
+            relative_path TEXT NOT NULL,
+            whole_file_sha256 TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            chunk_count INTEGER NOT NULL,
+            manifest_blob BLOB,
+            created_at_ms INTEGER NOT NULL,
+            UNIQUE(version_id, relative_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_version_manifests_ver ON version_manifests(version_id);
+        CREATE INDEX IF NOT EXISTS idx_version_manifests_ws ON version_manifests(workspace_id);
+        CREATE INDEX IF NOT EXISTS idx_version_manifests_hash ON version_manifests(whole_file_sha256);
+
+        CREATE TABLE IF NOT EXISTS version_manifest_chunks (
+            manifest_id TEXT NOT NULL REFERENCES version_manifests(manifest_id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL,
+            chunk_hash TEXT NOT NULL REFERENCES cas_chunks(chunk_hash),
+            chunk_size INTEGER NOT NULL,
+            PRIMARY KEY (manifest_id, chunk_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_manifest_chunks_hash ON version_manifest_chunks(chunk_hash);
+        CREATE INDEX IF NOT EXISTS idx_manifest_chunks_man ON version_manifest_chunks(manifest_id);
     )";
     execute_sql(schema);
 }
@@ -1692,6 +1754,8 @@ void CollabStore::recover_publish_version_op(const WorkspaceOperationRecord& op)
         }
     }
 
+    trigger_collab_fault_point(CollabFaultPoint::FailDuringRecovery, "FailDuringRecovery");
+
     if (fs::exists(backup_base)) {
         auto sres = validate_sentinel_file(backup_base, op.op_id, op.workspace_id, "backup_base");
         if (sres.valid) {
@@ -1884,9 +1948,43 @@ bool CollabStore::accept_submission(const std::string& sub_id, const std::string
             throw std::runtime_error("staging_work sentinel already exists");
         }
 
-        // Copy submission files into staging
-        copy_directory_recursive(sub_path, staging_base);
-        copy_directory_recursive(sub_path, staging_work);
+        // Milestone 3.2: FastCDC chunking, CAS insertion, and verified reconstruction
+        cas::FastCDCChunker chunker;
+        for (const auto& sf : sub_manifest.files) {
+            const auto src_file = sub_path / sf.relative_path;
+            std::vector<std::uint8_t> fbuf(sf.size);
+            if (sf.size > 0) {
+                std::ifstream fin(src_file, std::ios::binary);
+                if (!fin) throw std::runtime_error("failed to read submission file: " + sf.relative_path);
+                fin.read(reinterpret_cast<char*>(fbuf.data()), static_cast<std::streamsize>(sf.size));
+                if (static_cast<std::uintmax_t>(fin.gcount()) != sf.size) {
+                    throw std::runtime_error("short read on submission file: " + sf.relative_path);
+                }
+            }
+            const std::string computed_hash = sha256_data(fbuf.data(), fbuf.size());
+            if (computed_hash != sf.sha256) {
+                throw std::runtime_error("content hash mismatch on submission file: " + sf.relative_path);
+            }
+
+            auto chunks = chunker.chunk_buffer(fbuf.data(), fbuf.size());
+            for (const auto& c : chunks) {
+                auto pres = cas_store_->put_object(fbuf.data() + c.offset, static_cast<std::size_t>(c.size), c.hash);
+                if (pres.status != cas::PutResultStatus::StoredNew && pres.status != cas::PutResultStatus::AlreadyExists) {
+                    throw std::runtime_error("CAS put_object failed for " + c.hash + ": " + pres.error_message);
+                }
+            }
+
+            cas::FileManifest fman(sf.size, sf.sha256, chunks);
+            std::string recon_err;
+            const auto dest_base = staging_base / sf.relative_path;
+            const auto dest_work = staging_work / sf.relative_path;
+            if (!cas_store_->reconstruct_file(fman, dest_base, recon_err, true)) {
+                throw std::runtime_error("CAS reconstruction failed for staging_base " + sf.relative_path + ": " + recon_err);
+            }
+            if (!cas_store_->reconstruct_file(fman, dest_work, recon_err, true)) {
+                throw std::runtime_error("CAS reconstruction failed for staging_work " + sf.relative_path + ": " + recon_err);
+            }
+        }
 
         trigger_collab_fault_point(CollabFaultPoint::FailAfterStaging, "FailAfterStaging");
 
@@ -2394,6 +2492,45 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
             throw std::runtime_error("staging_ver sentinel already exists");
         }
 
+        // Milestone 3.2: Chunk working copy files, store into CAS, and serialize manifests
+        struct StagedManifestItem {
+            std::string rel_path;
+            std::string whole_file_sha256;
+            std::uintmax_t file_size{0};
+            cas::FileManifest file_man;
+            std::vector<std::uint8_t> binary_blob;
+        };
+        std::vector<StagedManifestItem> staged_manifests;
+        cas::FastCDCChunker chunker;
+        for (const auto& wf : manifest.files) {
+            const auto src_file = work_dir / wf.relative_path;
+            std::vector<std::uint8_t> fbuf(wf.size);
+            if (wf.size > 0) {
+                std::ifstream fin(src_file, std::ios::binary);
+                if (!fin) throw std::runtime_error("failed to read working copy file: " + wf.relative_path);
+                fin.read(reinterpret_cast<char*>(fbuf.data()), static_cast<std::streamsize>(wf.size));
+                if (static_cast<std::uintmax_t>(fin.gcount()) != wf.size) {
+                    throw std::runtime_error("short read on working copy file: " + wf.relative_path);
+                }
+            }
+            const std::string computed_hash = sha256_data(fbuf.data(), fbuf.size());
+            if (computed_hash != wf.sha256) {
+                throw std::runtime_error("content hash mismatch on working copy file: " + wf.relative_path);
+            }
+
+            auto chunks = chunker.chunk_buffer(fbuf.data(), fbuf.size());
+            for (const auto& c : chunks) {
+                auto pres = cas_store_->put_object(fbuf.data() + c.offset, static_cast<std::size_t>(c.size), c.hash);
+                if (pres.status != cas::PutResultStatus::StoredNew && pres.status != cas::PutResultStatus::AlreadyExists) {
+                    throw std::runtime_error("CAS put_object failed for " + c.hash + ": " + pres.error_message);
+                }
+            }
+
+            cas::FileManifest fman(wf.size, wf.sha256, chunks);
+            auto bin_blob = cas::ManifestSerializer::serialize_binary(fman);
+            staged_manifests.push_back({wf.relative_path, wf.sha256, wf.size, std::move(fman), std::move(bin_blob)});
+        }
+
         copy_directory_recursive(work_dir, staging_ver);
         const auto staged_ver_manifest = scan_folder(staging_ver);
         if (!staged_ver_manifest.complete || staged_ver_manifest.merkle_root != ver.merkle_root) {
@@ -2485,6 +2622,79 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
                     throw std::runtime_error("failed to insert published version: " + err);
                 }
                 stmt_registry_.finalize(stmt);
+
+                // Milestone 3.2: Record version manifests and update chunk reference counts
+                const auto now_ts = now_ms();
+                for (const auto& m : staged_manifests) {
+                    const std::string man_id = "man_" + generate_random_token(10);
+                    sqlite3_stmt* man_stmt = nullptr;
+                    const char* man_sql = R"(
+                        INSERT INTO version_manifests (manifest_id, workspace_id, version_id, relative_path, whole_file_sha256, file_size, chunk_count, manifest_blob, created_at_ms)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    )";
+                    man_stmt = stmt_registry_.prepare(db_, man_sql);
+                    if (!man_stmt) throw std::runtime_error("failed to prepare version_manifests insert");
+                    sqlite3_bind_text(man_stmt, 1, man_id.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_text(man_stmt, 2, actual_ws_id.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_text(man_stmt, 3, ver.id.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_text(man_stmt, 4, m.rel_path.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_text(man_stmt, 5, m.whole_file_sha256.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_int64(man_stmt, 6, static_cast<sqlite3_int64>(m.file_size));
+                    sqlite3_bind_int64(man_stmt, 7, static_cast<sqlite3_int64>(m.file_man.chunk_count()));
+                    sqlite3_bind_blob(man_stmt, 8, m.binary_blob.data(), static_cast<int>(m.binary_blob.size()), SQLITE_STATIC);
+                    sqlite3_bind_int64(man_stmt, 9, now_ts);
+                    if (sqlite3_step(man_stmt) != SQLITE_DONE) {
+                        std::string err = sqlite3_errmsg(db_);
+                        stmt_registry_.finalize(man_stmt);
+                        throw std::runtime_error("failed to insert version manifest: " + err);
+                    }
+                    stmt_registry_.finalize(man_stmt);
+
+                    // Upsert cas_chunks first (so FK reference in version_manifest_chunks succeeds)
+                    for (std::size_t ci = 0; ci < m.file_man.chunks().size(); ++ci) {
+                        const auto& chunk = m.file_man.chunks()[ci];
+
+                        // 1. Upsert cas_chunks reference count
+                        sqlite3_stmt* ref_stmt = nullptr;
+                        const char* ref_sql = R"(
+                            INSERT INTO cas_chunks (chunk_hash, chunk_size, reference_count, created_at_ms, verified_at_ms, storage_state)
+                            VALUES (?, ?, 1, ?, ?, 'COMMITTED')
+                            ON CONFLICT(chunk_hash) DO UPDATE SET reference_count = reference_count + 1, verified_at_ms = ?
+                        )";
+                        ref_stmt = stmt_registry_.prepare(db_, ref_sql);
+                        if (!ref_stmt) throw std::runtime_error("failed to prepare cas_chunks upsert");
+                        sqlite3_bind_text(ref_stmt, 1, chunk.hash.c_str(), -1, SQLITE_STATIC);
+                        sqlite3_bind_int64(ref_stmt, 2, static_cast<sqlite3_int64>(chunk.size));
+                        sqlite3_bind_int64(ref_stmt, 3, now_ts);
+                        sqlite3_bind_int64(ref_stmt, 4, now_ts);
+                        sqlite3_bind_int64(ref_stmt, 5, now_ts);
+                        if (sqlite3_step(ref_stmt) != SQLITE_DONE) {
+                            std::string err = sqlite3_errmsg(db_);
+                            stmt_registry_.finalize(ref_stmt);
+                            throw std::runtime_error("failed to update cas_chunk ref count: " + err);
+                        }
+                        stmt_registry_.finalize(ref_stmt);
+
+                        // 2. Insert into version_manifest_chunks
+                        sqlite3_stmt* chunk_stmt = nullptr;
+                        const char* chunk_sql = R"(
+                            INSERT INTO version_manifest_chunks (manifest_id, chunk_index, chunk_hash, chunk_size)
+                            VALUES (?, ?, ?, ?)
+                        )";
+                        chunk_stmt = stmt_registry_.prepare(db_, chunk_sql);
+                        if (!chunk_stmt) throw std::runtime_error("failed to prepare version_manifest_chunks insert");
+                        sqlite3_bind_text(chunk_stmt, 1, man_id.c_str(), -1, SQLITE_STATIC);
+                        sqlite3_bind_int64(chunk_stmt, 2, static_cast<sqlite3_int64>(ci));
+                        sqlite3_bind_text(chunk_stmt, 3, chunk.hash.c_str(), -1, SQLITE_STATIC);
+                        sqlite3_bind_int64(chunk_stmt, 4, static_cast<sqlite3_int64>(chunk.size));
+                        if (sqlite3_step(chunk_stmt) != SQLITE_DONE) {
+                            std::string err = sqlite3_errmsg(db_);
+                            stmt_registry_.finalize(chunk_stmt);
+                            throw std::runtime_error("failed to insert version_manifest_chunk: " + err);
+                        }
+                        stmt_registry_.finalize(chunk_stmt);
+                    }
+                }
 
                 // Notify/create client update records for active clients
                 std::vector<std::string> client_ids;
@@ -3049,6 +3259,272 @@ std::int64_t file_ticks_to_millis(std::int64_t ticks) {
     const auto system_time = std::chrono::system_clock::now() +
         std::chrono::duration_cast<std::chrono::system_clock::duration>(file_time - FileClock::now());
     return std::chrono::duration_cast<std::chrono::milliseconds>(system_time.time_since_epoch()).count();
+}
+
+
+bool CollabStore::reconstruct_version(const std::string& version_id,
+                                      const fs::path& destination_dir,
+                                      std::string& error_out) {
+    OperationGuard op_guard(*this);
+
+    std::string expected_merkle_root;
+    std::string ws_id;
+    std::vector<std::pair<std::string, std::vector<std::uint8_t>>> manifest_blobs;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        auto ver = find_version_by_id_nolock(version_id);
+        if (!ver) {
+            error_out = "Version not found: " + version_id;
+            return false;
+        }
+        expected_merkle_root = ver->merkle_root;
+        ws_id = ver->workspace_id;
+
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "SELECT relative_path, manifest_blob FROM version_manifests WHERE version_id = ? ORDER BY relative_path ASC";
+        stmt = stmt_registry_.prepare(db_, sql);
+        if (stmt) {
+            sqlite3_bind_text(stmt, 1, version_id.c_str(), -1, SQLITE_STATIC);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                std::string rel = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                const void* data = sqlite3_column_blob(stmt, 1);
+                int bytes = sqlite3_column_bytes(stmt, 1);
+                std::vector<std::uint8_t> blob;
+                if (data && bytes > 0) {
+                    const auto* p = reinterpret_cast<const std::uint8_t*>(data);
+                    blob.assign(p, p + bytes);
+                }
+                manifest_blobs.emplace_back(std::move(rel), std::move(blob));
+            }
+            stmt_registry_.finalize(stmt);
+        }
+    }
+
+    // Legacy fallback: if no manifests exist, check legacy snapshot or empty version
+    if (manifest_blobs.empty()) {
+        const auto legacy_dir = workspace_versions_dir(ws_id) / version_id;
+        if (fs::exists(legacy_dir)) {
+            const auto lm = scan_folder(legacy_dir);
+            if (lm.complete && lm.merkle_root == expected_merkle_root) {
+                std::error_code ec;
+                fs::create_directories(destination_dir, ec);
+                copy_directory_recursive(legacy_dir, destination_dir);
+                return true;
+            }
+        }
+        // If version has 0 files and empty merkle root, reconstruct as empty directory
+        if (expected_merkle_root == sha256_data("MERKLECHAIN-EMPTY-v1", 20)) {
+            std::error_code ec;
+            fs::create_directories(destination_dir, ec);
+            return true;
+        }
+        error_out = "No manifests found for version " + version_id + " and legacy snapshot unavailable";
+        return false;
+    }
+
+    // Reconstruct via temporary staging directory (WITHOUT holding db_mutex_)
+    const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto staging_parent = destination_dir.has_parent_path() ? destination_dir.parent_path() : fs::current_path();
+    const fs::path staging_dir = staging_parent / (".reconstruct_" + version_id + "_" + std::to_string(now_ns) + "_" + generate_random_token(6) + ".tmp");
+
+    std::error_code ec;
+    fs::create_directories(staging_dir, ec);
+    if (ec) {
+        error_out = "Failed to create staging directory for version reconstruction: " + ec.message();
+        return false;
+    }
+
+    for (const auto& [rel_path, blob] : manifest_blobs) {
+        // Path safety validation
+        if (rel_path.empty() || !safe_relative_path(rel_path)) {
+            fs::remove_all(staging_dir, ec);
+            error_out = "Unsafe relative path in manifest: " + rel_path;
+            return false;
+        }
+
+        cas::FileManifest man;
+        std::string parse_err;
+        if (!cas::ManifestSerializer::deserialize_binary(blob.data(), blob.size(), man, parse_err)) {
+            fs::remove_all(staging_dir, ec);
+            error_out = "Corrupted manifest for " + rel_path + ": " + parse_err;
+            return false;
+        }
+
+        const fs::path target_file = staging_dir / rel_path;
+        std::string recon_err;
+        if (!cas_store_->reconstruct_file(man, target_file, recon_err, true)) {
+            fs::remove_all(staging_dir, ec);
+            error_out = "Failed reconstructing " + rel_path + " from CAS: " + recon_err;
+            return false;
+        }
+    }
+
+    // Verify overall directory Merkle root matches published version
+    const auto recon_manifest = scan_folder(staging_dir);
+    if (!recon_manifest.complete || recon_manifest.merkle_root != expected_merkle_root) {
+        fs::remove_all(staging_dir, ec);
+        error_out = "Reconstructed version Merkle root mismatch: expected " + expected_merkle_root + ", got " + recon_manifest.merkle_root;
+        return false;
+    }
+
+    // Atomically promote staging directory to destination_dir
+    if (fs::exists(destination_dir)) {
+        fs::remove_all(destination_dir, ec);
+    }
+    fs::create_directories(destination_dir.parent_path(), ec);
+    fs::rename(staging_dir, destination_dir, ec);
+    if (ec) {
+        copy_directory_recursive(staging_dir, destination_dir);
+        fs::remove_all(staging_dir, ec);
+    }
+
+    return true;
+}
+
+std::vector<cas::FileManifest> CollabStore::get_version_manifests(const std::string& version_id,
+                                                                 std::string& error_out) {
+    OperationGuard op_guard(*this);
+    std::vector<std::vector<std::uint8_t>> blobs;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "SELECT manifest_blob FROM version_manifests WHERE version_id = ? ORDER BY relative_path ASC";
+        stmt = stmt_registry_.prepare(db_, sql);
+        if (!stmt) {
+            error_out = "Failed to prepare manifest query";
+            return {};
+        }
+        sqlite3_bind_text(stmt, 1, version_id.c_str(), -1, SQLITE_STATIC);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const void* data = sqlite3_column_blob(stmt, 0);
+            int bytes = sqlite3_column_bytes(stmt, 0);
+            if (data && bytes > 0) {
+                const auto* p = reinterpret_cast<const std::uint8_t*>(data);
+                blobs.emplace_back(p, p + bytes);
+            }
+        }
+        stmt_registry_.finalize(stmt);
+    }
+
+    std::vector<cas::FileManifest> manifests;
+    manifests.reserve(blobs.size());
+    for (const auto& b : blobs) {
+        cas::FileManifest man;
+        std::string err;
+        if (!cas::ManifestSerializer::deserialize_binary(b.data(), b.size(), man, err)) {
+            error_out = "Failed deserializing manifest: " + err;
+            return {};
+        }
+        manifests.push_back(std::move(man));
+    }
+    return manifests;
+}
+
+std::size_t CollabStore::get_chunk_reference_count(const std::string& chunk_hash) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "SELECT reference_count FROM cas_chunks WHERE chunk_hash = ?";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) return 0;
+    sqlite3_bind_text(stmt, 1, chunk_hash.c_str(), -1, SQLITE_STATIC);
+    std::size_t count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = static_cast<std::size_t>(sqlite3_column_int64(stmt, 0));
+    }
+    stmt_registry_.finalize(stmt);
+    return count;
+}
+
+bool CollabStore::audit_cas_reference_integrity(std::string& error_out) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
+    // Check for negative reference counts
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql_neg = "SELECT chunk_hash, reference_count FROM cas_chunks WHERE reference_count < 0";
+    stmt = stmt_registry_.prepare(db_, sql_neg);
+    if (stmt) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string h = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            int rc = sqlite3_column_int(stmt, 1);
+            stmt_registry_.finalize(stmt);
+            error_out = "Negative reference count detected for chunk " + h + ": " + std::to_string(rc);
+            return false;
+        }
+        stmt_registry_.finalize(stmt);
+    }
+
+    // Check drift between cas_chunks.reference_count and COUNT(version_manifest_chunks)
+    const char* sql_drift = R"(
+        SELECT c.chunk_hash, c.reference_count, COUNT(vmc.chunk_hash)
+        FROM cas_chunks c
+        LEFT JOIN version_manifest_chunks vmc ON c.chunk_hash = vmc.chunk_hash
+        GROUP BY c.chunk_hash
+        HAVING c.reference_count != COUNT(vmc.chunk_hash)
+    )";
+    stmt = stmt_registry_.prepare(db_, sql_drift);
+    if (stmt) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string h = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            int expected = sqlite3_column_int(stmt, 1);
+            int actual = sqlite3_column_int(stmt, 2);
+            stmt_registry_.finalize(stmt);
+            error_out = "Reference count drift for " + h + ": recorded " + std::to_string(expected) + ", actual manifest count " + std::to_string(actual);
+            return false;
+        }
+        stmt_registry_.finalize(stmt);
+    }
+
+    // Check for dangling manifest chunk references lacking a cas_chunks catalog entry
+    const char* sql_orphan = R"(
+        SELECT vmc.chunk_hash
+        FROM version_manifest_chunks vmc
+        LEFT JOIN cas_chunks c ON vmc.chunk_hash = c.chunk_hash
+        WHERE c.chunk_hash IS NULL
+        LIMIT 1
+    )";
+    stmt = stmt_registry_.prepare(db_, sql_orphan);
+    if (stmt) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string h = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            stmt_registry_.finalize(stmt);
+            error_out = "Dangling manifest chunk reference without cas_chunks record: " + h;
+            return false;
+        }
+        stmt_registry_.finalize(stmt);
+    }
+
+    // Verify physical CAS existence and size match for all active referenced chunks
+    std::vector<std::pair<std::string, std::uintmax_t>> chunks_to_verify;
+    const char* sql_phys = "SELECT chunk_hash, chunk_size FROM cas_chunks WHERE reference_count > 0";
+    stmt = stmt_registry_.prepare(db_, sql_phys);
+    if (stmt) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string h = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            auto sz = static_cast<std::uintmax_t>(sqlite3_column_int64(stmt, 1));
+            chunks_to_verify.emplace_back(std::move(h), sz);
+        }
+        stmt_registry_.finalize(stmt);
+    }
+
+    for (const auto& [h, expected_sz] : chunks_to_verify) {
+        if (!cas_store_->has_object(h)) {
+            error_out = "Referenced chunk missing from physical CAS storage: " + h;
+            return false;
+        }
+        if (cas_store_->object_size(h) != expected_sz) {
+            error_out = "Referenced chunk size mismatch in physical CAS storage for " + h + ": expected " + std::to_string(expected_sz) + ", found " + std::to_string(cas_store_->object_size(h));
+            return false;
+        }
+        auto vres = cas::ObjectVerifier::verify_object(cas_store_->object_path(h), h, expected_sz);
+        if (!vres.valid) {
+            error_out = "Referenced chunk cryptographic hash corruption for " + h + ": " + vres.error;
+            return false;
+        }
+    }
+
+    return true;
 }
 
 } // namespace mc

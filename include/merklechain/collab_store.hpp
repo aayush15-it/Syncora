@@ -3,6 +3,12 @@
 #include "merklechain/types.hpp"
 #include "merklechain/hash.hpp"
 #include "merklechain/scanner.hpp"
+#include "merklechain/cas/cas_types.hpp"
+#include "merklechain/cas/chunker.hpp"
+#include "merklechain/cas/file_manifest.hpp"
+#include "merklechain/cas/manifest_serializer.hpp"
+#include "merklechain/cas/object_store.hpp"
+#include "merklechain/cas/object_verifier.hpp"
 
 #include <sqlite3.h>
 #include <chrono>
@@ -135,6 +141,27 @@ struct CollabFileDiff {
     std::string diff_text;
 };
 
+struct CollabVersionManifestRecord {
+    std::string manifest_id;
+    std::string workspace_id;
+    std::string version_id;
+    std::string relative_path;
+    std::string whole_file_sha256;
+    std::uintmax_t file_size{0};
+    std::size_t chunk_count{0};
+    std::vector<std::uint8_t> manifest_blob;
+    std::int64_t created_at_ms{0};
+};
+
+struct CollabCasChunkRecord {
+    std::string chunk_hash;
+    std::size_t chunk_size{0};
+    std::size_t reference_count{0};
+    std::int64_t created_at_ms{0};
+    std::int64_t verified_at_ms{0};
+    std::string storage_state;
+};
+
 // ---------------------------------------------------------------------------
 // CollabFaultPoint: Controlled failpoints for testing crash recovery
 // ---------------------------------------------------------------------------
@@ -148,11 +175,14 @@ enum class CollabFaultPoint {
     FailAfterCommit,
     FailAfterSnapshotPromotion,
     FailAfterStagingBaseline,
-    FailAfterBaselineBackup
+    FailAfterBaselineBackup,
+    FailDuringRecovery
 };
 
 void set_collab_fault_point_for_testing(CollabFaultPoint fp);
 CollabFaultPoint get_collab_fault_point_for_testing();
+void set_collab_process_exit_on_fault_for_testing(bool enable);
+bool get_collab_process_exit_on_fault_for_testing();
 
 class CollabFaultPointInjected : public std::runtime_error {
 public:
@@ -376,6 +406,22 @@ public:
     const fs::path& storage_root() const { return base_storage_dir_; }
     const fs::path& database_path() const { return db_path_; }
 
+    // Content-Addressed Storage & Manifest APIs
+    fs::path cas_root_dir() const { return base_storage_dir_ / "cas"; }
+    cas::ObjectStore& cas_store() { return *cas_store_; }
+    const cas::ObjectStore& cas_store() const { return *cas_store_; }
+
+    bool reconstruct_version(const std::string& version_id,
+                             const fs::path& destination_dir,
+                             std::string& error_out);
+
+    std::vector<cas::FileManifest> get_version_manifests(const std::string& version_id,
+                                                         std::string& error_out);
+
+    std::size_t get_chunk_reference_count(const std::string& chunk_hash);
+
+    bool audit_cas_reference_integrity(std::string& error_out);
+
     // ---------------------------------------------------------------------------
     // Infrastructure accessors for testing only
     // ---------------------------------------------------------------------------
@@ -420,6 +466,7 @@ private:
     fs::path db_path_;
     fs::path base_storage_dir_;
     sqlite3* db_{nullptr};
+    std::unique_ptr<cas::ObjectStore> cas_store_;
 
     // -----------------------------------------------------------------------
     // Prepared statement registry

@@ -4,3 +4,6 @@
 /.merklechain/
 /collab_workspaces/
 *.tmp
+/.agents/
+/scratch/
+skills-lock.json

@@ -6,14 +6,16 @@ CPPFLAGS := -Iinclude $(shell "$(PKG_CONFIG)" --cflags openssl sqlite3)
 CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -O2
 LDLIBS := $(shell "$(PKG_CONFIG)" --libs openssl sqlite3) -lws2_32 -lshell32 -luuid
 PEER_SOURCES := src/peer/peer_protocol.cpp src/peer/peer_config.cpp src/peer/peer_auth.cpp src/peer/peer_transport.cpp src/peer/peer_sync.cpp src/peer/peer_session.cpp src/peer/peer_service.cpp src/peer/peer_controller.cpp
+CAS_SOURCES := src/cas/chunker.cpp src/cas/file_manifest.cpp src/cas/manifest_serializer.cpp src/cas/object_store.cpp src/cas/object_verifier.cpp
 BASE_SOURCES := src/main.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/folder_picker.cpp src/collab_store.cpp src/web_server.cpp
-SOURCES := $(BASE_SOURCES) $(PEER_SOURCES)
-HEADERS := $(wildcard include/merklechain/*.hpp include/merklechain/peer/*.hpp)
+SOURCES := $(BASE_SOURCES) $(PEER_SOURCES) $(CAS_SOURCES)
+HEADERS := $(wildcard include/merklechain/*.hpp include/merklechain/peer/*.hpp include/merklechain/cas/*.hpp)
 OBJECTS := $(patsubst src/%.cpp,build/%.o,$(BASE_SOURCES)) build/peer_protocol.o build/peer_config.o build/peer_auth.o build/peer_transport.o build/peer_sync.o build/peer_session.o build/peer_service.o build/peer_controller.o
 TARGET := build/merklechain.exe
 DASHBOARD_PORT ?= 47831
-TEST_SOURCES := tests/test_main.cpp tests/collab_store_tests.cpp tests/peer_transport_tests.cpp tests/peer_sync_tests.cpp tests/peer_session_tests.cpp tests/peer_service_tests.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/collab_store.cpp $(PEER_SOURCES)
+TEST_SOURCES := tests/test_main.cpp tests/cas/cas_tests.cpp tests/cas/cas_collab_integration_tests.cpp tests/collab_store_tests.cpp tests/peer_transport_tests.cpp tests/peer_sync_tests.cpp tests/peer_session_tests.cpp tests/peer_service_tests.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/collab_store.cpp $(PEER_SOURCES) $(CAS_SOURCES)
 BENCH_SOURCES := benchmarks/chunk_benchmark.cpp src/chunk_sync.cpp src/hash.cpp src/staging_file.cpp
+CAS_BENCH_SOURCES := benchmarks/cas_benchmark.cpp $(CAS_SOURCES) src/hash.cpp
 
 .PHONY: all test benchmark dashboard-test clean run-local run-dashboard help
 all: $(TARGET)
@@ -68,11 +70,18 @@ build/chunk_benchmark.exe: $(BENCH_SOURCES) $(HEADERS)
 	@mkdir -p build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -UMERKLECHAIN_TESTING $(BENCH_SOURCES) -o $@ $(TEST_LDLIBS)
 
+build/cas_benchmark.exe: $(CAS_BENCH_SOURCES) $(HEADERS)
+	@mkdir -p build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -UMERKLECHAIN_TESTING $(CAS_BENCH_SOURCES) -o $@ $(TEST_LDLIBS)
+
 test: build/tests.exe
 	build/tests.exe
 
 benchmark: build/chunk_benchmark.exe
 	build/chunk_benchmark.exe
+
+cas-benchmark: build/cas_benchmark.exe
+	build/cas_benchmark.exe
 
 run-local: $(TARGET)
 	$(TARGET) --local
