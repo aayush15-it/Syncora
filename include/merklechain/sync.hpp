@@ -36,6 +36,8 @@ struct SyncExecutionOptions {
     fs::file_time_type::clock::time_point file_clock_now{fs::file_time_type::clock::now()};
 };
 
+void reject_symlink_path(const fs::path& root, const std::string& relative);
+
 bool execute_plan(std::vector<SyncJob>& jobs, const fs::path& destination_root,
                   const fs::path& backup_root,
                   const std::function<void(const SyncJob&)>& after_verified_job={},

@@ -1456,7 +1456,8 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                     std::string sub_action = parts.size() >= 5 ? parts[4] : (parts.size() >= 4 ? parts[3] : optional_string(*pbody, "action"));
                     std::string notes = optional_string(*pbody, "notes", optional_string(*pbody, "reason", ""));
                     if (sub_action == "accept") {
-                        store.accept_submission(sub_id, auth.user.id, notes);
+                        bool ok = store.accept_submission(sub_id, auth.user.id, notes);
+                        if (!ok) return {400, "application/json; charset=utf-8", "{\"success\":false,\"error\":\"Failed to accept submission\"}"};
                         return {200, "application/json; charset=utf-8", "{\"success\":true,\"message\":\"Submission accepted. Baseline and working copy established.\"}"};
                     }
                     if (sub_action == "reject") {
@@ -1550,40 +1551,186 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
     }
 }
 
-HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t port) {
-    ParsedUrl url = parse_url(request.target);
-    if (url.path.rfind("/api/auth/", 0) == 0 ||
-        url.path.rfind("/api/host/", 0) == 0 ||
-        url.path.rfind("/api/client/", 0) == 0) {
-        return handle_collab_api(request, state, port, url);
-    }
-
-    if(request.method=="GET"&&request.target=="/api/status") {
+std::optional<HttpResponse> handle_peer_get_api(const Request& request, ServerState& state) {
+    if(request.method!="GET") return std::nullopt;
+    if(request.target=="/api/status" || request.target=="/api/peer/status") {
         const auto ps = peer::PeerController::instance().get_status();
-        return {200,"application/json; charset=utf-8", serialize_peer_status(ps, state.csrf)};
+        return HttpResponse{200,"application/json; charset=utf-8", serialize_peer_status(ps, state.csrf)};
     }
-    if(request.method=="GET"&&request.target=="/api/peer/status") {
-        const auto ps = peer::PeerController::instance().get_status();
-        return {200,"application/json; charset=utf-8", serialize_peer_status(ps, state.csrf)};
-    }
-    if(request.method=="GET"&&request.target=="/api/peer/plan") {
+    if(request.target=="/api/peer/plan") {
         const auto plan = peer::PeerController::instance().get_pending_plan();
-        if(!plan) return {200,"application/json; charset=utf-8","{\"has_plan\":false}"};
+        if(!plan) return HttpResponse{200,"application/json; charset=utf-8","{\"has_plan\":false}"};
         const auto ps = peer::PeerController::instance().get_status();
-        return {200,"application/json; charset=utf-8", serialize_peer_plan(*plan, ps.session_id)};
+        return HttpResponse{200,"application/json; charset=utf-8", serialize_peer_plan(*plan, ps.session_id)};
     }
-    if(request.method=="GET"&&request.target=="/api/peer/activity") {
-        return {200,"application/json; charset=utf-8", peer::PeerController::instance().get_history_json()};
+    if(request.target=="/api/peer/activity") {
+        return HttpResponse{200,"application/json; charset=utf-8", peer::PeerController::instance().get_history_json()};
     }
-    if(request.method=="GET"&&request.target=="/api/peer/diagnostics") {
-        return {200,"application/json; charset=utf-8", peer::PeerController::instance().get_diagnostics_json()};
+    if(request.target=="/api/peer/diagnostics") {
+        return HttpResponse{200,"application/json; charset=utf-8", peer::PeerController::instance().get_diagnostics_json()};
     }
-    if(request.method!="POST")return {405,"application/json; charset=utf-8",json_error("method not allowed")};
-    const auto origin=request.headers.find("origin");
-    const auto expected_origin="http://127.0.0.1:"+std::to_string(port);
-    if(origin==request.headers.end()||origin->second!=expected_origin)return {403,"application/json; charset=utf-8",json_error("request origin is not allowed")};
-    JsonObjectParser body(request.body);parse_body(request,body);
+    return std::nullopt;
+}
 
+std::optional<HttpResponse> handle_peer_post_api(const Request& request, ServerState& state, const JsonObjectParser& body) {
+    if(request.target=="/api/peer/validate-config") {
+        validate_allowed_fields(body,
+            {"csrf","role","identity","device_id","sync_root","bind_address","host_address","peer_address","address","certificate_file","cert_path","private_key_file","key_path","ca_file","ca_path","expected_peer_sha256","expected_peer_pin"},
+            {},
+            {"port","peer_port"}
+        );
+        require_csrf(body,state);
+        peer::PeerConfig cfg;
+        const auto role_str = require_string(body,"role");
+        if (role_str != "host" && role_str != "client") {
+            throw std::runtime_error("invalid role: must be host or client");
+        }
+        cfg.role = (role_str == "host") ? peer::Role::Host : peer::Role::Client;
+
+        cfg.identity = optional_string(body,"identity");
+        if (cfg.identity.empty()) cfg.identity = optional_string(body,"device_id");
+        if (cfg.identity.empty()) throw std::runtime_error("device identity is required");
+
+        cfg.sync_root = input_path(require_string(body,"sync_root"));
+
+        const auto port_num = optional_number(body, "port", optional_number(body, "peer_port", 47832));
+        if (port_num < 1024 || port_num > 65535) {
+            throw std::runtime_error("port must be between 1024 and 65535");
+        }
+        cfg.port = static_cast<std::uint16_t>(port_num);
+
+        std::string addr = optional_string(body, "bind_address");
+        if (addr.empty()) addr = optional_string(body, "host_address");
+        if (addr.empty()) addr = optional_string(body, "peer_address");
+        if (addr.empty()) addr = optional_string(body, "address");
+        if (cfg.role == peer::Role::Host) {
+            cfg.bind_address = addr.empty() ? "0.0.0.0" : addr;
+        } else {
+            cfg.host_address = addr.empty() ? "127.0.0.1" : addr;
+        }
+
+        std::string cert_file = optional_string(body, "certificate_file");
+        if (cert_file.empty()) cert_file = optional_string(body, "cert_path");
+        if (!cert_file.empty()) cfg.certificate_file = input_path(cert_file);
+
+        std::string key_file = optional_string(body, "private_key_file");
+        if (key_file.empty()) key_file = optional_string(body, "key_path");
+        if (!key_file.empty()) cfg.private_key_file = input_path(key_file);
+
+        std::string ca = optional_string(body, "ca_file");
+        if (ca.empty()) ca = optional_string(body, "ca_path");
+        if (!ca.empty()) cfg.ca_file = input_path(ca);
+
+        cfg.expected_peer_sha256 = optional_string(body, "expected_peer_sha256");
+        if (cfg.expected_peer_sha256.empty()) cfg.expected_peer_sha256 = optional_string(body, "expected_peer_pin");
+
+        const auto val = peer::PeerController::instance().validate_config(cfg);
+        if(!val.valid) {
+            return HttpResponse{200,"application/json; charset=utf-8","{\"valid\":false,\"error\":\""+quote(val.error)+"\",\"message\":\""+quote(val.error)+"\",\"local_cert_sha256\":\"\"}"};
+        }
+        return HttpResponse{200,"application/json; charset=utf-8","{\"valid\":true,\"error\":\"\",\"message\":\"Configuration valid\",\"local_cert_sha256\":"+quote(val.local_cert_sha256)+"}"};
+    }
+    if(request.target=="/api/peer/configure") {
+        validate_allowed_fields(body,
+            {"csrf","config_path","role","identity","device_id","sync_root","bind_address","host_address","peer_address","address","certificate_file","cert_path","private_key_file","key_path","ca_file","ca_path","expected_peer_sha256","expected_peer_pin"},
+            {},
+            {"port","peer_port"}
+        );
+        require_csrf(body,state);
+        peer::PeerConfig cfg;
+        const auto config_path_str = optional_string(body,"config_path");
+        if (!config_path_str.empty()) {
+            const auto role_str = optional_string(body,"role","client");
+            const auto exp_role = (role_str == "host") ? peer::Role::Host : peer::Role::Client;
+            cfg = peer::load_peer_config(input_path(config_path_str), exp_role);
+        } else {
+            const auto role_str = require_string(body,"role");
+            if (role_str != "host" && role_str != "client") {
+                throw std::runtime_error("invalid role: must be host or client");
+            }
+            cfg.role = (role_str == "host") ? peer::Role::Host : peer::Role::Client;
+
+            cfg.identity = optional_string(body,"identity");
+            if (cfg.identity.empty()) cfg.identity = optional_string(body,"device_id");
+            if (cfg.identity.empty()) throw std::runtime_error("device identity is required");
+
+            cfg.sync_root = canonical_directory(input_path(require_string(body,"sync_root")));
+
+            const auto port_num = optional_number(body, "port", optional_number(body, "peer_port", 47832));
+            if (port_num < 1024 || port_num > 65535) {
+                throw std::runtime_error("port must be between 1024 and 65535");
+            }
+            cfg.port = static_cast<std::uint16_t>(port_num);
+
+            std::string addr = optional_string(body, "bind_address");
+            if (addr.empty()) addr = optional_string(body, "host_address");
+            if (addr.empty()) addr = optional_string(body, "peer_address");
+            if (addr.empty()) addr = optional_string(body, "address");
+            if (cfg.role == peer::Role::Host) {
+                cfg.bind_address = addr.empty() ? "0.0.0.0" : addr;
+            } else {
+                cfg.host_address = addr.empty() ? "127.0.0.1" : addr;
+            }
+
+            std::string cert_file = optional_string(body, "certificate_file");
+            if (cert_file.empty()) cert_file = optional_string(body, "cert_path");
+            if (!cert_file.empty()) cfg.certificate_file = input_path(cert_file);
+
+            std::string key_file = optional_string(body, "private_key_file");
+            if (key_file.empty()) key_file = optional_string(body, "key_path");
+            if (!key_file.empty()) cfg.private_key_file = input_path(key_file);
+
+            std::string ca = optional_string(body, "ca_file");
+            if (ca.empty()) ca = optional_string(body, "ca_path");
+            if (!ca.empty()) cfg.ca_file = input_path(ca);
+
+            cfg.expected_peer_sha256 = optional_string(body, "expected_peer_sha256");
+            if (cfg.expected_peer_sha256.empty()) cfg.expected_peer_sha256 = optional_string(body, "expected_peer_pin");
+        }
+        std::string err;
+        if (!peer::PeerController::instance().configure(cfg, err)) {
+            return HttpResponse{400,"application/json; charset=utf-8",json_error(err)};
+        }
+        const auto ps = peer::PeerController::instance().get_status();
+        return HttpResponse{200,"application/json; charset=utf-8", serialize_peer_status(ps, state.csrf)};
+    }
+    if(request.target=="/api/peer/start") {
+        require_fields(body,{"csrf"});
+        require_csrf(body,state);
+        std::string err;
+        if (!peer::PeerController::instance().start(err)) {
+            return HttpResponse{400,"application/json; charset=utf-8",json_error(err)};
+        }
+        const auto ps = peer::PeerController::instance().get_status();
+        return HttpResponse{200,"application/json; charset=utf-8", serialize_peer_status(ps, state.csrf)};
+    }
+    if(request.target=="/api/peer/stop") {
+        require_fields(body,{"csrf"});
+        require_csrf(body,state);
+        peer::PeerController::instance().stop();
+        return HttpResponse{200,"application/json; charset=utf-8","{\"success\":true,\"message\":\"Peer operation stopped or cancelled\"}"};
+    }
+    if(request.target=="/api/peer/approve") {
+        validate_allowed_fields(body,
+            {"csrf","session_id","plan_hash"},
+            {"approve","confirm_deletions"},
+            {}
+        );
+        require_csrf(body,state);
+        const auto session_id = optional_string(body,"session_id");
+        const auto plan_hash = optional_string(body,"plan_hash");
+        const bool approve = require_bool(body,"approve");
+        const bool confirm_deletions = optional_bool(body,"confirm_deletions",false);
+        std::string err;
+        if (!peer::PeerController::instance().submit_approval(session_id, plan_hash, approve, confirm_deletions, err)) {
+            return HttpResponse{400,"application/json; charset=utf-8",json_error(err)};
+        }
+        return HttpResponse{200,"application/json; charset=utf-8","{\"success\":true,\"approved\":"+(approve?std::string("true"):std::string("false"))+"}"};
+    }
+    return std::nullopt;
+}
+
+std::optional<HttpResponse> handle_local_sync_api(const Request& request, ServerState& state, const JsonObjectParser& body) {
     if(request.target=="/api/pick-folder") {
         require_fields(body,{"csrf","slot"});require_csrf(body,state);
         const auto slot=require_string(body,"slot");
@@ -1594,9 +1741,9 @@ HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t 
         else if(slot=="target") picker_title = L"Select Folder to Receive Update";
         else throw std::runtime_error("slot must be a, b, submission, client, or target");
         const auto selected=pick_folder(picker_title.c_str());
-        if(!selected)return {200,"application/json; charset=utf-8","{\"cancelled\":true}"};
+        if(!selected)return HttpResponse{200,"application/json; charset=utf-8","{\"cancelled\":true}"};
         state.plan.reset();
-        return {200,"application/json; charset=utf-8","{\"cancelled\":false,\"path\":"+quote(path_utf8(fs::path(*selected)))+"}"};
+        return HttpResponse{200,"application/json; charset=utf-8","{\"cancelled\":false,\"path\":"+quote(path_utf8(fs::path(*selected)))+"}"};
     }
     if(request.target=="/api/list-files") {
         require_fields(body,{"csrf","path"});require_csrf(body,state);
@@ -1612,7 +1759,7 @@ HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t 
                 ",\"sha256\":"+quote(f.sha256)+"}";
         }
         output+="]}";
-        return {200,"application/json; charset=utf-8",output};
+        return HttpResponse{200,"application/json; charset=utf-8",output};
     }
     if(request.target=="/api/scan") {
         require_fields_ext(body,{"csrf","source","destination"},{"scope_mode","scope_paths"},{},{"scope_paths"},{"scope"});
@@ -1649,7 +1796,7 @@ HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t 
         scope_paths_json+="]";
         std::string scope_json="{\"mode\":"+quote(scope.mode)+",\"paths\":"+scope_paths_json+"}";
 
-        return {200,"application/json; charset=utf-8","{\"plan_id\":"+quote(plan.id)+",\"source\":"+quote(plan.source_root)+
+        return HttpResponse{200,"application/json; charset=utf-8","{\"plan_id\":"+quote(plan.id)+",\"source\":"+quote(plan.source_root)+
             ",\"destination\":"+quote(plan.destination_root)+",\"source_merkle_root\":"+quote(plan.source_merkle)+
             ",\"destination_merkle_root\":"+quote(plan.destination_merkle)+",\"expected_merkle_root\":"+quote(plan.expected_merkle)+
             ",\"scope\":"+scope_json+",\"source_files\":"+source_files+
@@ -1728,7 +1875,7 @@ HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t 
             ",\"elapsed_ms\":"+std::to_string(elapsed_ms)+
             ",\"verified\":"+(verified?"true":"false")+"}";
 
-        return {200,"application/json; charset=utf-8",std::string("{\"success\":")+(verified?"true":"false")+
+        return HttpResponse{200,"application/json; charset=utf-8",std::string("{\"success\":")+(verified?"true":"false")+
             ",\"final_merkle_root\":"+quote(final_manifest.merkle_root)+",\"expected_merkle_root\":"+quote(plan.expected_merkle)+
             ",\"chunk_metrics\":"+metrics_json+",\"jobs\":"+serialize_jobs(jobs)+
             ",\"message\":"+quote(verified?"Synchronization completed and Merkle root verified":"Synchronization failed or final Merkle verification did not match")+"}"};
@@ -1737,9 +1884,9 @@ HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t 
         require_fields(body,{"csrf","destination"});require_csrf(body,state);
         const auto destination=canonical_directory(input_path(require_string(body,"destination")));
         const auto internal=destination/".merklechain";const auto database=internal/"activity.sqlite3";
-        std::error_code error;if(!fs::is_regular_file(database,error)||error)return {200,"application/json; charset=utf-8","{\"versions\":[]}"};
+        std::error_code error;if(!fs::is_regular_file(database,error)||error)return HttpResponse{200,"application/json; charset=utf-8","{\"versions\":[]}"};
         VersionStore versions(database,internal);
-        return {200,"application/json; charset=utf-8",serialize_versions(versions,state,destination)};
+        return HttpResponse{200,"application/json; charset=utf-8",serialize_versions(versions,state,destination)};
     }
     if(request.target=="/api/restore") {
         require_fields(body,{"csrf","destination","version_id","restore_token","confirmation"});require_csrf(body,state);
@@ -1752,7 +1899,7 @@ HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t 
         state.plan.reset();
         const auto internal=destination/".merklechain";VersionStore versions(internal/"activity.sqlite3",internal);
         const bool restored=versions.restore(require_string(body,"version_id"),destination,true);
-        return {200,"application/json; charset=utf-8",std::string("{\"success\":")+(restored?"true":"false")+
+        return HttpResponse{200,"application/json; charset=utf-8",std::string("{\"success\":")+(restored?"true":"false")+
             ",\"message\":"+quote(restored?"Version restored and verified":"Restore failed verification; recovery data was retained")+"}"};
     }
     if(request.target=="/api/activity") {
@@ -1760,171 +1907,47 @@ HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t 
         const auto destination=canonical_directory(input_path(require_string(body,"destination")));
         const auto internal=destination/".merklechain";std::error_code error;
         const auto internal_status=fs::symlink_status(internal,error);
-        if(error==std::errc::no_such_file_or_directory||(!error&&!fs::exists(internal_status)))return {200,"application/json; charset=utf-8","{\"activity\":[]}"};
-        if(error||fs::is_symlink(internal_status))throw std::runtime_error("application state directory cannot be a symbolic link");
+        if(error==std::errc::no_such_file_or_directory||(!error&&!fs::exists(internal_status)))return HttpResponse{200,"application/json; charset=utf-8","{\"activity\":[]}"};
+        if(error||fs::is_symlink(internal_status)||is_reparse_point_or_symlink(internal))throw std::runtime_error("application state directory cannot be a symbolic link or directory junction");
         const auto database=internal/"activity.sqlite3";error.clear();
-        if(!fs::is_regular_file(database,error)||error)return {200,"application/json; charset=utf-8","{\"activity\":[]}"};
+        if(!fs::is_regular_file(database,error)||error)return HttpResponse{200,"application/json; charset=utf-8","{\"activity\":[]}"};
         const auto db_status=fs::symlink_status(database,error);
-        if(error||fs::is_symlink(db_status))throw std::runtime_error("activity database cannot be a symbolic link");
-        return {200,"application/json; charset=utf-8",activity_json(database)};
+        if(error||fs::is_symlink(db_status)||is_reparse_point_or_symlink(database))throw std::runtime_error("activity database cannot be a symbolic link or directory junction");
+        return HttpResponse{200,"application/json; charset=utf-8",activity_json(database)};
     }
-    if(request.target=="/api/peer/validate-config") {
-        validate_allowed_fields(body,
-            {"csrf","role","identity","device_id","sync_root","bind_address","host_address","peer_address","address","certificate_file","cert_path","private_key_file","key_path","ca_file","ca_path","expected_peer_sha256","expected_peer_pin"},
-            {},
-            {"port","peer_port"}
-        );
-        require_csrf(body,state);
-        peer::PeerConfig cfg;
-        const auto role_str = require_string(body,"role");
-        if (role_str != "host" && role_str != "client") {
-            throw std::runtime_error("invalid role: must be host or client");
-        }
-        cfg.role = (role_str == "host") ? peer::Role::Host : peer::Role::Client;
-        
-        cfg.identity = optional_string(body,"identity");
-        if (cfg.identity.empty()) cfg.identity = optional_string(body,"device_id");
-        if (cfg.identity.empty()) throw std::runtime_error("device identity is required");
-
-        cfg.sync_root = input_path(require_string(body,"sync_root"));
-        
-        const auto port_num = optional_number(body, "port", optional_number(body, "peer_port", 47832));
-        if (port_num < 1024 || port_num > 65535) {
-            throw std::runtime_error("port must be between 1024 and 65535");
-        }
-        cfg.port = static_cast<std::uint16_t>(port_num);
-
-        std::string addr = optional_string(body, "bind_address");
-        if (addr.empty()) addr = optional_string(body, "host_address");
-        if (addr.empty()) addr = optional_string(body, "peer_address");
-        if (addr.empty()) addr = optional_string(body, "address");
-        if (cfg.role == peer::Role::Host) {
-            cfg.bind_address = addr.empty() ? "0.0.0.0" : addr;
-        } else {
-            cfg.host_address = addr.empty() ? "127.0.0.1" : addr;
-        }
-
-        std::string cert_file = optional_string(body, "certificate_file");
-        if (cert_file.empty()) cert_file = optional_string(body, "cert_path");
-        if (!cert_file.empty()) cfg.certificate_file = input_path(cert_file);
-
-        std::string key_file = optional_string(body, "private_key_file");
-        if (key_file.empty()) key_file = optional_string(body, "key_path");
-        if (!key_file.empty()) cfg.private_key_file = input_path(key_file);
-
-        std::string ca = optional_string(body, "ca_file");
-        if (ca.empty()) ca = optional_string(body, "ca_path");
-        if (!ca.empty()) cfg.ca_file = input_path(ca);
-
-        cfg.expected_peer_sha256 = optional_string(body, "expected_peer_sha256");
-        if (cfg.expected_peer_sha256.empty()) cfg.expected_peer_sha256 = optional_string(body, "expected_peer_pin");
-
-        const auto val = peer::PeerController::instance().validate_config(cfg);
-        if(!val.valid) {
-            return {200,"application/json; charset=utf-8","{\"valid\":false,\"error\":"+quote(val.error)+",\"message\":"+quote(val.error)+",\"local_cert_sha256\":\"\"}"};
-        }
-        return {200,"application/json; charset=utf-8","{\"valid\":true,\"error\":\"\",\"message\":\"Configuration valid\",\"local_cert_sha256\":"+quote(val.local_cert_sha256)+"}"};
-    }
-    if(request.target=="/api/peer/configure") {
-        validate_allowed_fields(body,
-            {"csrf","config_path","role","identity","device_id","sync_root","bind_address","host_address","peer_address","address","certificate_file","cert_path","private_key_file","key_path","ca_file","ca_path","expected_peer_sha256","expected_peer_pin"},
-            {},
-            {"port","peer_port"}
-        );
-        require_csrf(body,state);
-        peer::PeerConfig cfg;
-        const auto config_path_str = optional_string(body,"config_path");
-        if (!config_path_str.empty()) {
-            const auto role_str = optional_string(body,"role","client");
-            const auto exp_role = (role_str == "host") ? peer::Role::Host : peer::Role::Client;
-            cfg = peer::load_peer_config(input_path(config_path_str), exp_role);
-        } else {
-            const auto role_str = require_string(body,"role");
-            if (role_str != "host" && role_str != "client") {
-                throw std::runtime_error("invalid role: must be host or client");
-            }
-            cfg.role = (role_str == "host") ? peer::Role::Host : peer::Role::Client;
-
-            cfg.identity = optional_string(body,"identity");
-            if (cfg.identity.empty()) cfg.identity = optional_string(body,"device_id");
-            if (cfg.identity.empty()) throw std::runtime_error("device identity is required");
-
-            cfg.sync_root = canonical_directory(input_path(require_string(body,"sync_root")));
-
-            const auto port_num = optional_number(body, "port", optional_number(body, "peer_port", 47832));
-            if (port_num < 1024 || port_num > 65535) {
-                throw std::runtime_error("port must be between 1024 and 65535");
-            }
-            cfg.port = static_cast<std::uint16_t>(port_num);
-
-            std::string addr = optional_string(body, "bind_address");
-            if (addr.empty()) addr = optional_string(body, "host_address");
-            if (addr.empty()) addr = optional_string(body, "peer_address");
-            if (addr.empty()) addr = optional_string(body, "address");
-            if (cfg.role == peer::Role::Host) {
-                cfg.bind_address = addr.empty() ? "0.0.0.0" : addr;
-            } else {
-                cfg.host_address = addr.empty() ? "127.0.0.1" : addr;
-            }
-
-            std::string cert_file = optional_string(body, "certificate_file");
-            if (cert_file.empty()) cert_file = optional_string(body, "cert_path");
-            if (!cert_file.empty()) cfg.certificate_file = input_path(cert_file);
-
-            std::string key_file = optional_string(body, "private_key_file");
-            if (key_file.empty()) key_file = optional_string(body, "key_path");
-            if (!key_file.empty()) cfg.private_key_file = input_path(key_file);
-
-            std::string ca = optional_string(body, "ca_file");
-            if (ca.empty()) ca = optional_string(body, "ca_path");
-            if (!ca.empty()) cfg.ca_file = input_path(ca);
-
-            cfg.expected_peer_sha256 = optional_string(body, "expected_peer_sha256");
-            if (cfg.expected_peer_sha256.empty()) cfg.expected_peer_sha256 = optional_string(body, "expected_peer_pin");
-        }
-        std::string err;
-        if (!peer::PeerController::instance().configure(cfg, err)) {
-            return {400,"application/json; charset=utf-8",json_error(err)};
-        }
-        const auto ps = peer::PeerController::instance().get_status();
-        return {200,"application/json; charset=utf-8", serialize_peer_status(ps, state.csrf)};
-    }
-    if(request.target=="/api/peer/start") {
-        require_fields(body,{"csrf"});
-        require_csrf(body,state);
-        std::string err;
-        if (!peer::PeerController::instance().start(err)) {
-            return {400,"application/json; charset=utf-8",json_error(err)};
-        }
-        const auto ps = peer::PeerController::instance().get_status();
-        return {200,"application/json; charset=utf-8", serialize_peer_status(ps, state.csrf)};
-    }
-    if(request.target=="/api/peer/stop") {
-        require_fields(body,{"csrf"});
-        require_csrf(body,state);
-        peer::PeerController::instance().stop();
-        return {200,"application/json; charset=utf-8","{\"success\":true,\"message\":\"Peer operation stopped or cancelled\"}"};
-    }
-    if(request.target=="/api/peer/approve") {
-        validate_allowed_fields(body,
-            {"csrf","session_id","plan_hash"},
-            {"approve","confirm_deletions"},
-            {}
-        );
-        require_csrf(body,state);
-        const auto session_id = optional_string(body,"session_id");
-        const auto plan_hash = optional_string(body,"plan_hash");
-        const bool approve = require_bool(body,"approve");
-        const bool confirm_deletions = optional_bool(body,"confirm_deletions",false);
-        std::string err;
-        if (!peer::PeerController::instance().submit_approval(session_id, plan_hash, approve, confirm_deletions, err)) {
-            return {400,"application/json; charset=utf-8",json_error(err)};
-        }
-        return {200,"application/json; charset=utf-8","{\"success\":true,\"approved\":"+(approve?std::string("true"):std::string("false"))+"}"};
-    }
-    return {404,"application/json; charset=utf-8",json_error("endpoint not found")};
+    return std::nullopt;
 }
 
+HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t port) {
+    ParsedUrl url = parse_url(request.target);
+    if (url.path.rfind("/api/auth/", 0) == 0 ||
+        url.path.rfind("/api/host/", 0) == 0 ||
+        url.path.rfind("/api/client/", 0) == 0) {
+        return handle_collab_api(request, state, port, url);
+    }
+
+    if (auto res = handle_peer_get_api(request, state)) {
+        return *res;
+    }
+
+    if(request.method!="POST") return {405,"application/json; charset=utf-8",json_error("method not allowed")};
+    const auto origin=request.headers.find("origin");
+    const auto expected_origin="http://127.0.0.1:"+std::to_string(port);
+    if(origin==request.headers.end()||origin->second!=expected_origin) return {403,"application/json; charset=utf-8",json_error("request origin is not allowed")};
+
+    JsonObjectParser body(request.body);
+    parse_body(request,body);
+
+    if (auto res = handle_peer_post_api(request, state, body)) {
+        return *res;
+    }
+
+    if (auto res = handle_local_sync_api(request, state, body)) {
+        return *res;
+    }
+
+    return {404,"application/json; charset=utf-8",json_error("endpoint not found")};
+}
 std::string mime_type(const std::string& path) {
     if(path=="/"||path=="/index.html")return "text/html; charset=utf-8";
     if(path=="/styles.css")return "text/css; charset=utf-8";

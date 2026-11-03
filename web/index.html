@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>MerkleChain — Peer Network &amp; Synchronization Console</title>
+  <title>MerkleChain — Secure File Synchronization &amp; Collaboration Platform</title>
   <link rel="stylesheet" href="/styles.css">
   <script defer src="/app.js"></script>
 </head>
@@ -82,10 +82,18 @@
       <a class="nav-link" id="nav-peer-activity" href="#peer-activity" data-view="peer-activity"><span>☷</span>Activity &amp; Recovery</a>
     </div>
 
+    <!-- SETTINGS NAV GROUP -->
+    <div class="nav-group workspace-group-settings" id="nav-group-settings" style="display:none;">
+      <div class="nav-label">SETTINGS &amp; SYSTEM</div>
+      <a class="nav-link active" id="nav-settings-overview" href="#settings" data-view="settings"><span>⚙</span>Settings Dashboard</a>
+      <a class="nav-link" id="nav-settings-local" href="#local-overview" data-go="local-overview"><span>⌂</span>Local Workspace</a>
+      <a class="nav-link" id="nav-settings-network" href="#network-select" data-go="network-select"><span>👥</span>Network Model</a>
+    </div>
+
     <div class="sidebar-bottom">
       <div class="workspace-switch-card">
         <button type="button" class="btn-switch-workspace" id="btn-toggle-workspace" data-go="overview">
-          Switch to Peer Network <span>⇄</span>
+          Switch to Network Model <span>⇄</span>
         </button>
       </div>
       <a class="nav-link" id="nav-settings" href="#settings" data-view="settings"><span>⚙</span>Settings</a>
@@ -116,7 +124,7 @@
           <button class="btn forest-btn btn-xs" id="btn-topbar-conn" data-go="connection">Connection Panel →</button>
         </div>
         <span id="role-badge" class="mode-badge role-none">STANDBY</span>
-        <span id="workspace-mode-badge" class="state-pill active">Offline Mode</span>
+        <span id="workspace-mode-badge" class="state-pill active">Local Engine</span>
         <button class="icon-btn-minimal" data-go="settings" title="Settings" aria-label="Settings">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3"/>
@@ -337,8 +345,7 @@
           <div class="landing-top-right">
             <nav class="landing-top-nav" aria-label="Direct workspace access">
               <a href="#local-overview" data-go="local-overview" class="btn neutral btn-xs">Local Workspace</a>
-              <a href="#network-select" data-go="network-select" class="btn forest-btn btn-xs">Network Model (Host / Client)</a>
-              <a href="#overview" data-go="overview" class="btn neutral btn-xs">Peer Network</a>
+              <a href="#network-select" data-go="network-select" class="btn forest-btn btn-xs">Network Model</a>
             </nav>
             <span class="landing-kicker-desc">FILE SYNCHRONIZATION ENGINE</span>
             <button class="icon-btn-minimal" data-go="settings" title="Engine Settings" aria-label="Settings">
@@ -371,10 +378,9 @@
                 </div>
               </div>
               <div class="mode-info">
-                <div class="mode-tag-pill">LOCAL ENGINE</div>
                 <h2>Local Workspace</h2>
                 <p>Synchronize two local folders, detect file changes, verify integrity, and inspect synchronization history.</p>
-                <a href="#local-overview" class="btn forest-btn" id="btn-landing-local" data-go="local-overview">Open Local Workspace <span>→</span></a>
+                <a href="#local-overview" class="btn forest-btn" id="btn-landing-local" data-go="local-overview">Open Local Workspace <span>&rarr;</span></a>
               </div>
             </article>
 
@@ -401,41 +407,9 @@
                 </div>
               </div>
               <div class="mode-info">
-                <div class="mode-tag-pill mode-tag-highlight">TEAM COLLABORATION</div>
                 <h2>Network Model</h2>
                 <p>Share folders with authorized clients, review submitted files, edit working copies, publish versions, and distribute approved updates.</p>
-                <a href="#network-select" class="btn forest-btn" id="btn-landing-collab" data-go="network-select">Open Network Model <span>→</span></a>
-              </div>
-            </article>
-
-            <!-- 3. Peer Network (TLS P2P) Card -->
-            <article class="landing-mode-card" id="landing-card-network">
-              <div class="mode-illu-container">
-                <div class="network-illu-art">
-                  <div class="laptop-device laptop-left">
-                    <div class="laptop-screen"></div>
-                    <div class="laptop-base"></div>
-                  </div>
-                  <div class="network-shield-badge">
-                    <svg class="wifi-radiate" viewBox="0 0 24 24" width="22" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                      <path d="M5 12.55a11 11 0 0 1 14.08 0M8.5 15.55a6 6 0 0 1 7.08 0"/>
-                    </svg>
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-                      <path d="m9 12 2 2 4-4"/>
-                    </svg>
-                  </div>
-                  <div class="laptop-device laptop-right">
-                    <div class="laptop-screen"></div>
-                    <div class="laptop-base"></div>
-                  </div>
-                </div>
-              </div>
-              <div class="mode-info">
-                <div class="mode-tag-pill">P2P DEVICE PAIRING</div>
-                <h2>Peer Network</h2>
-                <p>Pair trusted devices and synchronize through mutual TLS authenticated connections with certificate pinning.</p>
-                <a href="#overview" class="btn neutral" id="btn-landing-network" data-go="overview">Open Peer Network <span>→</span></a>
+                <a href="#network-select" class="btn forest-btn" id="btn-landing-collab" data-go="network-select">Open Network Model <span>&rarr;</span></a>
               </div>
             </article>
           </div>
@@ -611,7 +585,7 @@
               <div class="kicker">LOCAL DEVICE PROFILE</div>
               <h2 id="overview-device-id">Unconfigured</h2>
             </div>
-            <span id="overview-role-badge" class="badge">NO ROLE</span>
+            <span id="overview-role-badge" class="badge">STANDBY</span>
           </div>
           <div class="profile-details">
             <div class="detail-row">
@@ -873,7 +847,7 @@
             </div>
             <div class="auth-row">
               <span>Last Error / Diagnostics:</span>
-              <span id="auth-error" class="error-text">None</span>
+              <span id="auth-error" class="error-text">&mdash;</span>
             </div>
           </div>
         </article>
@@ -1080,7 +1054,7 @@
         <div class="progress-stats-grid">
           <div class="pstat-box">
             <small>CURRENT FILE</small>
-            <code id="prog-current-file">None</code>
+            <code id="prog-current-file">&mdash;</code>
           </div>
           <div class="pstat-box">
             <small>BYTES TRANSFERRED</small>
@@ -1416,6 +1390,7 @@
             <div><small class="muted">DESTINATION TREE DEPTH</small><div id="merkle-dest-depth" style="font-weight:600; margin-top:0.25rem;">—</div></div>
             <div><small class="muted">DIFFERING LEAF NODES</small><div id="merkle-diff-count" style="font-weight:600; margin-top:0.25rem;">—</div></div>
           </div>
+          <div id="merkle-levels-interactive" style="margin-top: 14px;"></div>
         </div>
       </div>
       <article class="card table-card"><div class="table-head"><div><div class="kicker">FILE LEAVES</div><h3>Manifest digests &amp; leaf hashes</h3></div><input id="merkle-search" type="search" placeholder="Filter path or hash…"></div><div class="table-scroll"><table><thead><tr><th>Path</th><th>Change state</th><th>Source SHA-256</th><th>Destination SHA-256</th><th>Source Leaf Hash</th><th>Destination Leaf Hash</th><th>Difference Reason</th></tr></thead><tbody id="merkle-rows"></tbody></table><p id="merkle-empty" class="empty">Run a comparison to inspect actual leaves.</p></div></article>
@@ -1424,6 +1399,7 @@
     <section class="view" id="view-chunks" data-title="Chunks &amp; reuse" data-section="Local Workspace">
       <div class="page-heading"><div><div class="kicker">ALGORITHM EXPLORER / FIXED-SIZE CHUNKING</div><h1>Chunks &amp; reuse</h1><p>Measured counters from actual Local Mode sync jobs, not estimated disk I/O or network traffic.</p></div><span class="state-pill">1 MiB default</span></div>
       <div class="summary-cards six"><div class="summary-card"><small>PAYLOAD</small><b id="chunk-payload">—</b></div><div class="summary-card"><small>SOURCE PROCESSED</small><b id="chunk-processed">—</b></div><div class="summary-card"><small>REUSED</small><b id="chunk-reused">—</b></div><div class="summary-card"><small>STAGING WRITTEN</small><b id="chunk-written">—</b></div><div class="summary-card"><small>CHUNKS REUSED / TOTAL</small><b id="chunk-count">—</b></div><div class="summary-card"><small>VERIFICATION</small><b id="chunk-integrity">Awaiting sync</b></div></div>
+      <article class="card" id="dedup-summary-card" style="margin-top: 16px;"><div class="kicker">DEDUPLICATION VISUALIZATION</div><h3>Block Reuse vs Transfer</h3><div id="dedup-visual-container"></div></article>
       <article class="card"><div class="kicker">RECORDED TRANSFERS</div><div id="chunk-rows" class="record-list"><p class="empty">No completed transfer metrics loaded.</p></div></article>
     </section>
 
@@ -1441,17 +1417,215 @@
       <article class="card"><div id="activity-list" class="record-list"><p class="empty">Choose Folder B in Synchronize to load SQLite records.</p></div></article>
     </section>
 
-    <!-- SETTINGS VIEW -->
+    <!-- SETTINGS DASHBOARD VIEW -->
     <section class="view" id="view-settings" data-title="Settings" data-section="System">
-      <div class="page-heading"><div><div class="kicker">ENGINE &amp; SECURITY SETTINGS</div><h1>Settings</h1><p>Effective settings reported by the local C++17 MerkleChain engine.</p></div></div>
-      <article class="card settings-list">
-        <div class="setting"><div><b>Dashboard bind address</b><small>Local loopback API access only</small></div><code>127.0.0.1:<span class="port-value">47831</span></code></div>
-        <div class="setting"><div><b>Peer Service port</b><small>Dedicated mTLS listener</small></div><code id="set-peer-port">47832</code></div>
-        <div class="setting"><div><b>Network Transport Security</b><small>TLS mutual authentication with certificate pinning</small></div><span class="badge">TLS 1.3 / mTLS</span></div>
-        <div class="setting"><div><b>Integrity Hash Algorithm</b><small>Merkle tree digests and file verification</small></div><code>SHA-256</code></div>
-        <div class="setting"><div><b>Default chunk size</b><small>Chunking baseline for transfer optimization</small></div><code>1 MiB</code></div>
-        <div class="setting"><div><b>Approval Policy</b><small>Cryptographically bound plan verification before commit</small></div><code>Mandatory Interactive</code></div>
-      </article>
+      <div class="page-heading">
+        <div>
+          <div class="kicker">SYSTEM PREFERENCES &amp; ENGINE CONFIGURATION</div>
+          <h1>Settings Dashboard</h1>
+          <p>Configure runtime policies, network bindings, storage defaults, and synchronization security parameters.</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn neutral" data-go="home">&larr; Return to Landing</button>
+          <button class="btn neutral" id="btn-reset-settings">Reset Defaults</button>
+          <button class="btn forest-btn" id="btn-save-settings">Save Configuration</button>
+        </div>
+      </div>
+
+      <div id="settings-save-feedback" class="card result-card" style="display:none; margin-bottom: 20px;">
+        <div class="table-head">
+          <h3 class="text-emerald">&#10003; Configuration Saved</h3>
+          <span class="badge badge-active">Applied to Engine</span>
+        </div>
+        <p style="margin: 0; padding: 12px 20px; font-size: 0.88rem; color: var(--text-body);">Your system preferences and synchronization parameters have been saved successfully.</p>
+      </div>
+
+      <div class="grid-2col">
+        <!-- Card 1: Engine & Cryptographic Integrity -->
+        <article class="card settings-panel-card">
+          <div class="table-head">
+            <h3>Engine &amp; Cryptographic Integrity</h3>
+            <span class="badge">Core</span>
+          </div>
+          <div class="settings-list">
+            <div class="setting">
+              <div>
+                <b>Integrity Hash Algorithm</b>
+                <small>Cryptographic hash used for Merkle tree digests and chunk verification</small>
+              </div>
+              <select id="cfg-hash-algo" class="setting-control-select">
+                <option value="SHA-256" selected>SHA-256 (Standard)</option>
+                <option value="SHA-512">SHA-512 (High Security)</option>
+                <option value="BLAKE3">BLAKE3 (High Throughput)</option>
+              </select>
+            </div>
+            <div class="setting">
+              <div>
+                <b>Default Chunk Size</b>
+                <small>Baseline block boundary for content deduplication</small>
+              </div>
+              <select id="cfg-chunk-size" class="setting-control-select">
+                <option value="256KB">256 KiB</option>
+                <option value="512KB">512 KiB</option>
+                <option value="1MB" selected>1 MiB (Recommended)</option>
+                <option value="2MB">2 MiB</option>
+                <option value="4MB">4 MiB</option>
+              </select>
+            </div>
+            <div class="setting">
+              <div>
+                <b>Merkle Verification Policy</b>
+                <small>Strict root digest comparison before staging files to destination</small>
+              </div>
+              <select id="cfg-verify-policy" class="setting-control-select">
+                <option value="strict" selected>Strict Pre-Commit Verification</option>
+                <option value="audit">Audit Log Verification</option>
+              </select>
+            </div>
+            <div class="setting">
+              <div>
+                <b>Chunk Deduplication &amp; Cache</b>
+                <small>Re-use existing chunks across local and peer synchronization sessions</small>
+              </div>
+              <label class="check-line">
+                <input type="checkbox" id="cfg-dedup-enabled" checked> Enabled
+              </label>
+            </div>
+          </div>
+        </article>
+
+        <!-- Card 2: Network & Loopback Bindings -->
+        <article class="card settings-panel-card">
+          <div class="table-head">
+            <h3>Network &amp; Loopback Bindings</h3>
+            <span class="badge">Transport</span>
+          </div>
+          <div class="settings-list">
+            <div class="setting">
+              <div>
+                <b>Dashboard Bind Address</b>
+                <small>Local loopback access restriction for control API</small>
+              </div>
+              <div class="setting-inline-input">
+                <code class="hash-code-inline">127.0.0.1:<span class="port-value">47831</span></code>
+              </div>
+            </div>
+            <div class="setting">
+              <div>
+                <b>Peer Service Listener Port</b>
+                <small>Dedicated mTLS listener port for authenticated peer transfers</small>
+              </div>
+              <div class="setting-inline-input">
+                <input type="number" id="cfg-peer-port" class="setting-number-input" value="47832" min="1024" max="65535">
+                <code id="set-peer-port" style="display:none;">47832</code>
+              </div>
+            </div>
+            <div class="setting">
+              <div>
+                <b>Transport Security</b>
+                <small>Mutual TLS with certificate leaf-pinning authentication</small>
+              </div>
+              <select id="cfg-tls-mode" class="setting-control-select">
+                <option value="mtls" selected>TLS 1.3 / mTLS Leaf-Pinned</option>
+                <option value="tls13">TLS 1.3 Standard</option>
+                <option value="loopback">Loopback Only</option>
+              </select>
+            </div>
+            <div class="setting">
+              <div>
+                <b>Connection Timeout</b>
+                <small>Socket timeout for peer handshakes and keepalives</small>
+              </div>
+              <select id="cfg-conn-timeout" class="setting-control-select">
+                <option value="15">15 seconds</option>
+                <option value="30" selected>30 seconds</option>
+                <option value="60">60 seconds</option>
+              </select>
+            </div>
+          </div>
+        </article>
+      </div>
+
+      <div class="grid-2col" style="margin-top: 20px;">
+        <!-- Card 3: Collaboration & Access Policies -->
+        <article class="card settings-panel-card">
+          <div class="table-head">
+            <h3>Collaboration &amp; Access Policies</h3>
+            <span class="badge">Governance</span>
+          </div>
+          <div class="settings-list">
+            <div class="setting">
+              <div>
+                <b>Interactive Plan Approval</b>
+                <small>Cryptographically bound plan verification before committing changes</small>
+              </div>
+              <select id="cfg-approval-policy" class="setting-control-select">
+                <option value="mandatory" selected>Mandatory Interactive</option>
+                <option value="auto-trusted">Automate for Trusted Nodes</option>
+              </select>
+            </div>
+            <div class="setting">
+              <div>
+                <b>Working Copy Isolation</b>
+                <small>Preserve original client submissions as permanent immutable baselines</small>
+              </div>
+              <label class="check-line">
+                <input type="checkbox" id="cfg-working-copy-isolation" checked disabled> Enforced (Immutable)
+              </label>
+            </div>
+            <div class="setting">
+              <div>
+                <b>Client Authentication Hash</b>
+                <small>PBKDF2 salted derivation algorithm for credential security</small>
+              </div>
+              <select id="cfg-pbkdf2-iter" class="setting-control-select">
+                <option value="100000" selected>100,000 iterations (Salted)</option>
+                <option value="250000">250,000 iterations (Strict)</option>
+              </select>
+            </div>
+          </div>
+        </article>
+
+        <!-- Card 4: UI & Sync Workspace Preferences -->
+        <article class="card settings-panel-card">
+          <div class="table-head">
+            <h3>UI &amp; Workspace Preferences</h3>
+            <span class="badge">Preferences</span>
+          </div>
+          <div class="settings-list">
+            <div class="setting">
+              <div>
+                <b>Default Startup View</b>
+                <small>Initial dashboard view shown when launching the application</small>
+              </div>
+              <select id="cfg-default-view" class="setting-control-select">
+                <option value="home" selected>Mode Selection (Landing)</option>
+                <option value="local-overview">Local Workspace</option>
+                <option value="network-select">Network Model Gateway</option>
+              </select>
+            </div>
+            <div class="setting">
+              <div>
+                <b>Diff Viewer Layout</b>
+                <small>Default visualization layout for file change comparisons</small>
+              </div>
+              <select id="cfg-diff-style" class="setting-control-select">
+                <option value="unified" selected>Unified Line-by-Line Diff</option>
+                <option value="split">Side-by-Side Split Diff</option>
+              </select>
+            </div>
+            <div class="setting">
+              <div>
+                <b>In-App Notifications &amp; Alerts</b>
+                <small>Show visual toast confirmation on sync and update operations</small>
+              </div>
+              <label class="check-line">
+                <input type="checkbox" id="cfg-toasts-enabled" checked> Enabled
+              </label>
+            </div>
+          </div>
+        </article>
+      </div>
     </section>
 
         <!-- ============================================================= -->
@@ -2056,7 +2230,7 @@
         </div>
       </div>
 
-      <article class="card styled-form" style="max-width: 800px;">
+      <article class="card styled-form form-card-contained">
         <div class="form-row">
           <label for="client-source-folder">Local Folder Path</label>
           <div class="input-browse-row">
@@ -2152,7 +2326,7 @@
         </div>
       </div>
 
-      <article class="card styled-form" style="max-width: 800px;">
+      <article class="card styled-form form-card-contained">
         <article class="card policy-card" style="margin-bottom: 20px;">
           <div class="kicker">VERIFICATION &amp; SAFETY</div>
           <h2>Safe Staging &amp; Merkle Validation</h2>
@@ -2263,10 +2437,7 @@
       </div>
     </section>
 
-    <footer>
-      <span>MerkleChain · C++17 Peer Synchronization &amp; Merkle Verification Engine</span>
-      <span>Control API: 127.0.0.1 Loopback Only · Peer Transport: mTLS Leaf-Pinned</span>
-    </footer>
+
   </main>
 
   <dialog id="restore-dialog" class="restore-dialog">

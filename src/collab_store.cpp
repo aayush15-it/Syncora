@@ -1,4 +1,5 @@
 #include "merklechain/collab_store.hpp"
+#include "merklechain/scanner.hpp"
 #include "merklechain/staging_file.hpp"
 #include "merklechain/sync.hpp"
 
@@ -14,20 +15,25 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_set>
+#include <atomic>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace mc {
 
 namespace {
-
-std::string to_hex(const unsigned char* data, std::size_t len) {
-    std::ostringstream ss;
-    ss << std::hex << std::setfill('0');
-    for (std::size_t i = 0; i < len; ++i) {
-        ss << std::setw(2) << static_cast<unsigned int>(data[i]);
-    }
-    return ss.str();
-}
 
 std::vector<unsigned char> from_hex(const std::string& hex) {
     std::vector<unsigned char> bytes;
@@ -64,24 +70,7 @@ std::vector<std::string> split_strings(const std::string& str, char delimiter = 
     return items;
 }
 
-void sanitize_and_validate_relative_path(const std::string& rel_path) {
-    if (rel_path.empty()) throw std::runtime_error("relative path cannot be empty");
-    if (rel_path.find('\\') != std::string::npos && rel_path.find('/') != std::string::npos) {
-        // Normalize internally to forward slashes for checking
-    }
-    std::string norm = rel_path;
-    std::replace(norm.begin(), norm.end(), '\\', '/');
-    if (norm.front() == '/' || norm.find(':') != std::string::npos) {
-        throw std::runtime_error("absolute or drive paths are forbidden: " + rel_path);
-    }
-    std::stringstream ss(norm);
-    std::string segment;
-    while (std::getline(ss, segment, '/')) {
-        if (segment == "..") {
-            throw std::runtime_error("directory traversal detected in path: " + rel_path);
-        }
-    }
-}
+} // namespace
 
 void copy_directory_recursive(const fs::path& source, const fs::path& target) {
     fs::create_directories(target);
@@ -96,6 +85,8 @@ void copy_directory_recursive(const fs::path& source, const fs::path& target) {
         }
     }
 }
+
+namespace {
 
 std::vector<std::string> split_lines(const std::string& text) {
     std::vector<std::string> lines;
@@ -149,6 +140,74 @@ std::int64_t file_ticks_to_millis(std::int64_t ticks) {
 
 } // namespace
 
+
+// ---------------------------------------------------------------------------
+// Controlled failpoints for testing crash recovery
+// ---------------------------------------------------------------------------
+namespace {
+std::atomic<CollabFaultPoint> g_collab_fault_point{CollabFaultPoint::None};
+}
+
+void set_collab_fault_point_for_testing(CollabFaultPoint fp) {
+    g_collab_fault_point.store(fp);
+}
+
+CollabFaultPoint get_collab_fault_point_for_testing() {
+    return g_collab_fault_point.load();
+}
+
+static void trigger_collab_fault_point(CollabFaultPoint target, const char* name) {
+    const auto active = g_collab_fault_point.load();
+    if (active == target ||
+        (target == CollabFaultPoint::FailAfterBaselineBackup && active == CollabFaultPoint::FailAfterBackup)) {
+        throw CollabFaultPointInjected(name);
+    }
+}
+
+#ifdef _WIN32
+static bool create_sentinel_exclusive(const fs::path& sentinel_path, const std::string& content) {
+    HANDLE hFile = CreateFileW(
+        sentinel_path.wstring().c_str(),
+        GENERIC_WRITE,
+        0, // exclusive
+        nullptr,
+        CREATE_NEW, // fail if exists
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if (hFile == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
+            return false;
+        }
+        throw std::runtime_error("failed to create sentinel file: " + sentinel_path.string() + " (error: " + std::to_string(err) + ")");
+    }
+    DWORD written = 0;
+    BOOL ok = WriteFile(hFile, content.data(), static_cast<DWORD>(content.size()), &written, nullptr);
+    CloseHandle(hFile);
+    if (!ok || written != content.size()) {
+        throw std::runtime_error("failed to write sentinel content to " + sentinel_path.string());
+    }
+    return true;
+}
+#else
+static bool create_sentinel_exclusive(const fs::path& sentinel_path, const std::string& content) {
+    int fd = open(sentinel_path.string().c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            return false;
+        }
+        throw std::runtime_error("failed to create sentinel file: " + sentinel_path.string() + " (errno: " + std::to_string(errno) + ")");
+    }
+    ssize_t written = write(fd, content.data(), content.size());
+    close(fd);
+    if (written < 0 || static_cast<std::size_t>(written) != content.size()) {
+        throw std::runtime_error("failed to write sentinel content to " + sentinel_path.string());
+    }
+    return true;
+}
+#endif
+
 CollabStore::CollabStore(const fs::path& db_path, const fs::path& base_storage_dir)
     : db_path_(db_path), base_storage_dir_(base_storage_dir) {
     fs::create_directories(db_path_.parent_path());
@@ -162,19 +221,104 @@ CollabStore::CollabStore(const fs::path& db_path, const fs::path& base_storage_d
         throw std::runtime_error("CollabStore database error: " + err);
     }
 
-    // Enable WAL and foreign keys
+    // Enable WAL and foreign keys.
+    // db_mutex_ not required here: single-threaded construction phase.
     execute_sql("PRAGMA journal_mode = WAL;");
     execute_sql("PRAGMA foreign_keys = ON;");
 
     init_schema();
     seed_default_accounts_if_empty();
+    recover_incomplete_operations();
 }
 
 CollabStore::~CollabStore() {
-    if (db_) {
-        sqlite3_close(db_);
-        db_ = nullptr;
+    const auto result = finalize_and_close(); // noexcept
+    if (result == FinalizeResult::CLOSE_FAILED) {
+        // sqlite3_close_v2 defers resource release until all remaining
+        // statements are finalized. Always succeeds from caller perspective.
+        // Used only here as last-resort fallback to prevent a hard leak.
+        if (db_) {
+            sqlite3_close_v2(db_);
+            db_ = nullptr;
+            std::cerr << "[ERROR] CollabStore destructor: sqlite3_close returned BUSY. "
+                         "Used sqlite3_close_v2 to defer cleanup. "
+                         "Investigate unregistered prepared statements." << std::endl;
+        }
     }
+}
+
+FinalizeResult CollabStore::finalize_and_close() noexcept {
+    // Phase 0: Signal shutdown and drain all in-flight operations.
+    {
+        std::unique_lock<std::mutex> life_lock(lifecycle_mutex_);
+        if (finalized_) return FinalizeResult::ALREADY_FINALIZED;
+        shutting_down_ = true;
+        drain_cv_.wait(life_lock, [this]() { return active_ops_ == 0; });
+        // active_ops_ == 0; no new OperationGuard can be admitted.
+    }
+
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
+    if (!db_) {
+        std::lock_guard<std::mutex> lk(lifecycle_mutex_);
+        finalized_ = true;
+        return FinalizeResult::ALREADY_FINALIZED;
+    }
+
+    // Phase 1: Force-finalize any remaining live statements before close.
+    const std::size_t leaked = stmt_registry_.finalize_all();
+    if (leaked > 0) {
+        std::cerr << "[WARN] CollabStore::finalize_and_close: force-finalized "
+                  << leaked << " leaked prepared statement(s). "
+                  << "Check all sqlite3_prepare_v2 call sites use stmt_registry_."
+                  << std::endl;
+    }
+
+    // Phase 2: WAL checkpoint (best-effort; non-fatal on failure).
+    bool checkpoint_ok = false;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        const int cp_rc = sqlite3_wal_checkpoint_v2(
+            db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+        if (cp_rc == SQLITE_OK) { checkpoint_ok = true; break; }
+        if (cp_rc == SQLITE_BUSY || cp_rc == SQLITE_LOCKED) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20 << attempt));
+            continue;
+        }
+        std::cerr << "[WARN] CollabStore::finalize_and_close: WAL checkpoint failed (rc="
+                  << cp_rc << "): " << sqlite3_errmsg(db_) << std::endl;
+        break;
+    }
+
+    // Phase 3: Close the connection.
+    const int close_rc = sqlite3_close(db_);
+    if (close_rc != SQLITE_OK) {
+        std::cerr << "[ERROR] CollabStore::finalize_and_close: sqlite3_close failed (rc="
+                  << close_rc << "): " << sqlite3_errmsg(db_)
+                  << ". Database handle retained for retry." << std::endl;
+        return FinalizeResult::CLOSE_FAILED;
+    }
+
+    db_ = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(lifecycle_mutex_);
+        finalized_ = true;
+    }
+    return checkpoint_ok ? FinalizeResult::OK : FinalizeResult::CHECKPOINT_FAILED;
+}
+
+std::unique_lock<std::mutex> CollabStore::get_workspace_lock(const std::string& ws_id) const {
+    std::shared_ptr<std::mutex> ws_mutex;
+    {
+        std::lock_guard<std::mutex> reg_lock(ws_registry_mutex_);
+        auto it = ws_mutexes_.find(ws_id);
+        if (it == ws_mutexes_.end()) {
+            ws_mutex = std::make_shared<std::mutex>();
+            ws_mutexes_[ws_id] = ws_mutex;
+        } else {
+            ws_mutex = it->second;
+        }
+    }
+    return std::unique_lock<std::mutex>(*ws_mutex);
 }
 
 std::int64_t CollabStore::now_ms() {
@@ -183,6 +327,7 @@ std::int64_t CollabStore::now_ms() {
 }
 
 void CollabStore::execute_sql(const std::string& sql) {
+    // Precondition: caller must hold db_mutex_.
     char* err_msg = nullptr;
     if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err_msg) != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown error";
@@ -249,6 +394,8 @@ bool CollabStore::verify_password(const std::string& password, const std::string
 }
 
 void CollabStore::init_schema() {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
     const char* schema = R"(
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
@@ -337,17 +484,37 @@ void CollabStore::init_schema() {
         CREATE INDEX IF NOT EXISTS idx_submissions_ws ON submissions(workspace_id);
         CREATE INDEX IF NOT EXISTS idx_versions_ws ON published_versions(workspace_id);
         CREATE INDEX IF NOT EXISTS idx_updates_client ON client_updates(client_id);
+
+        CREATE TABLE IF NOT EXISTS workspace_operations (
+            op_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+            operation_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            intent_step TEXT NOT NULL,
+            expected_base_hash TEXT NOT NULL,
+            expected_work_hash TEXT NOT NULL,
+            replacement_hash TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_ops_ws ON workspace_operations(workspace_id);
+        CREATE INDEX IF NOT EXISTS idx_workspace_ops_state ON workspace_operations(state);
         CREATE INDEX IF NOT EXISTS idx_security_timestamp ON security_events(timestamp_ms);
     )";
     execute_sql(schema);
 }
 
 void CollabStore::seed_default_accounts_if_empty() {
+    OperationGuard op_guard(*this);
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM users", -1, &stmt, nullptr) != SQLITE_OK) return;
     int count = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
-    sqlite3_finalize(stmt);
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        stmt = stmt_registry_.prepare(db_, "SELECT COUNT(*) FROM users"); if (!stmt) return;
+        if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+        stmt_registry_.finalize(stmt);
+    }
 
     if (count == 0) {
         // Seed default host account: host / MerkleHost2026!
@@ -372,6 +539,9 @@ CollabUser CollabStore::create_user(const std::string& username,
                                      const std::string& password,
                                      const std::string& role,
                                      const std::vector<std::string>& permissions) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     if (username.empty()) throw std::runtime_error("username cannot be empty");
     if (password.length() < 8) throw std::runtime_error("password must be at least 8 characters");
     if (role != "host" && role != "client") throw std::runtime_error("role must be 'host' or 'client'");
@@ -388,7 +558,7 @@ CollabUser CollabStore::create_user(const std::string& username,
 
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "INSERT INTO users (id, username, password_hash, role, status, permissions, created_at_ms, last_login_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) {
         throw std::runtime_error("failed to prepare user insert statement");
     }
 
@@ -404,18 +574,19 @@ CollabUser CollabStore::create_user(const std::string& username,
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::string err = sqlite3_errmsg(db_);
-        sqlite3_finalize(stmt);
+        stmt_registry_.finalize(stmt);
         throw std::runtime_error("failed to create user: " + err);
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
 
     return user;
 }
 
-std::optional<CollabUser> CollabStore::find_user_by_id(const std::string& user_id) {
+// Precondition: caller must hold db_mutex_.
+std::optional<CollabUser> CollabStore::find_user_by_id_nolock(const std::string& user_id) {
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "SELECT id, username, password_hash, role, status, permissions, created_at_ms, last_login_ms FROM users WHERE id = ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return std::nullopt;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return std::nullopt;
     sqlite3_bind_text(stmt, 1, user_id.c_str(), -1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -428,17 +599,24 @@ std::optional<CollabUser> CollabStore::find_user_by_id(const std::string& user_i
         u.permissions = split_strings(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5)));
         u.created_at_ms = sqlite3_column_int64(stmt, 6);
         u.last_login_ms = sqlite3_column_int64(stmt, 7);
-        sqlite3_finalize(stmt);
+        stmt_registry_.finalize(stmt);
         return u;
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return std::nullopt;
 }
 
-std::optional<CollabUser> CollabStore::find_user_by_username(const std::string& username) {
+std::optional<CollabUser> CollabStore::find_user_by_id(const std::string& user_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    return find_user_by_id_nolock(user_id);
+}
+
+// Precondition: caller must hold db_mutex_.
+std::optional<CollabUser> CollabStore::find_user_by_username_nolock(const std::string& username) {
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "SELECT id, username, password_hash, role, status, permissions, created_at_ms, last_login_ms FROM users WHERE username = ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return std::nullopt;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return std::nullopt;
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -451,18 +629,27 @@ std::optional<CollabUser> CollabStore::find_user_by_username(const std::string& 
         u.permissions = split_strings(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5)));
         u.created_at_ms = sqlite3_column_int64(stmt, 6);
         u.last_login_ms = sqlite3_column_int64(stmt, 7);
-        sqlite3_finalize(stmt);
+        stmt_registry_.finalize(stmt);
         return u;
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return std::nullopt;
 }
 
+std::optional<CollabUser> CollabStore::find_user_by_username(const std::string& username) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    return find_user_by_username_nolock(username);
+}
+
 std::vector<CollabUser> CollabStore::list_clients() {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     std::vector<CollabUser> users;
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "SELECT id, username, password_hash, role, status, permissions, created_at_ms, last_login_ms FROM users ORDER BY created_at_ms DESC";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return users;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return users;
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CollabUser u;
@@ -476,21 +663,24 @@ std::vector<CollabUser> CollabStore::list_clients() {
         u.last_login_ms = sqlite3_column_int64(stmt, 7);
         users.push_back(u);
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return users;
 }
 
 bool CollabStore::set_user_status(const std::string& user_id, const std::string& status) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "UPDATE users SET status = ? WHERE id = ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return false;
     sqlite3_bind_text(stmt, 1, status.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, user_id.c_str(), -1, SQLITE_STATIC);
     const bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
 
     if (ok && status == "suspended") {
-        revoke_all_user_sessions(user_id);
+        revoke_all_user_sessions_nolock(user_id);
     }
     return ok;
 }
@@ -498,36 +688,46 @@ bool CollabStore::set_user_status(const std::string& user_id, const std::string&
 bool CollabStore::reset_user_password(const std::string& user_id, const std::string& new_password) {
     if (new_password.length() < 8) throw std::runtime_error("password must be at least 8 characters");
     const auto hash = hash_password(new_password);
+
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "UPDATE users SET password_hash = ? WHERE id = ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return false;
     sqlite3_bind_text(stmt, 1, hash.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, user_id.c_str(), -1, SQLITE_STATIC);
     const bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
 
     if (ok) {
-        revoke_all_user_sessions(user_id);
+        revoke_all_user_sessions_nolock(user_id);
     }
     return ok;
 }
 
 bool CollabStore::update_user_permissions(const std::string& user_id, const std::vector<std::string>& permissions) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     const auto perms_str = join_strings(permissions);
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "UPDATE users SET permissions = ? WHERE id = ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return false;
     sqlite3_bind_text(stmt, 1, perms_str.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, user_id.c_str(), -1, SQLITE_STATIC);
     const bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return ok;
 }
 
 std::optional<CollabSession> CollabStore::authenticate(const std::string& username,
                                                         const std::string& password,
                                                         std::string& error_out) {
-    const auto user_opt = find_user_by_username(username);
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
+    const auto user_opt = find_user_by_username_nolock(username);
     if (!user_opt) {
         error_out = "Invalid username or password";
         return std::nullopt;
@@ -537,7 +737,6 @@ std::optional<CollabSession> CollabStore::authenticate(const std::string& userna
         error_out = "Account is suspended. Please contact administrator.";
         return std::nullopt;
     }
-
     if (!verify_password(password, user.password_hash)) {
         error_out = "Invalid username or password";
         return std::nullopt;
@@ -547,11 +746,11 @@ std::optional<CollabSession> CollabStore::authenticate(const std::string& userna
     const auto current_time = now_ms();
     {
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "UPDATE users SET last_login_ms = ? WHERE id = ?", -1, &stmt, nullptr) == SQLITE_OK) {
+        stmt = stmt_registry_.prepare(db_, "UPDATE users SET last_login_ms = ? WHERE id = ?"); if (stmt) {
             sqlite3_bind_int64(stmt, 1, current_time);
             sqlite3_bind_text(stmt, 2, user.id.c_str(), -1, SQLITE_STATIC);
             sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
+            stmt_registry_.finalize(stmt);
         }
     }
 
@@ -568,20 +767,55 @@ std::optional<CollabSession> CollabStore::authenticate(const std::string& userna
     {
         sqlite3_stmt* stmt = nullptr;
         const char* sql = "INSERT INTO sessions (token, user_id, created_at_ms, expires_at_ms, active) VALUES (?, ?, ?, ?, 1)";
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        stmt = stmt_registry_.prepare(db_, sql); if (stmt) {
             sqlite3_bind_text(stmt, 1, session.token.c_str(), -1, SQLITE_STATIC);
             sqlite3_bind_text(stmt, 2, session.user_id.c_str(), -1, SQLITE_STATIC);
             sqlite3_bind_int64(stmt, 3, session.created_at_ms);
             sqlite3_bind_int64(stmt, 4, session.expires_at_ms);
             sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
+            stmt_registry_.finalize(stmt);
         }
     }
 
     return session;
 }
 
+// Precondition: caller must hold db_mutex_.
+void CollabStore::revoke_session_nolock(const std::string& token) {
+    sqlite3_stmt* stmt = nullptr;
+    stmt = stmt_registry_.prepare(db_, "UPDATE sessions SET active = 0 WHERE token = ?"); if (stmt) {
+        sqlite3_bind_text(stmt, 1, token.c_str(), -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        stmt_registry_.finalize(stmt);
+    }
+}
+
+void CollabStore::revoke_session(const std::string& token) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    revoke_session_nolock(token);
+}
+
+// Precondition: caller must hold db_mutex_.
+void CollabStore::revoke_all_user_sessions_nolock(const std::string& user_id) {
+    sqlite3_stmt* stmt = nullptr;
+    stmt = stmt_registry_.prepare(db_, "UPDATE sessions SET active = 0 WHERE user_id = ?"); if (stmt) {
+        sqlite3_bind_text(stmt, 1, user_id.c_str(), -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        stmt_registry_.finalize(stmt);
+    }
+}
+
+void CollabStore::revoke_all_user_sessions(const std::string& user_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    revoke_all_user_sessions_nolock(user_id);
+}
+
 std::optional<CollabSession> CollabStore::validate_session(const std::string& token) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     if (token.empty()) return std::nullopt;
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
@@ -590,7 +824,7 @@ std::optional<CollabSession> CollabStore::validate_session(const std::string& to
         JOIN users u ON s.user_id = u.id
         WHERE s.token = ? AND s.active = 1
     )";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return std::nullopt;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return std::nullopt;
     sqlite3_bind_text(stmt, 1, token.c_str(), -1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -603,37 +837,22 @@ std::optional<CollabSession> CollabStore::validate_session(const std::string& to
         s.expires_at_ms = sqlite3_column_int64(stmt, 5);
         s.active = sqlite3_column_int(stmt, 6) != 0;
         const std::string user_status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
-        sqlite3_finalize(stmt);
+        stmt_registry_.finalize(stmt);
 
         if (user_status != "active" || now_ms() > s.expires_at_ms) {
-            revoke_session(token);
+            revoke_session_nolock(token);
             return std::nullopt;
         }
         return s;
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return std::nullopt;
 }
 
-void CollabStore::revoke_session(const std::string& token) {
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "UPDATE sessions SET active = 0 WHERE token = ?", -1, &stmt, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, token.c_str(), -1, SQLITE_STATIC);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-    }
-}
-
-void CollabStore::revoke_all_user_sessions(const std::string& user_id) {
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "UPDATE sessions SET active = 0 WHERE user_id = ?", -1, &stmt, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, user_id.c_str(), -1, SQLITE_STATIC);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-    }
-}
-
 CollabWorkspace CollabStore::create_workspace(const std::string& name, const std::string& description, const std::string& custom_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     CollabWorkspace ws;
     ws.id = custom_id.empty() ? ("ws_" + generate_random_token(8)) : custom_id;
     ws.name = name;
@@ -649,7 +868,7 @@ CollabWorkspace CollabStore::create_workspace(const std::string& name, const std
 
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "INSERT INTO workspaces (id, name, description, root_path, created_at_ms) VALUES (?, ?, ?, ?, ?)";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) {
         throw std::runtime_error("failed to prepare workspace insert");
     }
 
@@ -662,48 +881,20 @@ CollabWorkspace CollabStore::create_workspace(const std::string& name, const std
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::string err = sqlite3_errmsg(db_);
-        sqlite3_finalize(stmt);
+        stmt_registry_.finalize(stmt);
         throw std::runtime_error("failed to create workspace: " + err);
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
 
     return ws;
 }
 
-std::optional<CollabWorkspace> CollabStore::find_workspace_by_id(const std::string& ws_id) {
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql = "SELECT id, name, description, root_path, created_at_ms FROM workspaces WHERE id = ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return std::nullopt;
-    sqlite3_bind_text(stmt, 1, ws_id.c_str(), -1, SQLITE_STATIC);
-
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        CollabWorkspace ws;
-        ws.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        ws.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        const auto* desc = sqlite3_column_text(stmt, 2);
-        ws.description = desc ? reinterpret_cast<const char*>(desc) : "";
-        ws.root_path = fs::u8path(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
-        ws.created_at_ms = sqlite3_column_int64(stmt, 4);
-        sqlite3_finalize(stmt);
-        return ws;
-    }
-    sqlite3_finalize(stmt);
-
-    if (ws_id == "ws-default") {
-        auto list = list_workspaces();
-        for (const auto& w : list) {
-            if (w.name == "Default-Workspace") return w;
-        }
-        if (!list.empty()) return list.front();
-    }
-    return std::nullopt;
-}
-
-std::vector<CollabWorkspace> CollabStore::list_workspaces() {
+// Precondition: caller must hold db_mutex_.
+std::vector<CollabWorkspace> CollabStore::list_workspaces_nolock() {
     std::vector<CollabWorkspace> workspaces;
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "SELECT id, name, description, root_path, created_at_ms FROM workspaces ORDER BY created_at_ms ASC";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return workspaces;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return workspaces;
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CollabWorkspace ws;
@@ -715,11 +906,56 @@ std::vector<CollabWorkspace> CollabStore::list_workspaces() {
         ws.created_at_ms = sqlite3_column_int64(stmt, 4);
         workspaces.push_back(ws);
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return workspaces;
 }
 
+std::vector<CollabWorkspace> CollabStore::list_workspaces() {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    return list_workspaces_nolock();
+}
+
+// Precondition: caller must hold db_mutex_.
+std::optional<CollabWorkspace> CollabStore::find_workspace_by_id_nolock(const std::string& ws_id) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "SELECT id, name, description, root_path, created_at_ms FROM workspaces WHERE id = ?";
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return std::nullopt;
+    sqlite3_bind_text(stmt, 1, ws_id.c_str(), -1, SQLITE_STATIC);
+
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        CollabWorkspace ws;
+        ws.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        ws.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        const auto* desc = sqlite3_column_text(stmt, 2);
+        ws.description = desc ? reinterpret_cast<const char*>(desc) : "";
+        ws.root_path = fs::u8path(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
+        ws.created_at_ms = sqlite3_column_int64(stmt, 4);
+        stmt_registry_.finalize(stmt);
+        return ws;
+    }
+    stmt_registry_.finalize(stmt);
+
+    if (ws_id == "ws-default") {
+        auto list = list_workspaces_nolock();
+        for (const auto& w : list) {
+            if (w.name == "Default-Workspace") return w;
+        }
+        if (!list.empty()) return list.front();
+    }
+    return std::nullopt;
+}
+
+std::optional<CollabWorkspace> CollabStore::find_workspace_by_id(const std::string& ws_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    return find_workspace_by_id_nolock(ws_id);
+}
+
 std::vector<CollabWorkspace> CollabStore::list_workspaces_for_user(const std::string& user_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     std::vector<CollabWorkspace> workspaces;
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
@@ -729,7 +965,7 @@ std::vector<CollabWorkspace> CollabStore::list_workspaces_for_user(const std::st
         WHERE wm.user_id = ?
         ORDER BY w.created_at_ms ASC
     )";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return workspaces;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return workspaces;
     sqlite3_bind_text(stmt, 1, user_id.c_str(), -1, SQLITE_STATIC);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -742,45 +978,51 @@ std::vector<CollabWorkspace> CollabStore::list_workspaces_for_user(const std::st
         ws.created_at_ms = sqlite3_column_int64(stmt, 4);
         workspaces.push_back(ws);
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return workspaces;
 }
 
 void CollabStore::assign_user_to_workspace(const std::string& workspace_id, const std::string& user_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     std::string actual_id = workspace_id;
-    auto ws = find_workspace_by_id(workspace_id);
-    if (ws) actual_id = ws->id;
+    const auto ws_resolved = find_workspace_by_id_nolock(workspace_id);
+    if (ws_resolved) actual_id = ws_resolved->id;
 
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "INSERT OR IGNORE INTO workspace_members (workspace_id, user_id) VALUES (?, ?)";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+    stmt = stmt_registry_.prepare(db_, sql); if (stmt) {
         sqlite3_bind_text(stmt, 1, actual_id.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 2, user_id.c_str(), -1, SQLITE_STATIC);
         sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
+        stmt_registry_.finalize(stmt);
     }
 }
 
 bool CollabStore::is_user_in_workspace(const std::string& workspace_id, const std::string& user_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     std::string actual_id = workspace_id;
-    auto ws = find_workspace_by_id(workspace_id);
-    if (ws) actual_id = ws->id;
+    const auto ws_resolved = find_workspace_by_id_nolock(workspace_id);
+    if (ws_resolved) actual_id = ws_resolved->id;
 
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return false;
     sqlite3_bind_text(stmt, 1, actual_id.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, user_id.c_str(), -1, SQLITE_STATIC);
     const bool found = (sqlite3_step(stmt) == SQLITE_ROW);
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return found;
 }
 
 fs::path CollabStore::workspace_root(const std::string& ws_id) const {
-    std::string actual_id = ws_id;
-    auto ws = const_cast<CollabStore*>(this)->find_workspace_by_id(ws_id);
-    if (ws) actual_id = ws->id;
-    return base_storage_dir_ / "workspaces" / actual_id;
+    // Path helpers use ws_id directly. Alias resolution ("ws-default") is
+    // performed at the API boundary by find_workspace_by_id() before any
+    // path helper is called -- not here, to avoid re-entrant db_mutex_ acquisition.
+    return base_storage_dir_ / "workspaces" / ws_id;
 }
 fs::path CollabStore::workspace_submissions_dir(const std::string& ws_id) const {
     return workspace_root(ws_id) / "submissions";
@@ -798,13 +1040,22 @@ fs::path CollabStore::workspace_versions_dir(const std::string& ws_id) const {
 CollabSubmission CollabStore::create_submission(const std::string& client_id,
                                                 const std::string& workspace_id,
                                                 const fs::path& source_folder) {
+    OperationGuard op_guard(*this);
+
     if (!fs::is_directory(source_folder)) {
         throw std::runtime_error("submission source folder is not an accessible directory");
     }
 
+    // Resolve workspace ID under db_mutex_
     std::string actual_ws_id = workspace_id;
-    auto ws = find_workspace_by_id(workspace_id);
-    if (ws) actual_ws_id = ws->id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        auto ws = find_workspace_by_id_nolock(workspace_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+
+    // Acquire workspace lock across the entire logical operation
+    auto ws_lock = get_workspace_lock(actual_ws_id);
 
     const auto manifest = scan_folder(source_folder);
     if (!manifest.complete) {
@@ -824,7 +1075,7 @@ CollabSubmission CollabStore::create_submission(const std::string& client_id,
     sub.submitted_at_ms = now_ms();
     sub.reviewed_at_ms = 0;
 
-    // Stage files in workspace submissions directory
+    // Stage files in workspace submissions directory under ws_lock
     const auto target_dir = workspace_submissions_dir(actual_ws_id) / sub.id;
     copy_directory_recursive(source_folder, target_dir);
 
@@ -835,32 +1086,35 @@ CollabSubmission CollabStore::create_submission(const std::string& client_id,
         throw std::runtime_error("submission integrity verification failed upon staging");
     }
 
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql = R"(
-        INSERT INTO submissions (id, client_id, workspace_id, file_count, total_size, merkle_root, status, review_notes, submitted_at_ms, reviewed_at_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        throw std::runtime_error("failed to prepare submission record insert");
-    }
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = R"(
+            INSERT INTO submissions (id, client_id, workspace_id, file_count, total_size, merkle_root, status, review_notes, submitted_at_ms, reviewed_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        )";
+        stmt = stmt_registry_.prepare(db_, sql); if (!stmt) {
+            throw std::runtime_error("failed to prepare submission record insert");
+        }
 
-    sqlite3_bind_text(stmt, 1, sub.id.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, sub.client_id.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, sub.workspace_id.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(sub.file_count));
-    sqlite3_bind_int64(stmt, 5, static_cast<sqlite3_int64>(sub.total_size));
-    sqlite3_bind_text(stmt, 6, sub.merkle_root.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 7, sub.status.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 8, sub.review_notes.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 9, sub.submitted_at_ms);
-    sqlite3_bind_int64(stmt, 10, sub.reviewed_at_ms);
+        sqlite3_bind_text(stmt, 1, sub.id.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, sub.client_id.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 3, sub.workspace_id.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(sub.file_count));
+        sqlite3_bind_int64(stmt, 5, static_cast<sqlite3_int64>(sub.total_size));
+        sqlite3_bind_text(stmt, 6, sub.merkle_root.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 7, sub.status.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 8, sub.review_notes.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 9, sub.submitted_at_ms);
+        sqlite3_bind_int64(stmt, 10, sub.reviewed_at_ms);
 
-    if (sqlite3_step(stmt) != SQLITE_DONE) {
-        std::string err = sqlite3_errmsg(db_);
-        sqlite3_finalize(stmt);
-        throw std::runtime_error("failed to record submission: " + err);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            std::string err = sqlite3_errmsg(db_);
+            stmt_registry_.finalize(stmt);
+            throw std::runtime_error("failed to record submission: " + err);
+        }
+        stmt_registry_.finalize(stmt);
     }
-    sqlite3_finalize(stmt);
 
     const auto user = find_user_by_id(client_id);
     record_event(client_id, user ? user->username : "unknown", "SUBMISSION_CREATED",
@@ -870,7 +1124,8 @@ CollabSubmission CollabStore::create_submission(const std::string& client_id,
     return sub;
 }
 
-std::optional<CollabSubmission> CollabStore::find_submission_by_id(const std::string& sub_id) {
+// Precondition: caller must hold db_mutex_.
+std::optional<CollabSubmission> CollabStore::find_submission_by_id_nolock(const std::string& sub_id) {
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
         SELECT s.id, s.client_id, u.username, s.workspace_id, s.file_count, s.total_size, s.merkle_root, s.status, s.review_notes, s.submitted_at_ms, s.reviewed_at_ms
@@ -878,7 +1133,7 @@ std::optional<CollabSubmission> CollabStore::find_submission_by_id(const std::st
         JOIN users u ON s.client_id = u.id
         WHERE s.id = ?
     )";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return std::nullopt;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return std::nullopt;
     sqlite3_bind_text(stmt, 1, sub_id.c_str(), -1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -895,57 +1150,121 @@ std::optional<CollabSubmission> CollabStore::find_submission_by_id(const std::st
         s.review_notes = notes ? reinterpret_cast<const char*>(notes) : "";
         s.submitted_at_ms = sqlite3_column_int64(stmt, 9);
         s.reviewed_at_ms = sqlite3_column_int64(stmt, 10);
-        sqlite3_finalize(stmt);
+        stmt_registry_.finalize(stmt);
         return s;
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return std::nullopt;
 }
 
+std::optional<CollabSubmission> CollabStore::find_submission_by_id(const std::string& sub_id) {
+    OperationGuard op_guard(*this);
+
+    // 1. Retrieve workspace ID under db_mutex_
+    std::string ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto sub_pre = find_submission_by_id_nolock(sub_id);
+        if (!sub_pre) return std::nullopt;
+        ws_id = sub_pre->workspace_id;
+    }
+
+    // 2. Acquire workspace lock
+    auto ws_lock = get_workspace_lock(ws_id);
+
+    // 3. Re-read and validate under db_mutex_
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    const auto sub = find_submission_by_id_nolock(sub_id);
+    if (!sub || sub->workspace_id != ws_id) return std::nullopt;
+
+    return sub;
+}
+
 std::vector<CollabSubmission> CollabStore::list_submissions(const std::string& workspace_id) {
+    OperationGuard op_guard(*this);
+
+    if (workspace_id.empty()) {
+        // Global administrative reader: database-only
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        std::vector<CollabSubmission> list;
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = R"(
+            SELECT s.id, s.client_id, u.username, s.workspace_id, s.file_count, s.total_size, s.merkle_root, s.status, s.review_notes, s.submitted_at_ms, s.reviewed_at_ms
+            FROM submissions s
+            JOIN users u ON s.client_id = u.id
+            ORDER BY s.submitted_at_ms DESC
+        )";
+        stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return list;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            CollabSubmission s;
+            s.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            s.client_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            s.client_username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            s.workspace_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            s.file_count = static_cast<std::size_t>(sqlite3_column_int64(stmt, 4));
+            s.total_size = static_cast<std::uintmax_t>(sqlite3_column_int64(stmt, 5));
+            s.merkle_root = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+            s.status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            const auto* notes = sqlite3_column_text(stmt, 8);
+            s.review_notes = notes ? reinterpret_cast<const char*>(notes) : "";
+            s.submitted_at_ms = sqlite3_column_int64(stmt, 9);
+            s.reviewed_at_ms = sqlite3_column_int64(stmt, 10);
+            list.push_back(s);
+        }
+        stmt_registry_.finalize(stmt);
+        return list;
+    }
+
+    // Workspace-correlated reader: resolve workspace ID under db_mutex_
     std::string actual_ws_id = workspace_id;
-    if (!workspace_id.empty()) {
-        auto ws = find_workspace_by_id(workspace_id);
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(workspace_id);
         if (ws) actual_ws_id = ws->id;
     }
+
+    // Acquire workspace lock
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+
     std::vector<CollabSubmission> list;
-    sqlite3_stmt* stmt = nullptr;
-    std::string sql = R"(
-        SELECT s.id, s.client_id, u.username, s.workspace_id, s.file_count, s.total_size, s.merkle_root, s.status, s.review_notes, s.submitted_at_ms, s.reviewed_at_ms
-        FROM submissions s
-        JOIN users u ON s.client_id = u.id
-    )";
-    if (!workspace_id.empty()) {
-        sql += " WHERE s.workspace_id = ?";
-    }
-    sql += " ORDER BY s.submitted_at_ms DESC";
-
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return list;
-    if (!workspace_id.empty()) {
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = R"(
+            SELECT s.id, s.client_id, u.username, s.workspace_id, s.file_count, s.total_size, s.merkle_root, s.status, s.review_notes, s.submitted_at_ms, s.reviewed_at_ms
+            FROM submissions s
+            JOIN users u ON s.client_id = u.id
+            WHERE s.workspace_id = ?
+            ORDER BY s.submitted_at_ms DESC
+        )";
+        stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return list;
         sqlite3_bind_text(stmt, 1, actual_ws_id.c_str(), -1, SQLITE_STATIC);
-    }
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        CollabSubmission s;
-        s.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        s.client_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        s.client_username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        s.workspace_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-        s.file_count = static_cast<std::size_t>(sqlite3_column_int64(stmt, 4));
-        s.total_size = static_cast<std::uintmax_t>(sqlite3_column_int64(stmt, 5));
-        s.merkle_root = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
-        s.status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
-        const auto* notes = sqlite3_column_text(stmt, 8);
-        s.review_notes = notes ? reinterpret_cast<const char*>(notes) : "";
-        s.submitted_at_ms = sqlite3_column_int64(stmt, 9);
-        s.reviewed_at_ms = sqlite3_column_int64(stmt, 10);
-        list.push_back(s);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            CollabSubmission s;
+            s.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            s.client_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            s.client_username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            s.workspace_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            s.file_count = static_cast<std::size_t>(sqlite3_column_int64(stmt, 4));
+            s.total_size = static_cast<std::uintmax_t>(sqlite3_column_int64(stmt, 5));
+            s.merkle_root = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+            s.status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            const auto* notes = sqlite3_column_text(stmt, 8);
+            s.review_notes = notes ? reinterpret_cast<const char*>(notes) : "";
+            s.submitted_at_ms = sqlite3_column_int64(stmt, 9);
+            s.reviewed_at_ms = sqlite3_column_int64(stmt, 10);
+            list.push_back(s);
+        }
+        stmt_registry_.finalize(stmt);
     }
-    sqlite3_finalize(stmt);
     return list;
 }
 
 std::vector<CollabSubmission> CollabStore::list_submissions_for_client(const std::string& client_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     std::vector<CollabSubmission> list;
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
@@ -955,7 +1274,7 @@ std::vector<CollabSubmission> CollabStore::list_submissions_for_client(const std
         WHERE s.client_id = ?
         ORDER BY s.submitted_at_ms DESC
     )";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return list;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return list;
     sqlite3_bind_text(stmt, 1, client_id.c_str(), -1, SQLITE_STATIC);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -974,54 +1293,750 @@ std::vector<CollabSubmission> CollabStore::list_submissions_for_client(const std
         s.reviewed_at_ms = sqlite3_column_int64(stmt, 10);
         list.push_back(s);
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return list;
 }
 
-bool CollabStore::accept_submission(const std::string& sub_id, const std::string& reviewer_id, const std::string& notes) {
-    const auto sub = find_submission_by_id(sub_id);
-    if (!sub || sub->status != "pending") return false;
 
-    const auto sub_path = workspace_submissions_dir(sub->workspace_id) / sub->id;
-    const auto base_path = workspace_baseline_dir(sub->workspace_id);
-    const auto work_path = workspace_working_copy_dir(sub->workspace_id);
+bool CollabStore::create_sentinel_file(const fs::path& dir_path,
+                                       const std::string& op_id,
+                                       const std::string& ws_id,
+                                       const std::string& op_type,
+                                       const std::string& dir_role) {
+    if (is_reparse_point_or_symlink(dir_path)) {
+        throw std::runtime_error("reparse point detected at " + dir_path.string() + " -- refusing sentinel creation");
+    }
+    const auto sentinel_path = dir_path / ".syncora_op_sentinel";
+    std::string content = "op_id=" + op_id + "\n" +
+                          "workspace_id=" + ws_id + "\n" +
+                          "op_type=" + op_type + "\n" +
+                          "dir_role=" + dir_role + "\n" +
+                          "created_at_ms=" + std::to_string(now_ms()) + "\n";
+    return create_sentinel_exclusive(sentinel_path, content);
+}
 
-    // Copy to baseline (immutable base) and working copy
-    fs::remove_all(base_path);
-    fs::remove_all(work_path);
-    copy_directory_recursive(sub_path, base_path);
-    copy_directory_recursive(sub_path, work_path);
+SentinelValidationResult CollabStore::validate_sentinel_file(const fs::path& dir_path,
+                                                            const std::string& expected_op_id,
+                                                            const std::string& expected_ws_id,
+                                                            const std::string& expected_role) const {
+    SentinelValidationResult res;
+    if (is_reparse_point_or_symlink(dir_path)) {
+        res.error = "directory is a reparse point or symlink";
+        return res;
+    }
+    const auto sentinel_path = dir_path / ".syncora_op_sentinel";
+    if (!fs::exists(sentinel_path) || !fs::is_regular_file(sentinel_path)) {
+        res.error = "sentinel file missing or not regular file";
+        return res;
+    }
+    std::ifstream f(sentinel_path, std::ios::binary);
+    if (!f.is_open()) {
+        res.error = "cannot open sentinel file";
+        return res;
+    }
+    std::string line;
+    std::unordered_map<std::string, std::string> kv;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        auto eq = line.find('=');
+        if (eq != std::string::npos) {
+            kv[line.substr(0, eq)] = line.substr(eq + 1);
+        }
+    }
+    res.op_id = kv["op_id"];
+    res.workspace_id = kv["workspace_id"];
+    res.op_type = kv["op_type"];
+    res.dir_role = kv["dir_role"];
+    try {
+        if (!kv["created_at_ms"].empty()) {
+            res.created_at_ms = std::stoll(kv["created_at_ms"]);
+        }
+    } catch (...) {
+        res.error = "invalid created_at_ms in sentinel";
+        return res;
+    }
 
-    const auto t = now_ms();
+    if (res.op_id.empty() || res.workspace_id.empty() || res.op_type.empty() || res.dir_role.empty() || res.created_at_ms <= 0) {
+        res.error = "missing required fields in sentinel";
+        return res;
+    }
+
+    const std::string dirname = dir_path.filename().string();
+    if (dirname.rfind(".staging_", 0) == 0 || dirname.rfind(".backup_", 0) == 0) {
+        std::string embedded_op_id;
+        const auto op_pos = dirname.find("_op_");
+        if (op_pos != std::string::npos) {
+            embedded_op_id = dirname.substr(op_pos + 1);
+        } else if (dirname.rfind(".staging_base_", 0) == 0 || dirname.rfind(".staging_work_", 0) == 0) {
+            embedded_op_id = dirname.substr(14);
+        } else if (dirname.rfind(".staging_ver_", 0) == 0 || dirname.rfind(".backup_base_", 0) == 0 || dirname.rfind(".backup_work_", 0) == 0) {
+            embedded_op_id = dirname.substr(13);
+        }
+        if (!embedded_op_id.empty() && res.op_id != embedded_op_id) {
+            res.error = "op_id in sentinel (" + res.op_id + ") does not match directory name suffix (" + embedded_op_id + ")";
+            return res;
+        }
+    }
+    if (!expected_op_id.empty() && res.op_id != expected_op_id) {
+        res.error = "mismatched op_id (expected " + expected_op_id + ", got " + res.op_id + ")";
+        return res;
+    }
+    if (!expected_ws_id.empty() && res.workspace_id != expected_ws_id) {
+        res.error = "mismatched workspace_id (expected " + expected_ws_id + ", got " + res.workspace_id + ")";
+        return res;
+    }
+    if (!expected_role.empty() && res.dir_role != expected_role) {
+        res.error = "mismatched dir_role (expected " + expected_role + ", got " + res.dir_role + ")";
+        return res;
+    }
+    res.valid = true;
+    return res;
+}
+
+void CollabStore::quarantine_directory(const fs::path& suspect_dir,
+                                       const std::string& ws_id,
+                                       const std::string& reason) {
+    if (!fs::exists(suspect_dir)) return;
+    const auto q_base = workspace_root(ws_id) / ".quarantine";
+    std::error_code ec;
+    fs::create_directories(q_base, ec);
+    const auto dest = q_base / (suspect_dir.filename().string() + "_" + std::to_string(now_ms()));
+    fs::rename(suspect_dir, dest, ec);
+    if (!ec) {
+        record_event("SYSTEM", "recovery", "QUARANTINE_DIRECTORY",
+                     "workspace:" + ws_id, "WARNING",
+                     "Quarantined directory: " + suspect_dir.string() + " reason: " + reason);
+    }
+}
+
+void CollabStore::assert_path_absent(const fs::path& p) const {
+    if (fs::exists(p) || is_reparse_point_or_symlink(p)) {
+        throw std::runtime_error("path already exists or is a reparse point: " + p.string());
+    }
+}
+
+void CollabStore::insert_operation_intent_nolock(const WorkspaceOperationRecord& rec) {
     sqlite3_stmt* stmt = nullptr;
-    const char* sql = "UPDATE submissions SET status = 'accepted', review_notes = ?, reviewed_at_ms = ? WHERE id = ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, notes.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 2, t);
-    sqlite3_bind_text(stmt, 3, sub_id.c_str(), -1, SQLITE_STATIC);
-    const bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
-    sqlite3_finalize(stmt);
+    const char* sql = R"(
+        INSERT INTO workspace_operations
+        (op_id, workspace_id, operation_type, target_id, state, intent_step,
+         expected_base_hash, expected_work_hash, replacement_hash, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) throw std::runtime_error("failed to prepare workspace operation intent insert");
+    sqlite3_bind_text(stmt, 1, rec.op_id.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, rec.workspace_id.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, rec.operation_type.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, rec.target_id.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 5, rec.state.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 6, rec.intent_step.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 7, rec.expected_base_hash.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 8, rec.expected_work_hash.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 9, rec.replacement_hash.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 10, rec.created_at_ms);
+    sqlite3_bind_int64(stmt, 11, rec.updated_at_ms);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        std::string err = sqlite3_errmsg(db_);
+        stmt_registry_.finalize(stmt);
+        throw std::runtime_error("failed to insert workspace operation intent: " + err);
+    }
+    stmt_registry_.finalize(stmt);
+}
 
-    const auto reviewer = find_user_by_id(reviewer_id);
-    record_event(reviewer_id, reviewer ? reviewer->username : "host", "SUBMISSION_ACCEPTED",
-                 "submission:" + sub_id, "success", "Accepted baseline created in workspace: " + sub->workspace_id);
+void CollabStore::update_operation_intent_nolock(const std::string& op_id,
+                                                const std::string& state,
+                                                const std::string& intent_step) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "UPDATE workspace_operations SET state = ?, intent_step = ?, updated_at_ms = ? WHERE op_id = ?";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) throw std::runtime_error("failed to prepare workspace operation intent update");
+    sqlite3_bind_text(stmt, 1, state.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, intent_step.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 3, now_ms());
+    sqlite3_bind_text(stmt, 4, op_id.c_str(), -1, SQLITE_STATIC);
+    sqlite3_step(stmt);
+    stmt_registry_.finalize(stmt);
+}
 
-    return ok;
+std::optional<WorkspaceOperationRecord> CollabStore::find_workspace_operation_nolock(const std::string& op_id) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"(
+        SELECT op_id, workspace_id, operation_type, target_id, state, intent_step,
+               expected_base_hash, expected_work_hash, replacement_hash, created_at_ms, updated_at_ms
+        FROM workspace_operations WHERE op_id = ?
+    )";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) return std::nullopt;
+    sqlite3_bind_text(stmt, 1, op_id.c_str(), -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        WorkspaceOperationRecord r;
+        r.op_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        r.workspace_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        r.operation_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        r.target_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        r.state = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+        r.intent_step = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+        r.expected_base_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+        r.expected_work_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+        r.replacement_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+        r.created_at_ms = sqlite3_column_int64(stmt, 9);
+        r.updated_at_ms = sqlite3_column_int64(stmt, 10);
+        stmt_registry_.finalize(stmt);
+        return r;
+    }
+    stmt_registry_.finalize(stmt);
+    return std::nullopt;
+}
+
+std::vector<WorkspaceOperationRecord> CollabStore::list_incomplete_operations_nolock() {
+    std::vector<WorkspaceOperationRecord> list;
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"(
+        SELECT op_id, workspace_id, operation_type, target_id, state, intent_step,
+               expected_base_hash, expected_work_hash, replacement_hash, created_at_ms, updated_at_ms
+        FROM workspace_operations WHERE state NOT IN ('COMMITTED', 'FAILED') ORDER BY created_at_ms ASC
+    )";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) return list;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        WorkspaceOperationRecord r;
+        r.op_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        r.workspace_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        r.operation_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        r.target_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        r.state = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+        r.intent_step = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+        r.expected_base_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+        r.expected_work_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+        r.replacement_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+        r.created_at_ms = sqlite3_column_int64(stmt, 9);
+        r.updated_at_ms = sqlite3_column_int64(stmt, 10);
+        list.push_back(r);
+    }
+    stmt_registry_.finalize(stmt);
+    return list;
+}
+
+std::vector<WorkspaceOperationRecord> CollabStore::list_workspace_operations(const std::string& workspace_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    std::vector<WorkspaceOperationRecord> list;
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"(
+        SELECT op_id, workspace_id, operation_type, target_id, state, intent_step,
+               expected_base_hash, expected_work_hash, replacement_hash, created_at_ms, updated_at_ms
+        FROM workspace_operations WHERE workspace_id = ? ORDER BY created_at_ms DESC
+    )";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) return list;
+    sqlite3_bind_text(stmt, 1, workspace_id.c_str(), -1, SQLITE_STATIC);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        WorkspaceOperationRecord r;
+        r.op_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        r.workspace_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        r.operation_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        r.target_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        r.state = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+        r.intent_step = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+        r.expected_base_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+        r.expected_work_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+        r.replacement_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+        r.created_at_ms = sqlite3_column_int64(stmt, 9);
+        r.updated_at_ms = sqlite3_column_int64(stmt, 10);
+        list.push_back(r);
+    }
+    stmt_registry_.finalize(stmt);
+    return list;
+}
+
+std::optional<WorkspaceOperationRecord> CollabStore::find_workspace_operation(const std::string& op_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    return find_workspace_operation_nolock(op_id);
+}
+
+void CollabStore::recover_accept_submission_op(const WorkspaceOperationRecord& op) {
+    const auto ws_root_dir = workspace_root(op.workspace_id);
+    const auto base_dir = workspace_baseline_dir(op.workspace_id);
+    const auto work_dir = workspace_working_copy_dir(op.workspace_id);
+    const auto staging_base = ws_root_dir / (".staging_base_" + op.op_id);
+    const auto staging_work = ws_root_dir / (".staging_work_" + op.op_id);
+    const auto backup_base  = ws_root_dir / (".backup_base_" + op.op_id);
+    const auto backup_work  = ws_root_dir / (".backup_work_" + op.op_id);
+
+    bool is_committed = false;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        auto cur = find_workspace_operation_nolock(op.op_id);
+        if (cur && cur->state == "COMMITTED") is_committed = true;
+    }
+
+    if (is_committed) {
+        if (fs::exists(backup_base)) {
+            auto sres = validate_sentinel_file(backup_base, op.op_id, op.workspace_id, "backup_base");
+            if (sres.valid) fs::remove_all(backup_base);
+            else quarantine_directory(backup_base, op.workspace_id, "corrupt backup_base sentinel");
+        }
+        if (fs::exists(backup_work)) {
+            auto sres = validate_sentinel_file(backup_work, op.op_id, op.workspace_id, "backup_work");
+            if (sres.valid) fs::remove_all(backup_work);
+            else quarantine_directory(backup_work, op.workspace_id, "corrupt backup_work sentinel");
+        }
+        if (fs::exists(staging_base)) fs::remove_all(staging_base);
+        if (fs::exists(staging_work)) fs::remove_all(staging_work);
+
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        update_operation_intent_nolock(op.op_id, "COMMITTED", "COMPLETED");
+        record_event_nolock("SYSTEM", "recovery", "RECOVERY_FORWARD_COMPLETED", "workspace:" + op.workspace_id, "success", "Cleaned up backups for committed op " + op.op_id);
+        return;
+    }
+
+    // Rollback uncommitted operation
+    if (fs::exists(backup_base)) {
+        auto sres = validate_sentinel_file(backup_base, op.op_id, op.workspace_id, "backup_base");
+        if (sres.valid) {
+            bool hash_ok = true;
+            fs::remove(backup_base / ".syncora_op_sentinel");
+            if (op.expected_base_hash != "EMPTY" && op.expected_base_hash != "INITIAL") {
+                auto m_clean = scan_folder(backup_base);
+                if (m_clean.merkle_root != op.expected_base_hash) hash_ok = false;
+            }
+            if (hash_ok) {
+                fs::remove_all(base_dir);
+                fs::rename(backup_base, base_dir);
+            } else {
+                quarantine_directory(backup_base, op.workspace_id, "hash mismatch on restored backup_base");
+            }
+        } else {
+            quarantine_directory(backup_base, op.workspace_id, sres.error);
+        }
+    }
+
+    if (fs::exists(backup_work)) {
+        auto sres = validate_sentinel_file(backup_work, op.op_id, op.workspace_id, "backup_work");
+        if (sres.valid) {
+            fs::remove(backup_work / ".syncora_op_sentinel");
+            fs::remove_all(work_dir);
+            fs::rename(backup_work, work_dir);
+        } else {
+            quarantine_directory(backup_work, op.workspace_id, sres.error);
+        }
+    }
+
+    if (fs::exists(staging_base)) {
+        auto sres = validate_sentinel_file(staging_base, op.op_id, op.workspace_id, "staging_base");
+        if (sres.valid) fs::remove_all(staging_base);
+        else quarantine_directory(staging_base, op.workspace_id, sres.error);
+    }
+    if (fs::exists(staging_work)) {
+        auto sres = validate_sentinel_file(staging_work, op.op_id, op.workspace_id, "staging_work");
+        if (sres.valid) fs::remove_all(staging_work);
+        else quarantine_directory(staging_work, op.workspace_id, sres.error);
+    }
+
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        update_operation_intent_nolock(op.op_id, "FAILED", "ROLLED_BACK");
+        record_event_nolock("SYSTEM", "recovery", "RECOVERY_ROLLBACK_COMPLETED", "workspace:" + op.workspace_id, "success", "Rolled back uncommitted op " + op.op_id);
+    }
+}
+
+void CollabStore::recover_publish_version_op(const WorkspaceOperationRecord& op) {
+    const auto ws_root_dir = workspace_root(op.workspace_id);
+    const auto base_dir = workspace_baseline_dir(op.workspace_id);
+    const auto versions_dir = workspace_versions_dir(op.workspace_id);
+    const auto staging_ver = versions_dir / (".staging_ver_" + op.op_id);
+    const auto final_ver = versions_dir / op.target_id;
+    const auto staging_base = ws_root_dir / (".staging_base_" + op.op_id);
+    const auto backup_base = ws_root_dir / (".backup_base_" + op.op_id);
+
+    bool is_committed = false;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        auto cur = find_workspace_operation_nolock(op.op_id);
+        if (cur && cur->state == "COMMITTED") is_committed = true;
+    }
+
+    if (is_committed) {
+        if (fs::exists(backup_base)) {
+            auto sres = validate_sentinel_file(backup_base, op.op_id, op.workspace_id, "backup_base");
+            if (sres.valid) fs::remove_all(backup_base);
+            else quarantine_directory(backup_base, op.workspace_id, "corrupt backup_base sentinel");
+        }
+        if (fs::exists(staging_base)) fs::remove_all(staging_base);
+        if (fs::exists(staging_ver)) fs::remove_all(staging_ver);
+        fs::remove(final_ver / ".syncora_op_sentinel");
+
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        update_operation_intent_nolock(op.op_id, "COMMITTED", "COMPLETED");
+        record_event_nolock("SYSTEM", "recovery", "PUBLICATION_RECOVERY_FORWARD_COMPLETED", "workspace:" + op.workspace_id, "success", "Cleaned up for committed publish op " + op.op_id);
+        return;
+    }
+
+    // Rollback uncommitted publish
+    if (fs::exists(final_ver)) {
+        auto sres = validate_sentinel_file(final_ver, op.op_id, op.workspace_id, "version_snapshot");
+        if (sres.valid) {
+            fs::remove_all(final_ver);
+        } else {
+            bool published_in_db = false;
+            {
+                std::lock_guard<std::mutex> db_lock(db_mutex_);
+                auto ver = find_version_by_id_nolock(op.target_id);
+                if (ver) published_in_db = true;
+            }
+            if (!published_in_db) {
+                quarantine_directory(final_ver, op.workspace_id, "uncommitted version snapshot without valid sentinel");
+            }
+        }
+    }
+
+    if (fs::exists(backup_base)) {
+        auto sres = validate_sentinel_file(backup_base, op.op_id, op.workspace_id, "backup_base");
+        if (sres.valid) {
+            bool hash_ok = true;
+            fs::remove(backup_base / ".syncora_op_sentinel");
+            if (op.expected_base_hash != "INITIAL" && op.expected_base_hash != "EMPTY") {
+                auto m = scan_folder(backup_base);
+                if (m.merkle_root != op.expected_base_hash) hash_ok = false;
+            }
+            if (hash_ok) {
+                fs::remove_all(base_dir);
+                fs::rename(backup_base, base_dir);
+            } else {
+                quarantine_directory(backup_base, op.workspace_id, "hash mismatch on restored publication backup_base");
+            }
+        } else {
+            quarantine_directory(backup_base, op.workspace_id, sres.error);
+        }
+    }
+
+    if (fs::exists(staging_base)) {
+        auto sres = validate_sentinel_file(staging_base, op.op_id, op.workspace_id, "staging_base");
+        if (sres.valid) fs::remove_all(staging_base);
+        else quarantine_directory(staging_base, op.workspace_id, sres.error);
+    }
+    if (fs::exists(staging_ver)) {
+        auto sres = validate_sentinel_file(staging_ver, op.op_id, op.workspace_id, "version_snapshot");
+        if (sres.valid) fs::remove_all(staging_ver);
+        else quarantine_directory(staging_ver, op.workspace_id, sres.error);
+    }
+
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        update_operation_intent_nolock(op.op_id, "FAILED", "ROLLED_BACK");
+        record_event_nolock("SYSTEM", "recovery", "PUBLICATION_RECOVERY_ROLLBACK_COMPLETED", "workspace:" + op.workspace_id, "success", "Rolled back uncommitted publish op " + op.op_id);
+    }
+}
+
+void CollabStore::scan_and_reconcile_orphaned_directories(const std::string& ws_id) {
+    const auto ws_root_dir = workspace_root(ws_id);
+    if (!fs::exists(ws_root_dir)) return;
+
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(ws_root_dir, ec)) {
+        if (!entry.is_directory()) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(".staging_", 0) == 0 || name.rfind(".backup_", 0) == 0) {
+            auto sres = validate_sentinel_file(entry.path(), "", ws_id, "");
+            if (!sres.valid) {
+                quarantine_directory(entry.path(), ws_id, "orphaned directory with invalid or missing sentinel: " + sres.error);
+            } else {
+                std::optional<WorkspaceOperationRecord> op;
+                {
+                    std::lock_guard<std::mutex> db_lock(db_mutex_);
+                    op = find_workspace_operation_nolock(sres.op_id);
+                }
+                if (!op || op->state == "COMMITTED" || op->state == "FAILED") {
+                    fs::remove_all(entry.path(), ec);
+                }
+            }
+        }
+    }
+}
+
+void CollabStore::recover_incomplete_operations() {
+    std::vector<WorkspaceOperationRecord> ops;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        ops = list_incomplete_operations_nolock();
+    }
+
+    for (const auto& op : ops) {
+        auto ws_lock = get_workspace_lock(op.workspace_id);
+        if (op.operation_type == "ACCEPT_SUBMISSION") {
+            recover_accept_submission_op(op);
+        } else if (op.operation_type == "PUBLISH_VERSION") {
+            recover_publish_version_op(op);
+        }
+    }
+
+    std::vector<CollabWorkspace> ws_list;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        ws_list = list_workspaces_nolock();
+    }
+    for (const auto& ws : ws_list) {
+        auto ws_lock = get_workspace_lock(ws.id);
+        scan_and_reconcile_orphaned_directories(ws.id);
+    }
+}
+
+
+bool CollabStore::accept_submission(const std::string& sub_id, const std::string& reviewer_id, const std::string& notes) {
+    OperationGuard op_guard(*this);
+
+    // 1. Retrieve workspace ID under db_mutex_
+    std::string ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto sub_init = find_submission_by_id_nolock(sub_id);
+        if (!sub_init || sub_init->status != "pending") return false;
+        ws_id = sub_init->workspace_id;
+    }
+
+    // 2. Acquire workspace lock across the entire logical operation
+    auto ws_lock = get_workspace_lock(ws_id);
+
+    // 3. Re-read and validate submission under db_mutex_
+    CollabSubmission sub;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto sub_check = find_submission_by_id_nolock(sub_id);
+        if (!sub_check || sub_check->status != "pending" || sub_check->workspace_id != ws_id) return false;
+        sub = *sub_check;
+    }
+
+    const auto sub_path = workspace_submissions_dir(ws_id) / sub.id;
+    if (!fs::exists(sub_path)) return false;
+    const auto sub_manifest = scan_folder(sub_path);
+    if (!sub_manifest.complete || sub_manifest.merkle_root != sub.merkle_root) return false;
+
+    const auto base_dir = workspace_baseline_dir(ws_id);
+    const auto work_dir = workspace_working_copy_dir(ws_id);
+    const auto ws_root_dir = workspace_root(ws_id);
+
+    std::string expected_base_hash = "EMPTY";
+    if (fs::exists(base_dir)) {
+        const auto bm = scan_folder(base_dir);
+        if (bm.complete && !bm.files.empty()) {
+            expected_base_hash = bm.merkle_root;
+        }
+    }
+
+    std::string expected_work_hash = "EMPTY";
+    if (fs::exists(work_dir)) {
+        const auto wm = scan_folder(work_dir);
+        if (wm.complete && !wm.files.empty()) {
+            expected_work_hash = wm.merkle_root;
+        }
+    }
+
+    const std::string op_id = "op_acc_" + generate_random_token(10);
+    const auto staging_base = ws_root_dir / (".staging_base_" + op_id);
+    const auto staging_work = ws_root_dir / (".staging_work_" + op_id);
+    const auto backup_base  = ws_root_dir / (".backup_base_" + op_id);
+    const auto backup_work  = ws_root_dir / (".backup_work_" + op_id);
+
+    // Verify paths do not exist
+    assert_path_absent(staging_base);
+    assert_path_absent(staging_work);
+    assert_path_absent(backup_base);
+    assert_path_absent(backup_work);
+
+    // 4. Register intent in journal under db_mutex_
+    WorkspaceOperationRecord op_rec;
+    op_rec.op_id = op_id;
+    op_rec.workspace_id = ws_id;
+    op_rec.operation_type = "ACCEPT_SUBMISSION";
+    op_rec.target_id = sub.id;
+    op_rec.state = "PENDING";
+    op_rec.intent_step = "STAGE_DIRECTORIES";
+    op_rec.expected_base_hash = expected_base_hash;
+    op_rec.expected_work_hash = expected_work_hash;
+    op_rec.replacement_hash = sub.merkle_root;
+    op_rec.created_at_ms = now_ms();
+    op_rec.updated_at_ms = op_rec.created_at_ms;
+
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        insert_operation_intent_nolock(op_rec);
+    }
+
+    try {
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterIntent, "FailAfterIntent");
+
+        // 5. Create staging directories and write exclusive sentinels
+        fs::create_directories(staging_base);
+        if (is_reparse_point_or_symlink(staging_base)) {
+            throw std::runtime_error("reparse point detected at staging_base");
+        }
+        if (!create_sentinel_file(staging_base, op_id, ws_id, "ACCEPT_SUBMISSION", "staging_base")) {
+            throw std::runtime_error("staging_base sentinel already exists");
+        }
+
+        fs::create_directories(staging_work);
+        if (is_reparse_point_or_symlink(staging_work)) {
+            throw std::runtime_error("reparse point detected at staging_work");
+        }
+        if (!create_sentinel_file(staging_work, op_id, ws_id, "ACCEPT_SUBMISSION", "staging_work")) {
+            throw std::runtime_error("staging_work sentinel already exists");
+        }
+
+        // Copy submission files into staging
+        copy_directory_recursive(sub_path, staging_base);
+        copy_directory_recursive(sub_path, staging_work);
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterStaging, "FailAfterStaging");
+
+        // 6. Update journal: state=STAGED, intent_step=BACKUP_DIRECTORIES
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "STAGED", "BACKUP_DIRECTORIES");
+        }
+
+        // 7. Backup baseline and working copy
+        if (fs::exists(base_dir)) {
+            fs::rename(base_dir, backup_base);
+            if (!create_sentinel_file(backup_base, op_id, ws_id, "ACCEPT_SUBMISSION", "backup_base")) {
+                throw std::runtime_error("backup_base sentinel already exists");
+            }
+        } else {
+            fs::create_directories(backup_base);
+            create_sentinel_file(backup_base, op_id, ws_id, "ACCEPT_SUBMISSION", "backup_base");
+        }
+
+        if (fs::exists(work_dir)) {
+            fs::rename(work_dir, backup_work);
+            if (!create_sentinel_file(backup_work, op_id, ws_id, "ACCEPT_SUBMISSION", "backup_work")) {
+                throw std::runtime_error("backup_work sentinel already exists");
+            }
+        } else {
+            fs::create_directories(backup_work);
+            create_sentinel_file(backup_work, op_id, ws_id, "ACCEPT_SUBMISSION", "backup_work");
+        }
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterBackup, "FailAfterBackup");
+
+        // 8. Update journal: state=PROMOTING, intent_step=PROMOTE_BASELINE
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "PROMOTING", "PROMOTE_BASELINE");
+        }
+
+        // Remove temporary sentinel from staging before promotion
+        fs::remove(staging_base / ".syncora_op_sentinel");
+        fs::rename(staging_base, base_dir);
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterBaselinePromotion, "FailAfterBaselinePromotion");
+
+        // Update journal: intent_step=PROMOTE_WORKING_COPY
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "PROMOTING", "PROMOTE_WORKING_COPY");
+        }
+
+        fs::remove(staging_work / ".syncora_op_sentinel");
+        fs::rename(staging_work, work_dir);
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterWorkingCopyPromotion, "FailAfterWorkingCopyPromotion");
+
+        // 9. Update journal: intent_step=COMMIT_DB
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "PROMOTING", "COMMIT_DB");
+        }
+
+        // 10. Commit SQLite transaction under db_mutex_
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            execute_sql("BEGIN IMMEDIATE;");
+            try {
+                sqlite3_stmt* stmt = nullptr;
+                const char* sql = "UPDATE submissions SET status = 'accepted', review_notes = ?, reviewed_at_ms = ? WHERE id = ?";
+                stmt = stmt_registry_.prepare(db_, sql);
+                if (!stmt) throw std::runtime_error("failed to prepare submission accept update");
+                sqlite3_bind_text(stmt, 1, notes.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stmt, 2, now_ms());
+                sqlite3_bind_text(stmt, 3, sub.id.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(stmt) != SQLITE_DONE) {
+                    stmt_registry_.finalize(stmt);
+                    throw std::runtime_error("failed to update submission status");
+                }
+                stmt_registry_.finalize(stmt);
+
+                update_operation_intent_nolock(op_id, "COMMITTED", "CLEANUP");
+
+                const auto reviewer = find_user_by_id_nolock(reviewer_id);
+                record_event_nolock(reviewer_id, reviewer ? reviewer->username : "host", "SUBMISSION_ACCEPTED",
+                                    "submission:" + sub_id, "success", "Accepted baseline created in workspace: " + ws_id);
+
+                execute_sql("COMMIT;");
+            } catch (...) {
+                execute_sql("ROLLBACK;");
+                throw;
+            }
+        }
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterCommit, "FailAfterCommit");
+
+        // 11. Cleanup verified backups after successful commit
+        if (fs::exists(backup_base)) {
+            const auto sres = validate_sentinel_file(backup_base, op_id, ws_id, "backup_base");
+            if (sres.valid) fs::remove_all(backup_base);
+            else quarantine_directory(backup_base, ws_id, "invalid backup_base sentinel at cleanup");
+        }
+        if (fs::exists(backup_work)) {
+            const auto sres = validate_sentinel_file(backup_work, op_id, ws_id, "backup_work");
+            if (sres.valid) fs::remove_all(backup_work);
+            else quarantine_directory(backup_work, ws_id, "invalid backup_work sentinel at cleanup");
+        }
+
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "COMMITTED", "COMPLETED");
+        }
+
+        return true;
+    } catch (...) {
+        recover_accept_submission_op(op_rec);
+        return false;
+    }
 }
 
 bool CollabStore::reject_submission(const std::string& sub_id, const std::string& reviewer_id, const std::string& notes) {
-    const auto sub = find_submission_by_id(sub_id);
-    if (!sub || sub->status != "pending") return false;
+    OperationGuard op_guard(*this);
 
+    // 1. Retrieve workspace ID under db_mutex_
+    std::string ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto sub_init = find_submission_by_id_nolock(sub_id);
+        if (!sub_init || sub_init->status != "pending") return false;
+        ws_id = sub_init->workspace_id;
+    }
+
+    // 2. Acquire workspace lock
+    auto ws_lock = get_workspace_lock(ws_id);
+
+    // 3. Re-read and validate record under db_mutex_
+    bool ok = false;
     const auto t = now_ms();
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql = "UPDATE submissions SET status = 'rejected', review_notes = ?, reviewed_at_ms = ? WHERE id = ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, notes.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 2, t);
-    sqlite3_bind_text(stmt, 3, sub_id.c_str(), -1, SQLITE_STATIC);
-    const bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
-    sqlite3_finalize(stmt);
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto sub = find_submission_by_id_nolock(sub_id);
+        if (!sub || sub->status != "pending" || sub->workspace_id != ws_id) return false;
+
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "UPDATE submissions SET status = 'rejected', review_notes = ?, reviewed_at_ms = ? WHERE id = ?";
+        stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return false;
+        sqlite3_bind_text(stmt, 1, notes.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 2, t);
+        sqlite3_bind_text(stmt, 3, sub_id.c_str(), -1, SQLITE_STATIC);
+        ok = (sqlite3_step(stmt) == SQLITE_DONE);
+        stmt_registry_.finalize(stmt);
+    }
 
     const auto reviewer = find_user_by_id(reviewer_id);
     record_event(reviewer_id, reviewer ? reviewer->username : "host", "SUBMISSION_REJECTED",
@@ -1031,15 +2046,35 @@ bool CollabStore::reject_submission(const std::string& sub_id, const std::string
 }
 
 std::vector<FileMetadata> CollabStore::list_working_copy_files(const std::string& ws_id) {
-    const auto work_dir = workspace_working_copy_dir(ws_id);
+    OperationGuard op_guard(*this);
+    std::string actual_ws_id = ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(ws_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+    const auto work_dir = workspace_working_copy_dir(actual_ws_id);
     if (!fs::exists(work_dir)) return {};
     const auto manifest = scan_folder(work_dir);
     return manifest.files;
 }
 
 std::string CollabStore::read_working_copy_file_content(const std::string& ws_id, const std::string& rel_path) {
-    sanitize_and_validate_relative_path(rel_path);
-    const auto file_path = workspace_working_copy_dir(ws_id) / rel_path;
+    OperationGuard op_guard(*this);
+    std::string actual_ws_id = ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(ws_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+    if (!safe_relative_path(rel_path)) {
+        throw std::runtime_error("invalid or unsafe relative path: " + rel_path);
+    }
+    const auto work_dir = workspace_working_copy_dir(actual_ws_id);
+    reject_symlink_path(work_dir, rel_path);
+    const auto file_path = work_dir / rel_path;
     if (!fs::is_regular_file(file_path)) {
         throw std::runtime_error("file not found in working copy: " + rel_path);
     }
@@ -1055,8 +2090,19 @@ std::string CollabStore::read_working_copy_file_content(const std::string& ws_id
 void CollabStore::write_working_copy_file_content(const std::string& ws_id,
                                                   const std::string& rel_path,
                                                   const std::string& content) {
-    sanitize_and_validate_relative_path(rel_path);
-    const auto work_dir = workspace_working_copy_dir(ws_id);
+    OperationGuard op_guard(*this);
+    std::string actual_ws_id = ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(ws_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+    if (!safe_relative_path(rel_path)) {
+        throw std::runtime_error("invalid or unsafe relative path: " + rel_path);
+    }
+    const auto work_dir = workspace_working_copy_dir(actual_ws_id);
+    reject_symlink_path(work_dir, rel_path);
     fs::create_directories(work_dir);
     const auto target_path = work_dir / rel_path;
     fs::create_directories(target_path.parent_path());
@@ -1073,17 +2119,37 @@ void CollabStore::write_working_copy_file_content(const std::string& ws_id,
 }
 
 void CollabStore::delete_working_copy_file(const std::string& ws_id, const std::string& rel_path) {
-    sanitize_and_validate_relative_path(rel_path);
-    const auto target_path = workspace_working_copy_dir(ws_id) / rel_path;
+    OperationGuard op_guard(*this);
+    std::string actual_ws_id = ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(ws_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+    if (!safe_relative_path(rel_path)) {
+        throw std::runtime_error("invalid or unsafe relative path: " + rel_path);
+    }
+    const auto work_dir = workspace_working_copy_dir(actual_ws_id);
+    reject_symlink_path(work_dir, rel_path);
+    const auto target_path = work_dir / rel_path;
     if (fs::exists(target_path)) {
         fs::remove(target_path);
     }
 }
 
 std::vector<CollabFileDiff> CollabStore::compute_working_copy_diff(const std::string& ws_id) {
+    OperationGuard op_guard(*this);
+    std::string actual_ws_id = ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(ws_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+    auto ws_lock = get_workspace_lock(actual_ws_id);
     std::vector<CollabFileDiff> diffs;
-    const auto base_dir = workspace_baseline_dir(ws_id);
-    const auto work_dir = workspace_working_copy_dir(ws_id);
+    const auto base_dir = workspace_baseline_dir(actual_ws_id);
+    const auto work_dir = workspace_working_copy_dir(actual_ws_id);
 
     const auto base_manifest = fs::exists(base_dir) ? scan_folder(base_dir) : FileManifest{};
     const auto work_manifest = fs::exists(work_dir) ? scan_folder(work_dir) : FileManifest{};
@@ -1145,12 +2211,27 @@ std::vector<CollabFileDiff> CollabStore::compute_working_copy_diff(const std::st
 }
 
 CollabFileDiff CollabStore::compute_file_diff(const std::string& ws_id, const std::string& rel_path) {
-    sanitize_and_validate_relative_path(rel_path);
+    OperationGuard op_guard(*this);
+    std::string actual_ws_id = ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(ws_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+    if (!safe_relative_path(rel_path)) {
+        throw std::runtime_error("invalid or unsafe relative path: " + rel_path);
+    }
+    const auto base_dir = workspace_baseline_dir(actual_ws_id);
+    const auto work_dir = workspace_working_copy_dir(actual_ws_id);
+    reject_symlink_path(base_dir, rel_path);
+    reject_symlink_path(work_dir, rel_path);
+
     CollabFileDiff diff;
     diff.relative_path = rel_path;
 
-    const auto base_file = workspace_baseline_dir(ws_id) / rel_path;
-    const auto work_file = workspace_working_copy_dir(ws_id) / rel_path;
+    const auto base_file = base_dir / rel_path;
+    const auto work_file = work_dir / rel_path;
 
     const bool base_exists = fs::is_regular_file(base_file);
     const bool work_exists = fs::is_regular_file(work_file);
@@ -1204,15 +2285,28 @@ CollabFileDiff CollabStore::compute_file_diff(const std::string& ws_id, const st
     return diff;
 }
 
-CollabPublishedVersion CollabStore::publish_version(const std::string& ws_id,
-                                                    const std::string& published_by_id,
-                                                    const std::string& title,
-                                                    const std::string& release_notes) {
-    std::string actual_ws_id = ws_id;
-    auto ws = find_workspace_by_id(ws_id);
-    if (ws) actual_ws_id = ws->id;
+CollabPublishedVersion CollabStore::publish_version(const std::string& workspace_id,
+                                                   const std::string& published_by_id,
+                                                   const std::string& title,
+                                                   const std::string& release_notes) {
+    OperationGuard op_guard(*this);
 
+    // 1. Resolve workspace ID under db_mutex_
+    std::string actual_ws_id = workspace_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(workspace_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+
+    // 2. Acquire workspace lock across the entire publishing operation
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+
+    const auto ws_root_dir = workspace_root(actual_ws_id);
     const auto work_dir = workspace_working_copy_dir(actual_ws_id);
+    const auto base_dir = workspace_baseline_dir(actual_ws_id);
+    const auto versions_dir = workspace_versions_dir(actual_ws_id);
+
     if (!fs::exists(work_dir)) {
         throw std::runtime_error("cannot publish: working copy does not exist");
     }
@@ -1221,22 +2315,45 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& ws_id,
         throw std::runtime_error("cannot publish: working copy scan incomplete");
     }
 
-    // Determine parent version
+    // Determine parent version under db_mutex_
     std::string parent_id;
     {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
         sqlite3_stmt* stmt = nullptr;
         const char* sql = "SELECT id FROM published_versions WHERE workspace_id = ? ORDER BY published_at_ms DESC LIMIT 1";
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        stmt = stmt_registry_.prepare(db_, sql);
+        if (stmt) {
             sqlite3_bind_text(stmt, 1, actual_ws_id.c_str(), -1, SQLITE_STATIC);
             if (sqlite3_step(stmt) == SQLITE_ROW) {
                 parent_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
             }
-            sqlite3_finalize(stmt);
+            stmt_registry_.finalize(stmt);
         }
     }
 
+    std::string expected_base_hash = "INITIAL";
+    if (fs::exists(base_dir)) {
+        const auto bm = scan_folder(base_dir);
+        if (bm.complete && !bm.files.empty()) {
+            expected_base_hash = bm.merkle_root;
+        }
+    }
+
+    const std::string op_id = "op_pub_" + generate_random_token(10);
+    const std::string ver_id = "ver_" + generate_random_token(10);
+
+    const auto staging_ver  = versions_dir / (".staging_ver_" + op_id);
+    const auto final_ver    = versions_dir / ver_id;
+    const auto staging_base = ws_root_dir / (".staging_base_" + op_id);
+    const auto backup_base  = ws_root_dir / (".backup_base_" + op_id);
+
+    assert_path_absent(staging_ver);
+    assert_path_absent(final_ver);
+    assert_path_absent(staging_base);
+    assert_path_absent(backup_base);
+
     CollabPublishedVersion ver;
-    ver.id = "ver_" + generate_random_token(10);
+    ver.id = ver_id;
     ver.workspace_id = actual_ws_id;
     ver.parent_version_id = parent_id;
     ver.title = title.empty() ? ("Release " + ver.id.substr(4, 6)) : title;
@@ -1248,115 +2365,252 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& ws_id,
     ver.published_by_id = published_by_id;
     ver.published_at_ms = now_ms();
 
-    // Store immutable copy of version in workspace versions directory
-    const auto ver_storage = workspace_versions_dir(actual_ws_id) / ver.id;
-    copy_directory_recursive(work_dir, ver_storage);
+    // 3. Register intent in journal under db_mutex_
+    WorkspaceOperationRecord op_rec;
+    op_rec.op_id = op_id;
+    op_rec.workspace_id = actual_ws_id;
+    op_rec.operation_type = "PUBLISH_VERSION";
+    op_rec.target_id = ver_id;
+    op_rec.state = "PENDING";
+    op_rec.intent_step = "STAGE_SNAPSHOT";
+    op_rec.expected_base_hash = expected_base_hash;
+    op_rec.expected_work_hash = manifest.merkle_root;
+    op_rec.replacement_hash = manifest.merkle_root;
+    op_rec.created_at_ms = now_ms();
+    op_rec.updated_at_ms = op_rec.created_at_ms;
 
-    // Also update baseline to match published version
-    const auto base_dir = workspace_baseline_dir(actual_ws_id);
-    fs::remove_all(base_dir);
-    copy_directory_recursive(work_dir, base_dir);
-
-    // Save record to database in a transaction
-    execute_sql("BEGIN TRANSACTION;");
-    try {
-        sqlite3_stmt* stmt = nullptr;
-        const char* sql = R"(
-            INSERT INTO published_versions (id, workspace_id, parent_version_id, title, release_notes, merkle_root, file_count, total_size, published_by_id, published_at_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        )";
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-            throw std::runtime_error("failed to prepare version insert");
-        }
-        sqlite3_bind_text(stmt, 1, ver.id.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 2, ver.workspace_id.c_str(), -1, SQLITE_STATIC);
-        if (ver.parent_version_id.empty()) sqlite3_bind_null(stmt, 3);
-        else sqlite3_bind_text(stmt, 3, ver.parent_version_id.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 4, ver.title.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 5, ver.release_notes.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 6, ver.merkle_root.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt, 7, static_cast<sqlite3_int64>(ver.file_count));
-        sqlite3_bind_int64(stmt, 8, static_cast<sqlite3_int64>(ver.total_size));
-        sqlite3_bind_text(stmt, 9, ver.published_by_id.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt, 10, ver.published_at_ms);
-
-        if (sqlite3_step(stmt) != SQLITE_DONE) {
-            std::string err = sqlite3_errmsg(db_);
-            sqlite3_finalize(stmt);
-            throw std::runtime_error("failed to insert published version: " + err);
-        }
-        sqlite3_finalize(stmt);
-
-        // Notify/create client update records for all clients assigned to workspace
-        std::vector<std::string> client_ids;
-        {
-            sqlite3_stmt* mem_stmt = nullptr;
-            const char* mem_sql = R"(
-                SELECT wm.user_id FROM workspace_members wm
-                JOIN users u ON wm.user_id = u.id
-                WHERE wm.workspace_id = ? AND u.role = 'client' AND u.status = 'active'
-            )";
-            if (sqlite3_prepare_v2(db_, mem_sql, -1, &mem_stmt, nullptr) == SQLITE_OK) {
-                sqlite3_bind_text(mem_stmt, 1, actual_ws_id.c_str(), -1, SQLITE_STATIC);
-                while (sqlite3_step(mem_stmt) == SQLITE_ROW) {
-                    client_ids.push_back(reinterpret_cast<const char*>(sqlite3_column_text(mem_stmt, 0)));
-                }
-                sqlite3_finalize(mem_stmt);
-            }
-        }
-
-        for (const auto& cid : client_ids) {
-            const std::string update_id = "upd_" + generate_random_token(10);
-            sqlite3_stmt* upd_stmt = nullptr;
-            const char* upd_sql = "INSERT INTO client_updates (id, version_id, client_id, workspace_id, status) VALUES (?, ?, ?, ?, 'available')";
-            if (sqlite3_prepare_v2(db_, upd_sql, -1, &upd_stmt, nullptr) == SQLITE_OK) {
-                sqlite3_bind_text(upd_stmt, 1, update_id.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(upd_stmt, 2, ver.id.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(upd_stmt, 3, cid.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(upd_stmt, 4, actual_ws_id.c_str(), -1, SQLITE_STATIC);
-                sqlite3_step(upd_stmt);
-                sqlite3_finalize(upd_stmt);
-            }
-        }
-
-        execute_sql("COMMIT;");
-    } catch (...) {
-        execute_sql("ROLLBACK;");
-        fs::remove_all(ver_storage);
-        throw;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        insert_operation_intent_nolock(op_rec);
     }
 
-    const auto publisher = find_user_by_id(published_by_id);
-    record_event(published_by_id, publisher ? publisher->username : "host", "VERSION_PUBLISHED",
-                 "version:" + ver.id, "success",
-                 "Published version '" + ver.title + "' (root: " + ver.merkle_root.substr(0, 12) + "...)");
+    try {
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterIntent, "FailAfterIntent");
 
-    return ver;
+        // 4. Create staging version snapshot and promote to final_ver
+        fs::create_directories(staging_ver);
+        if (is_reparse_point_or_symlink(staging_ver)) throw std::runtime_error("reparse point at staging_ver");
+        if (!create_sentinel_file(staging_ver, op_id, actual_ws_id, "PUBLISH_VERSION", "version_snapshot")) {
+            throw std::runtime_error("staging_ver sentinel already exists");
+        }
+
+        copy_directory_recursive(work_dir, staging_ver);
+        const auto staged_ver_manifest = scan_folder(staging_ver);
+        if (!staged_ver_manifest.complete || staged_ver_manifest.merkle_root != ver.merkle_root) {
+            throw std::runtime_error("staged version root mismatch");
+        }
+
+        fs::rename(staging_ver, final_ver);
+        create_sentinel_file(final_ver, op_id, actual_ws_id, "PUBLISH_VERSION", "version_snapshot");
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterSnapshotPromotion, "FailAfterSnapshotPromotion");
+
+        // 5. Update journal: state=STAGED, intent_step=STAGE_BASELINE
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "STAGED", "STAGE_BASELINE");
+        }
+
+        fs::create_directories(staging_base);
+        if (is_reparse_point_or_symlink(staging_base)) throw std::runtime_error("reparse point at staging_base");
+        if (!create_sentinel_file(staging_base, op_id, actual_ws_id, "PUBLISH_VERSION", "staging_base")) {
+            throw std::runtime_error("staging_base sentinel already exists");
+        }
+        copy_directory_recursive(work_dir, staging_base);
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterStagingBaseline, "FailAfterStagingBaseline");
+
+        // 6. Update journal: intent_step=BACKUP_BASELINE
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "STAGED", "BACKUP_BASELINE");
+        }
+
+        if (fs::exists(base_dir)) {
+            fs::rename(base_dir, backup_base);
+            if (!create_sentinel_file(backup_base, op_id, actual_ws_id, "PUBLISH_VERSION", "backup_base")) {
+                throw std::runtime_error("backup_base sentinel already exists");
+            }
+        } else {
+            fs::create_directories(backup_base);
+            create_sentinel_file(backup_base, op_id, actual_ws_id, "PUBLISH_VERSION", "backup_base");
+        }
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterBaselineBackup, "FailAfterBaselineBackup");
+
+        // 7. Update journal: state=PROMOTING, intent_step=PROMOTE_BASELINE
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "PROMOTING", "PROMOTE_BASELINE");
+        }
+
+        fs::remove(staging_base / ".syncora_op_sentinel");
+        fs::rename(staging_base, base_dir);
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterBaselinePromotion, "FailAfterBaselinePromotion");
+
+        // 8. Update journal: intent_step=COMMIT_DB
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "PROMOTING", "COMMIT_DB");
+        }
+
+        // 9. Commit SQLite transaction under db_mutex_
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            execute_sql("BEGIN IMMEDIATE;");
+            try {
+                sqlite3_stmt* stmt = nullptr;
+                const char* sql = R"(
+                    INSERT INTO published_versions (id, workspace_id, parent_version_id, title, release_notes, merkle_root, file_count, total_size, published_by_id, published_at_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                )";
+                stmt = stmt_registry_.prepare(db_, sql);
+                if (!stmt) throw std::runtime_error("failed to prepare version insert");
+                sqlite3_bind_text(stmt, 1, ver.id.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 2, ver.workspace_id.c_str(), -1, SQLITE_STATIC);
+                if (ver.parent_version_id.empty()) sqlite3_bind_null(stmt, 3);
+                else sqlite3_bind_text(stmt, 3, ver.parent_version_id.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 4, ver.title.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 5, ver.release_notes.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 6, ver.merkle_root.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stmt, 7, static_cast<sqlite3_int64>(ver.file_count));
+                sqlite3_bind_int64(stmt, 8, static_cast<sqlite3_int64>(ver.total_size));
+                sqlite3_bind_text(stmt, 9, ver.published_by_id.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stmt, 10, ver.published_at_ms);
+
+                if (sqlite3_step(stmt) != SQLITE_DONE) {
+                    std::string err = sqlite3_errmsg(db_);
+                    stmt_registry_.finalize(stmt);
+                    throw std::runtime_error("failed to insert published version: " + err);
+                }
+                stmt_registry_.finalize(stmt);
+
+                // Notify/create client update records for active clients
+                std::vector<std::string> client_ids;
+                {
+                    sqlite3_stmt* mem_stmt = nullptr;
+                    const char* mem_sql = R"(
+                        SELECT wm.user_id FROM workspace_members wm
+                        JOIN users u ON wm.user_id = u.id
+                        WHERE wm.workspace_id = ? AND u.role = 'client' AND u.status = 'active'
+                    )";
+                    mem_stmt = stmt_registry_.prepare(db_, mem_sql);
+                    if (mem_stmt) {
+                        sqlite3_bind_text(mem_stmt, 1, actual_ws_id.c_str(), -1, SQLITE_STATIC);
+                        while (sqlite3_step(mem_stmt) == SQLITE_ROW) {
+                            client_ids.push_back(reinterpret_cast<const char*>(sqlite3_column_text(mem_stmt, 0)));
+                        }
+                        stmt_registry_.finalize(mem_stmt);
+                    }
+                }
+
+                for (const auto& cid : client_ids) {
+                    const std::string upd_id = "upd_" + generate_random_token(10);
+                    sqlite3_stmt* upd_stmt = nullptr;
+                    const char* upd_sql = R"(
+                        INSERT INTO client_updates (id, version_id, client_id, workspace_id, status)
+                        VALUES (?, ?, ?, ?, 'available')
+                    )";
+                    upd_stmt = stmt_registry_.prepare(db_, upd_sql);
+                    if (upd_stmt) {
+                        sqlite3_bind_text(upd_stmt, 1, upd_id.c_str(), -1, SQLITE_STATIC);
+                        sqlite3_bind_text(upd_stmt, 2, ver.id.c_str(), -1, SQLITE_STATIC);
+                        sqlite3_bind_text(upd_stmt, 3, cid.c_str(), -1, SQLITE_STATIC);
+                        sqlite3_bind_text(upd_stmt, 4, actual_ws_id.c_str(), -1, SQLITE_STATIC);
+                        sqlite3_step(upd_stmt);
+                        stmt_registry_.finalize(upd_stmt);
+                    }
+                }
+
+                // Clean sentinel from committed final_ver
+                fs::remove(final_ver / ".syncora_op_sentinel");
+
+                update_operation_intent_nolock(op_id, "COMMITTED", "CLEANUP");
+
+                const auto publisher = find_user_by_id_nolock(published_by_id);
+                record_event_nolock(published_by_id, publisher ? publisher->username : "host", "VERSION_PUBLISHED",
+                                    "version:" + ver.id, "success", "Published immutable version " + ver.title + " in workspace: " + actual_ws_id);
+
+                execute_sql("COMMIT;");
+            } catch (...) {
+                execute_sql("ROLLBACK;");
+                throw;
+            }
+        }
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterCommit, "FailAfterCommit");
+
+        // 10. Clean up backup_base
+        if (fs::exists(backup_base)) {
+            auto sres = validate_sentinel_file(backup_base, op_id, actual_ws_id, "backup_base");
+            if (sres.valid) fs::remove_all(backup_base);
+            else quarantine_directory(backup_base, actual_ws_id, "invalid backup_base sentinel");
+        }
+
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "COMMITTED", "COMPLETED");
+        }
+
+        return ver;
+    } catch (...) {
+        recover_publish_version_op(op_rec);
+        throw;
+    }
 }
 
 std::vector<CollabPublishedVersion> CollabStore::list_published_versions(const std::string& ws_id) {
+    OperationGuard op_guard(*this);
+
+    if (ws_id.empty()) {
+        // Global administrative reader: database-only
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        return list_published_versions_nolock(ws_id);
+    }
+
+    // Workspace-correlated reader: resolve workspace ID under db_mutex_
     std::string actual_ws_id = ws_id;
-    if (!ws_id.empty()) {
-        auto ws = find_workspace_by_id(ws_id);
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(ws_id);
         if (ws) actual_ws_id = ws->id;
     }
+
+    // Acquire workspace lock
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    return list_published_versions_nolock(actual_ws_id);
+}
+
+// Precondition: caller must hold db_mutex_.
+// Precondition: caller must hold db_mutex_.
+std::vector<CollabPublishedVersion> CollabStore::list_published_versions_nolock(const std::string& ws_id) {
     std::vector<CollabPublishedVersion> list;
     sqlite3_stmt* stmt = nullptr;
-    std::string sql = R"(
-        SELECT v.id, v.workspace_id, v.parent_version_id, v.title, v.release_notes, v.merkle_root, v.file_count, v.total_size, v.published_by_id, u.username, v.published_at_ms
-        FROM published_versions v
-        JOIN users u ON v.published_by_id = u.id
-    )";
-    if (!ws_id.empty()) {
-        sql += " WHERE v.workspace_id = ?";
+    const char* sql = nullptr;
+    if (ws_id.empty()) {
+        sql = R"(
+            SELECT v.id, v.workspace_id, v.parent_version_id, v.title, v.release_notes, v.merkle_root, v.file_count, v.total_size, v.published_by_id, u.username, v.published_at_ms
+            FROM published_versions v
+            JOIN users u ON v.published_by_id = u.id
+            ORDER BY v.published_at_ms DESC
+        )";
+        stmt = stmt_registry_.prepare(db_, sql);
+        if (!stmt) return list;
+    } else {
+        sql = R"(
+            SELECT v.id, v.workspace_id, v.parent_version_id, v.title, v.release_notes, v.merkle_root, v.file_count, v.total_size, v.published_by_id, u.username, v.published_at_ms
+            FROM published_versions v
+            JOIN users u ON v.published_by_id = u.id
+            WHERE v.workspace_id = ?
+            ORDER BY v.published_at_ms DESC
+        )";
+        stmt = stmt_registry_.prepare(db_, sql);
+        if (!stmt) return list;
+        sqlite3_bind_text(stmt, 1, ws_id.c_str(), -1, SQLITE_STATIC);
     }
-    sql += " ORDER BY v.published_at_ms DESC";
-
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return list;
-    if (!ws_id.empty()) {
-        sqlite3_bind_text(stmt, 1, actual_ws_id.c_str(), -1, SQLITE_STATIC);
-    }
-
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CollabPublishedVersion v;
         v.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
@@ -1370,15 +2624,16 @@ std::vector<CollabPublishedVersion> CollabStore::list_published_versions(const s
         v.file_count = static_cast<std::size_t>(sqlite3_column_int64(stmt, 6));
         v.total_size = static_cast<std::uintmax_t>(sqlite3_column_int64(stmt, 7));
         v.published_by_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
-        v.published_by_username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9));
+        const auto* uname = sqlite3_column_text(stmt, 9);
+        v.published_by_username = uname ? reinterpret_cast<const char*>(uname) : "";
         v.published_at_ms = sqlite3_column_int64(stmt, 10);
         list.push_back(v);
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return list;
 }
 
-std::optional<CollabPublishedVersion> CollabStore::find_version_by_id(const std::string& version_id) {
+std::optional<CollabPublishedVersion> CollabStore::find_version_by_id_nolock(const std::string& version_id) {
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
         SELECT v.id, v.workspace_id, v.parent_version_id, v.title, v.release_notes, v.merkle_root, v.file_count, v.total_size, v.published_by_id, u.username, v.published_at_ms
@@ -1386,7 +2641,7 @@ std::optional<CollabPublishedVersion> CollabStore::find_version_by_id(const std:
         JOIN users u ON v.published_by_id = u.id
         WHERE v.id = ?
     )";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return std::nullopt;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return std::nullopt;
     sqlite3_bind_text(stmt, 1, version_id.c_str(), -1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1404,14 +2659,40 @@ std::optional<CollabPublishedVersion> CollabStore::find_version_by_id(const std:
         v.published_by_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
         v.published_by_username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9));
         v.published_at_ms = sqlite3_column_int64(stmt, 10);
-        sqlite3_finalize(stmt);
+        stmt_registry_.finalize(stmt);
         return v;
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return std::nullopt;
 }
 
+std::optional<CollabPublishedVersion> CollabStore::find_version_by_id(const std::string& version_id) {
+    OperationGuard op_guard(*this);
+
+    // 1. Retrieve workspace ID under db_mutex_
+    std::string ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ver_pre = find_version_by_id_nolock(version_id);
+        if (!ver_pre) return std::nullopt;
+        ws_id = ver_pre->workspace_id;
+    }
+
+    // 2. Acquire workspace lock
+    auto ws_lock = get_workspace_lock(ws_id);
+
+    // 3. Re-read and validate under db_mutex_
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    const auto ver = find_version_by_id_nolock(version_id);
+    if (!ver || ver->workspace_id != ws_id) return std::nullopt;
+
+    return ver;
+}
+
 std::vector<CollabClientUpdate> CollabStore::list_updates_for_client(const std::string& client_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     std::vector<CollabClientUpdate> list;
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
@@ -1421,7 +2702,7 @@ std::vector<CollabClientUpdate> CollabStore::list_updates_for_client(const std::
         WHERE u.client_id = ?
         ORDER BY v.published_at_ms DESC
     )";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return list;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return list;
     sqlite3_bind_text(stmt, 1, client_id.c_str(), -1, SQLITE_STATIC);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1443,11 +2724,12 @@ std::vector<CollabClientUpdate> CollabStore::list_updates_for_client(const std::
         upd.error_message = err ? reinterpret_cast<const char*>(err) : "";
         list.push_back(upd);
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return list;
 }
 
-std::optional<CollabClientUpdate> CollabStore::find_update_by_id(const std::string& update_id) {
+// Precondition: caller must hold db_mutex_.
+std::optional<CollabClientUpdate> CollabStore::find_update_by_id_nolock(const std::string& update_id) {
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
         SELECT u.id, u.version_id, u.client_id, u.workspace_id, v.title, v.release_notes, v.merkle_root, v.file_count, v.total_size, u.status, u.accepted_at_ms, u.applied_at_ms, u.error_message
@@ -1455,7 +2737,7 @@ std::optional<CollabClientUpdate> CollabStore::find_update_by_id(const std::stri
         JOIN published_versions v ON u.version_id = v.id
         WHERE u.id = ?
     )";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return std::nullopt;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return std::nullopt;
     sqlite3_bind_text(stmt, 1, update_id.c_str(), -1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1475,29 +2757,55 @@ std::optional<CollabClientUpdate> CollabStore::find_update_by_id(const std::stri
         upd.applied_at_ms = sqlite3_column_int64(stmt, 11);
         const auto* err = sqlite3_column_text(stmt, 12);
         upd.error_message = err ? reinterpret_cast<const char*>(err) : "";
-        sqlite3_finalize(stmt);
+        stmt_registry_.finalize(stmt);
         return upd;
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return std::nullopt;
 }
 
+std::optional<CollabClientUpdate> CollabStore::find_update_by_id(const std::string& update_id) {
+    OperationGuard op_guard(*this);
+
+    // 1. Retrieve workspace ID under db_mutex_
+    std::string ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto upd_pre = find_update_by_id_nolock(update_id);
+        if (!upd_pre) return std::nullopt;
+        ws_id = upd_pre->workspace_id;
+    }
+
+    // 2. Acquire workspace lock
+    auto ws_lock = get_workspace_lock(ws_id);
+
+    // 3. Re-read and validate under db_mutex_
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    const auto upd = find_update_by_id_nolock(update_id);
+    if (!upd || upd->workspace_id != ws_id) return std::nullopt;
+
+    return upd;
+}
+
 bool CollabStore::accept_update(const std::string& update_id, const std::string& client_id) {
-    const auto upd = find_update_by_id(update_id);
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
+    const auto upd = find_update_by_id_nolock(update_id);
     if (!upd || upd->client_id != client_id) return false;
 
     const auto t = now_ms();
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "UPDATE client_updates SET status = 'accepted', accepted_at_ms = ? WHERE id = ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return false;
     sqlite3_bind_int64(stmt, 1, t);
     sqlite3_bind_text(stmt, 2, update_id.c_str(), -1, SQLITE_STATIC);
     const bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
 
-    const auto user = find_user_by_id(client_id);
-    record_event(client_id, user ? user->username : "client", "UPDATE_ACCEPTED",
-                 "update:" + update_id, "success", "Accepted version update: " + upd->version_title);
+    const auto user = find_user_by_id_nolock(client_id);
+    record_event_nolock(client_id, user ? user->username : "client", "UPDATE_ACCEPTED",
+                        "update:" + update_id, "success", "Accepted version update: " + upd->version_title);
 
     return ok;
 }
@@ -1506,10 +2814,33 @@ bool CollabStore::apply_update(const std::string& update_id,
                                const std::string& client_id,
                                const fs::path& target_local_folder,
                                std::string& error_out) {
-    const auto upd = find_update_by_id(update_id);
-    if (!upd || upd->client_id != client_id) {
-        error_out = "Update not found or unauthorized";
-        return false;
+    OperationGuard op_guard(*this);
+
+    // 1. Retrieve workspace ID under db_mutex_
+    std::string ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto upd_init = find_update_by_id_nolock(update_id);
+        if (!upd_init || upd_init->client_id != client_id) {
+            error_out = "Update not found or unauthorized";
+            return false;
+        }
+        ws_id = upd_init->workspace_id;
+    }
+
+    // 2. Acquire workspace lock
+    auto ws_lock = get_workspace_lock(ws_id);
+
+    // 3. Re-read and validate record under db_mutex_
+    CollabClientUpdate upd;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto upd_check = find_update_by_id_nolock(update_id);
+        if (!upd_check || upd_check->client_id != client_id || upd_check->workspace_id != ws_id) {
+            error_out = "Update not found or unauthorized";
+            return false;
+        }
+        upd = *upd_check;
     }
 
     if (!fs::is_directory(target_local_folder)) {
@@ -1517,7 +2848,7 @@ bool CollabStore::apply_update(const std::string& update_id,
         return false;
     }
 
-    const auto version_dir = workspace_versions_dir(upd->workspace_id) / upd->version_id;
+    const auto version_dir = workspace_versions_dir(ws_id) / upd.version_id;
     if (!fs::exists(version_dir)) {
         error_out = "Published version directory missing from server";
         return false;
@@ -1525,14 +2856,14 @@ bool CollabStore::apply_update(const std::string& update_id,
 
     // Scan target directory and version directory
     const auto ver_manifest = scan_folder(version_dir);
-    if (!ver_manifest.complete || ver_manifest.merkle_root != upd->merkle_root) {
+    if (!ver_manifest.complete || ver_manifest.merkle_root != upd.merkle_root) {
         error_out = "Published version failed integrity verification";
         return false;
     }
 
     // Stage update in temporary directory inside target
-    const auto staging_dir = target_local_folder / ".merklechain" / "staging" / upd->id;
-    const auto recovery_dir = target_local_folder / ".merklechain" / "recovery" / upd->id;
+    const auto staging_dir = target_local_folder / ".merklechain" / "staging" / upd.id;
+    const auto recovery_dir = target_local_folder / ".merklechain" / "recovery" / upd.id;
     fs::create_directories(staging_dir);
     fs::create_directories(recovery_dir);
 
@@ -1540,7 +2871,7 @@ bool CollabStore::apply_update(const std::string& update_id,
         // Copy files to staging and verify hashes
         copy_directory_recursive(version_dir, staging_dir);
         const auto staged_manifest = scan_folder(staging_dir);
-        if (!staged_manifest.complete || staged_manifest.merkle_root != upd->merkle_root) {
+        if (!staged_manifest.complete || staged_manifest.merkle_root != upd.merkle_root) {
             fs::remove_all(staging_dir);
             error_out = "Staged update content hash mismatch; aborted";
             return false;
@@ -1571,34 +2902,40 @@ bool CollabStore::apply_update(const std::string& update_id,
             return false;
         }
 
-        // Mark applied
+        // Mark applied under db_mutex_
         const auto t = now_ms();
-        sqlite3_stmt* stmt = nullptr;
-        const char* sql = "UPDATE client_updates SET status = 'applied', applied_at_ms = ? WHERE id = ?";
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(stmt, 1, t);
-            sqlite3_bind_text(stmt, 2, update_id.c_str(), -1, SQLITE_STATIC);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            sqlite3_stmt* stmt = nullptr;
+            const char* sql = "UPDATE client_updates SET status = 'applied', applied_at_ms = ? WHERE id = ?";
+            stmt = stmt_registry_.prepare(db_, sql); if (stmt) {
+                sqlite3_bind_int64(stmt, 1, t);
+                sqlite3_bind_text(stmt, 2, update_id.c_str(), -1, SQLITE_STATIC);
+                sqlite3_step(stmt);
+                stmt_registry_.finalize(stmt);
+            }
         }
 
         const auto user = find_user_by_id(client_id);
         record_event(client_id, user ? user->username : "client", "UPDATE_APPLIED",
                      "update:" + update_id, "success",
-                     "Applied version '" + upd->version_title + "' (final local root: " + final_manifest.merkle_root.substr(0, 12) + "...)");
+                     "Applied version '" + upd.version_title + "' (final local root: " + final_manifest.merkle_root.substr(0, 12) + "...)");
 
         return true;
     } catch (const std::exception& ex) {
         fs::remove_all(staging_dir);
         error_out = std::string("Error during update application: ") + ex.what();
 
-        sqlite3_stmt* stmt = nullptr;
-        const char* sql = "UPDATE client_updates SET status = 'failed', error_message = ? WHERE id = ?";
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, error_out.c_str(), -1, SQLITE_STATIC);
-            sqlite3_bind_text(stmt, 2, update_id.c_str(), -1, SQLITE_STATIC);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            sqlite3_stmt* stmt = nullptr;
+            const char* sql = "UPDATE client_updates SET status = 'failed', error_message = ? WHERE id = ?";
+            stmt = stmt_registry_.prepare(db_, sql); if (stmt) {
+                sqlite3_bind_text(stmt, 1, error_out.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 2, update_id.c_str(), -1, SQLITE_STATIC);
+                sqlite3_step(stmt);
+                stmt_registry_.finalize(stmt);
+            }
         }
 
         const auto user = find_user_by_id(client_id);
@@ -1609,18 +2946,19 @@ bool CollabStore::apply_update(const std::string& update_id,
     }
 }
 
-void CollabStore::record_event(const std::string& actor_id,
-                               const std::string& actor_username,
-                               const std::string& action,
-                               const std::string& resource,
-                               const std::string& outcome,
-                               const std::string& detail) {
+// Precondition: caller must hold db_mutex_.
+void CollabStore::record_event_nolock(const std::string& actor_id,
+                                      const std::string& actor_username,
+                                      const std::string& action,
+                                      const std::string& resource,
+                                      const std::string& outcome,
+                                      const std::string& detail) {
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
         INSERT INTO security_events (actor_id, actor_username, action, resource, outcome, detail, timestamp_ms)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     )";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+    stmt = stmt_registry_.prepare(db_, sql); if (stmt) {
         sqlite3_bind_text(stmt, 1, actor_id.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 2, actor_username.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 3, action.c_str(), -1, SQLITE_STATIC);
@@ -1629,15 +2967,29 @@ void CollabStore::record_event(const std::string& actor_id,
         sqlite3_bind_text(stmt, 6, detail.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_int64(stmt, 7, now_ms());
         sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
+        stmt_registry_.finalize(stmt);
     }
 }
 
+void CollabStore::record_event(const std::string& actor_id,
+                               const std::string& actor_username,
+                               const std::string& action,
+                               const std::string& resource,
+                               const std::string& outcome,
+                               const std::string& detail) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    record_event_nolock(actor_id, actor_username, action, resource, outcome, detail);
+}
+
 std::vector<CollabSecurityEvent> CollabStore::list_events(std::size_t limit) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     std::vector<CollabSecurityEvent> events;
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "SELECT id, actor_id, actor_username, action, resource, outcome, detail, timestamp_ms FROM security_events ORDER BY id DESC LIMIT ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return events;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return events;
     sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(limit));
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1656,15 +3008,18 @@ std::vector<CollabSecurityEvent> CollabStore::list_events(std::size_t limit) {
         e.timestamp_ms = sqlite3_column_int64(stmt, 7);
         events.push_back(e);
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return events;
 }
 
 std::vector<CollabSecurityEvent> CollabStore::list_events_for_actor(const std::string& actor_id, std::size_t limit) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
     std::vector<CollabSecurityEvent> events;
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "SELECT id, actor_id, actor_username, action, resource, outcome, detail, timestamp_ms FROM security_events WHERE actor_id = ? ORDER BY id DESC LIMIT ?";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return events;
+    stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return events;
     sqlite3_bind_text(stmt, 1, actor_id.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(limit));
 
@@ -1684,7 +3039,7 @@ std::vector<CollabSecurityEvent> CollabStore::list_events_for_actor(const std::s
         e.timestamp_ms = sqlite3_column_int64(stmt, 7);
         events.push_back(e);
     }
-    sqlite3_finalize(stmt);
+    stmt_registry_.finalize(stmt);
     return events;
 }
 

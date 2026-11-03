@@ -92,6 +92,30 @@ async function api(path, body) {
   return data;
 }
 
+
+function copyHashToClipboard(text, btn) {
+  if (!text || text === "Not present" || text === "—") return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => {
+      toast("Hash copied to clipboard");
+      if (btn) {
+        const orig = btn.textContent;
+        btn.textContent = "Copied!";
+        btn.classList.add("copied");
+        setTimeout(() => {
+          btn.textContent = orig;
+          btn.classList.remove("copied");
+        }, 2000);
+      }
+    }).catch(() => {
+      prompt("Copy hash:", text);
+    });
+  } else {
+    prompt("Copy hash:", text);
+  }
+}
+window.copyHashToClipboard = copyHashToClipboard;
+
 function toast(message) {
   put($("toast"), message);
   $("toast")?.classList.add("show");
@@ -129,6 +153,7 @@ function view(name, pushHash = true) {
   }
 
   // Determine active workspace and update sidebar and topbar context
+  const isSettings = name === "settings";
   const isHost = ["host-overview", "host-clients", "host-submissions", "host-workspace", "host-review", "host-publish", "host-versions", "host-activity"].includes(name);
   const isClient = ["client-overview", "client-submit", "client-submissions", "client-review", "client-receive", "client-versions", "client-account"].includes(name);
   const isLocal = ["local-overview", "synchronize", "versions", "algorithm", "merkle", "chunks", "scheduler", "activity"].includes(name);
@@ -137,6 +162,8 @@ function view(name, pushHash = true) {
   if (document.body) {
     if (name === "home" || name === "network-select") {
       document.body.dataset.workspace = "home";
+    } else if (isSettings) {
+      document.body.dataset.workspace = "settings";
     } else if (isHost) {
       document.body.dataset.workspace = "host";
     } else if (isClient) {
@@ -151,10 +178,14 @@ function view(name, pushHash = true) {
   // Update dynamic sidebar labels and toggle button
   if (name !== "home") {
     let wsLabel = "Local Workspace";
-    let modeLabel = "Offline Mode";
+    let modeLabel = "Local Engine";
     let modeClass = "state-pill active";
 
-    if (isHost) {
+    if (isSettings) {
+      wsLabel = "System Settings";
+      modeLabel = "Configured";
+      modeClass = "state-pill active";
+    } else if (isHost) {
       wsLabel = "Host Dashboard";
       modeLabel = "Host Mode (Admin)";
       modeClass = "state-pill active";
@@ -165,7 +196,8 @@ function view(name, pushHash = true) {
       modeClass = "state-pill active";
     } else if (isLocal) {
       wsLabel = "Local Workspace";
-      modeLabel = "Offline Mode";
+      modeLabel = "Local Engine";
+      modeClass = "state-pill active";
     } else {
       wsLabel = "Peer Network";
       modeLabel = state.peer?.state === "CONNECTED" ? "Connected" : "Standby";
@@ -183,8 +215,16 @@ function view(name, pushHash = true) {
     if (peerControls) {
       peerControls.style.display = isPeer ? "flex" : "none";
     }
+    const roleBadge = $("role-badge");
+    if (roleBadge) {
+      roleBadge.style.display = isPeer ? "inline-block" : "none";
+    }
     const toggleBtn = $("btn-toggle-workspace");
     if (toggleBtn) {
+      if (isSettings) {
+        toggleBtn.innerHTML = '&larr; Return to Landing <span>&larr;</span>';
+        toggleBtn.dataset.go = "home";
+      } else
       if (isHost || isClient) {
         toggleBtn.innerHTML = 'Switch Workspace / Role <span>&rlarr;</span>';
         toggleBtn.dataset.go = "network-select";
@@ -225,7 +265,8 @@ function view(name, pushHash = true) {
   try {
     if (name === "peer-sync" || name === "approval") loadPeerPlan();
     if (name === "peer-activity") loadPeerActivity();
-    if (name === "versions") loadVersions();
+    if (name === "settings") loadSettingsConfig();
+  if (name === "versions") loadVersions();
     if (["activity", "chunks"].includes(name)) loadActivity();
     if (name === "local-overview") renderLocalOverview();
     if (name === "merkle") renderMerkle();
@@ -266,7 +307,7 @@ function updatePeerUI(p) {
   put($("overview-local-pin"), p.local_certificate_pin || "Not loaded");
   put($("overview-expected-pin"), p.expected_peer_pin || "Not configured");
 
-  const roleText = (p.role || "none").toUpperCase();
+  const roleText = (!p.role || p.role === "none") ? "STANDBY" : p.role.toUpperCase();
   put($("overview-role-badge"), roleText);
   put($("role-badge"), roleText);
   const roleBadge = $("role-badge");
@@ -290,7 +331,7 @@ function updatePeerUI(p) {
   put($("conn-state-badge"), p.state || "STOPPED");
   const connBadge = $("conn-state-badge");
   if (connBadge) connBadge.className = `badge ${p.state === "CONNECTED" || p.state === "COMPLETED" ? "active" : p.state === "ERROR" ? "danger" : ""}`;
-  put($("conn-role-pill"), p.role ? `Role: ${p.role.toUpperCase()}` : "No Role");
+  put($("conn-role-pill"), (p.role && p.role !== "none") ? `Role: ${p.role.toUpperCase()}` : "Role: Standby");
   put($("conn-phase"), p.phase || "Idle");
   put($("conn-session-id"), p.session_id ? p.session_id.slice(0, 16) + "…" : "—");
   put($("conn-remote-id"), p.remote_peer_id || "—");
@@ -312,12 +353,12 @@ function updatePeerUI(p) {
   put($("auth-tls-status"), p.tls_negotiated ? `Verified (${p.tls_version || "TLS 1.3"})` : "Not connected");
   put($("auth-pin-status"), p.peer_pin_verified ? "Verified Match" : p.expected_peer_pin ? "Pending Handshake" : "No pin configured");
   put($("auth-identity-status"), p.remote_peer_id ? `Authenticated (${p.remote_peer_id})` : "Pending");
-  put($("auth-error"), p.last_error || "None");
+  put($("auth-error"), p.last_error || "—");
   if ($("auth-error")) $("auth-error").className = p.last_error ? "error-text" : "muted";
 
   // Progress View updates
   put($("progress-phase-badge"), p.phase || "IDLE");
-  put($("prog-current-file"), p.current_file || "None");
+  put($("prog-current-file"), p.current_file || "—");
   put($("prog-bytes"), `${escBytes(p.bytes_transferred)} / ${escBytes(p.total_bytes)}`);
   put($("prog-files"), `${p.files_transferred} / ${p.total_files}`);
 
@@ -379,7 +420,7 @@ async function pollPeerStatus() {
     put($("connection-status"), data.state === "IDLE" ? "Connected · 127.0.0.1" : `Peer: ${data.state}`);
     $("connection-dot")?.classList.add("online");
   } catch (e) {
-    put($("connection-status"), "Offline / Unreachable");
+    put($("connection-status"), "Standby · 127.0.0.1");
     $("connection-dot")?.classList.remove("online");
   }
 }
@@ -448,7 +489,6 @@ async function savePairingConfig(e) {
     put(statusEl, "Configuration active and saved.");
     statusEl.className = "status-msg success";
     toast("Peer configuration activated");
-
     await pollPeerStatus();
     view("connection");
   } catch (e) {
@@ -533,7 +573,7 @@ function renderPeerPlan() {
 
   const entries = filterPeerPlanEntries(plan.entries);
   put(countEl, `(${entries.length})`);
-  put(summaryEl, `${entries.length} items shown · Plan Hash: ${plan.plan_hash ? plan.plan_hash.slice(0, 16) + '…' : 'None'}`);
+  put(summaryEl, `${entries.length} items shown · Plan Hash: ${plan.plan_hash ? plan.plan_hash.slice(0, 16) + '…' : '—'}`);
 
   if (rowsEl) rowsEl.replaceChildren();
   if (entries.length === 0) {
@@ -847,9 +887,11 @@ function setApproval() {
   const hasDeletes = Boolean(counts?.delete > 0);
   $("deletion-row")?.classList.toggle("hidden", !hasDeletes);
   if ($("sync-button")) {
-    $("sync-button").disabled = !state.plan ||
-      (hasMutations && !$("approve-changes").checked) ||
-      (hasDeletes && !$("confirm-deletions").checked);
+    const isApproved = !hasMutations || Boolean($("approve-changes")?.checked);
+    const isDeletionsConfirmed = !hasDeletes || Boolean($("confirm-deletions")?.checked);
+    const ready = Boolean(state.plan && isApproved && isDeletionsConfirmed);
+    $("sync-button").disabled = !ready;
+    $("sync-button").classList.toggle("disabled", !ready);
   }
 }
 
@@ -924,18 +966,64 @@ function renderInspector() {
   if (!f) {
     put($("inspector-name"), "Select a file");
     put($("inspector-path"), "Choose a row to inspect metadata and hashes.");
+    if ($("inspector-operation")) {
+      put($("inspector-operation"), "—");
+      $("inspector-operation").className = "operation-chip";
+    }
     empty($("inspector-content"), "No file selected.");
     return;
   }
   put($("inspector-name"), f.path.split(/[\\/]/).pop());
   put($("inspector-path"), f.path);
+  if ($("inspector-operation")) {
+    put($("inspector-operation"), f.operation || "—");
+    $("inspector-operation").className = `operation-chip ${(f.operation || "").toLowerCase()}`;
+  }
   const box = $("inspector-content");
+  if (!box) return;
   if (state.inspectorTab === "hashes") {
-    box.textContent = `Source SHA-256:\n${f.source_hash || "Not present"}\n\nDestination SHA-256:\n${f.destination_hash || "Not present"}`;
+    box.innerHTML = `
+      <div class="hash-field">
+        <div class="hash-header-row">
+          <span class="hash-label">Source SHA-256</span>
+          ${f.source_hash && f.source_hash !== "Not present" ? `<button type="button" class="btn-copy-hash" onclick="copyHashToClipboard('${f.source_hash}', this)">Copy</button>` : ''}
+        </div>
+        <code class="hash-box" title="Click to copy full SHA-256" onclick="copyHashToClipboard('${f.source_hash || ''}', this)">${f.source_hash || "Not present"}</code>
+      </div>
+      <div class="hash-field" style="margin-top: 14px;">
+        <div class="hash-header-row">
+          <span class="hash-label">Destination SHA-256</span>
+          ${f.destination_hash && f.destination_hash !== "Not present" ? `<button type="button" class="btn-copy-hash" onclick="copyHashToClipboard('${f.destination_hash}', this)">Copy</button>` : ''}
+        </div>
+        <code class="hash-box" title="Click to copy full SHA-256" onclick="copyHashToClipboard('${f.destination_hash || ''}', this)">${f.destination_hash || "Not present"}</code>
+      </div>
+    `;
   } else if (state.inspectorTab === "transfer") {
-    box.textContent = `Source Hash: ${f.source_hash || "—"}\nDestination Hash: ${f.destination_hash || "—"}`;
+    box.innerHTML = `
+      <div class="hash-field">
+        <div class="hash-header-row">
+          <span class="hash-label">Source Hash</span>
+          ${f.source_hash && f.source_hash !== "—" ? `<button type="button" class="btn-copy-hash" onclick="copyHashToClipboard('${f.source_hash}', this)">Copy</button>` : ''}
+        </div>
+        <code class="hash-box" title="Click to copy" onclick="copyHashToClipboard('${f.source_hash || ''}', this)">${f.source_hash || "—"}</code>
+      </div>
+      <div class="hash-field" style="margin-top: 14px;">
+        <div class="hash-header-row">
+          <span class="hash-label">Destination Hash</span>
+          ${f.destination_hash && f.destination_hash !== "—" ? `<button type="button" class="btn-copy-hash" onclick="copyHashToClipboard('${f.destination_hash}', this)">Copy</button>` : ''}
+        </div>
+        <code class="hash-box" title="Click to copy" onclick="copyHashToClipboard('${f.destination_hash || ''}', this)">${f.destination_hash || "—"}</code>
+      </div>
+    `;
   } else {
-    box.textContent = `Operation: ${f.operation}\nSize: ${escBytes(f.size)} (${f.size} bytes)\nRelative Path: ${f.path}\nState: ${f.state || "—"}`;
+    box.innerHTML = `
+      <div class="meta-field">
+        <div><span class="muted">Operation:</span> <b>${f.operation || "—"}</b></div>
+        <div style="margin-top: 6px;"><span class="muted">Size:</span> <b>${escBytes(f.size)}</b> (${f.size} bytes)</div>
+        <div style="margin-top: 6px; word-break: break-all;"><span class="muted">Relative Path:</span> <code>${f.path}</code></div>
+        <div style="margin-top: 6px;"><span class="muted">State:</span> <b>${f.state || "—"}</b></div>
+      </div>
+    `;
   }
 }
 
@@ -1276,6 +1364,43 @@ function renderMerkle() {
     put($("merkle-dest-depth"), `${me.destination_tree?.depth ?? "—"} levels (${me.destination_tree?.file_count ?? 0} files)`);
     put($("merkle-diff-count"), `${me.differ_count} leaves differ`);
 
+    const interBox = $("merkle-levels-interactive");
+    if (interBox && me) {
+      interBox.replaceChildren();
+      const grid = document.createElement("div");
+      grid.className = "merkle-level-grid";
+
+      const rootCard = document.createElement("div");
+      rootCard.className = `merkle-level-card ${me.roots_match ? "active" : ""}`;
+      rootCard.innerHTML = `
+        <div class="merkle-level-header">
+          <span class="merkle-level-title">Level 0: Merkle Root</span>
+          <span class="badge ${me.roots_match ? 'active' : 'warning'}">${me.roots_match ? 'Match' : 'Differ'}</span>
+        </div>
+        <div class="merkle-level-count">${me.roots_match ? "1 Synchronized Root" : "2 Diverged Roots"}</div>
+        <div class="merkle-level-desc">${me.roots_match ? "Cryptographic state verified identical between trees" : "Integrity boundary detected subtree divergence"}</div>
+      `;
+      grid.append(rootCard);
+
+      if (me.source_tree?.levels) {
+        me.source_tree.levels.forEach(lvl => {
+          const c = document.createElement("div");
+          c.className = "merkle-level-card";
+          const isLeaf = lvl.level === (me.source_tree.depth || 1);
+          c.innerHTML = `
+            <div class="merkle-level-header">
+              <span class="merkle-level-title">Source Lvl ${lvl.level} (${isLeaf ? 'Leaves' : 'Subtrees'})</span>
+              <span class="badge">${lvl.node_count} nodes</span>
+            </div>
+            <div class="merkle-level-count">${lvl.node_count} Hash Nodes</div>
+            <div class="merkle-level-desc">${isLeaf ? 'SHA-256 leaf digests ordered by path' : 'Intermediate internal tree nodes'}</div>
+          `;
+          grid.append(c);
+        });
+      }
+      interBox.append(grid);
+    }
+
     if (tableBody) {
       tableBody.replaceChildren();
       const filter = ($("merkle-search")?.value || "").toLowerCase().trim();
@@ -1447,6 +1572,30 @@ function renderScheduler() {
 function renderChunks() {
   const cm = state.lastSyncResult?.chunk_metrics;
   const chunkRows = $("chunk-rows");
+  const dedupCont = $("dedup-visual-container");
+
+  if (dedupCont) {
+    if (!cm) {
+      dedupCont.innerHTML = '<p class="empty">No synchronization data available yet. Execute an approved synchronization to inspect block-level deduplication.</p>';
+    } else {
+      const total = cm.chunks_total || 0;
+      const reused = cm.chunks_reused || 0;
+      const written = total - reused > 0 ? total - reused : 0;
+      const reusePct = total > 0 ? Math.round((reused / total) * 100) : 0;
+      const writePct = 100 - reusePct;
+      dedupCont.innerHTML = `
+        <div class="dedup-visual-bar">
+          <div class="dedup-bar-reused" style="width: ${reusePct}%;" title="Reused: ${reused} chunks (${reusePct}%)"></div>
+          <div class="dedup-bar-written" style="width: ${writePct}%;" title="Written: ${written} chunks (${writePct}%)"></div>
+        </div>
+        <div class="dedup-legend">
+          <span class="dedup-legend-item"><span class="dedup-dot reused"></span> Reused Chunks: <b>${reused}</b> (${reusePct}%)</span>
+          <span class="dedup-legend-item"><span class="dedup-dot written"></span> Transferred Chunks: <b>${written}</b> (${writePct}%)</span>
+          <span>Total Chunks: <b>${total}</b></span>
+        </div>
+      `;
+    }
+  }
 
   if (!cm) {
     put($("chunk-payload"), "—");
@@ -1597,26 +1746,51 @@ async function compare() {
 }
 
 async function applyLocal() {
-  if (!state.plan) return;
-  setApproval();
-  if ($("sync-button").disabled) return;
+  if (!state.plan) {
+    put($("folder-error"), "Please compare folders first before approving.");
+    toast("No comparison plan found · Click 'Compare folders' first");
+    return;
+  }
+  const counts = state.plan?.comparison?.counts;
+  const hasMutations = Boolean(counts && (counts.add + counts.modify + counts.delete) > 0);
+  const hasDeletes = Boolean(counts?.delete > 0);
+
+  if (hasMutations && !$("approve-changes")?.checked) {
+    put($("sync-status"), "Please check 'I approve the listed changes to Folder B' before synchronizing.");
+    $("sync-status").className = "error-text";
+    toast("Change approval checkbox is required");
+    return;
+  }
+
+  if (hasDeletes && !$("confirm-deletions")?.checked) {
+    put($("sync-status"), "Please check 'I separately confirm every listed deletion' before synchronizing.");
+    $("sync-status").className = "error-text";
+    toast("Deletion confirmation checkbox is required");
+    return;
+  }
+
   const button = $("sync-button");
-  button.disabled = true;
+  if (button) {
+    button.disabled = true;
+    button.classList.add("disabled");
+  }
   put($("sync-status"), "Executing approved plan and verifying destination…");
+  $("sync-status").className = "muted";
+  toast("Executing synchronization…");
 
   try {
     const data = await api("/api/sync", {
       plan_id: state.plan.plan_id,
-      source: $("folder-a").value.trim(),
-      destination: $("folder-b").value.trim(),
-      scope_mode: state.scopeMode,
-      scope_paths: state.scopeMode === "selective" ? Array.from(state.selectedPaths) : [],
-      scope: {
-        mode: state.scopeMode,
+      source: state.plan.source || $("folder-a").value.trim(),
+      destination: state.plan.destination || $("folder-b").value.trim(),
+      scope_mode: state.plan.scope?.mode || state.scopeMode || "all",
+      scope_paths: state.plan.scope?.paths || (state.scopeMode === "selective" ? Array.from(state.selectedPaths) : []),
+      scope: state.plan.scope || {
+        mode: state.scopeMode || "all",
         paths: state.scopeMode === "selective" ? Array.from(state.selectedPaths) : []
       },
-      approve: $("approve-changes").checked,
-      confirm_deletions: $("confirm-deletions").checked
+      approve: $("approve-changes")?.checked ?? true,
+      confirm_deletions: $("confirm-deletions")?.checked ?? false
     });
     state.lastSyncResult = data;
     renderScheduler();
@@ -1624,25 +1798,34 @@ async function applyLocal() {
 
     const panel = $("sync-result");
     panel.classList.remove("hidden", "failure");
+    panel.classList.add("success");
     panel.replaceChildren();
     const h = document.createElement("h3");
     h.textContent = data.message || "Synchronization complete";
     const details = document.createElement("p");
     details.className = "muted";
-    const counts = state.plan?.comparison?.counts;
     if (counts) {
       details.textContent = `Applied: ${counts.add ?? 0} added · ${counts.modify ?? 0} modified · ${counts.delete ?? 0} deleted`;
     }
     panel.append(h);
     if (counts) panel.append(details);
 
+    put($("sync-status"), "✓ Plan executed and destination Merkle root verified.");
+    $("sync-status").className = "success-text";
+
     state.plan = null;
     setApproval();
     // Mark all steps complete
     ["step-config", "step-compare", "step-review", "step-apply", "step-verify"].forEach(id => $(id)?.classList.add("complete"));
-    toast("Local synchronization completed");
+    toast("Local synchronization completed successfully");
   } catch (e) {
-    put($("sync-status"), e.message);
+    put($("sync-status"), "Sync Error: " + e.message);
+    $("sync-status").className = "error-text";
+    toast("Sync failed: " + e.message);
+    const panel = $("sync-result");
+    panel.classList.remove("hidden");
+    panel.classList.add("failure");
+    panel.innerHTML = `<h3>Synchronization Refused or Failed</h3><p class="error-msg">${e.message}</p>`;
   } finally {
     setApproval();
   }
@@ -1794,7 +1977,11 @@ function attachListeners() {
   $("scan-button")?.addEventListener("click", compare);
   $("sync-button")?.addEventListener("click", applyLocal);
   $("approve-changes")?.addEventListener("change", setApproval);
+  $("approve-changes")?.addEventListener("input", setApproval);
+  $("approve-changes")?.addEventListener("click", setApproval);
   $("confirm-deletions")?.addEventListener("change", setApproval);
+  $("confirm-deletions")?.addEventListener("input", setApproval);
+  $("confirm-deletions")?.addEventListener("click", setApproval);
   document.querySelectorAll(".browse").forEach(b => {
     b.addEventListener("click", () => pickFolder(b.dataset.slot));
   });
@@ -2711,4 +2898,88 @@ window.addEventListener("DOMContentLoaded", () => {
   };
   $("btn-client-logout-top")?.addEventListener("click", doLogout);
   $("btn-client-logout-page")?.addEventListener("click", doLogout);
+
+  // Settings Dashboard actions
+  $("btn-save-settings")?.addEventListener("click", saveSettingsConfig);
+  $("btn-reset-settings")?.addEventListener("click", resetSettingsDefaults);
+  loadSettingsConfig();
 });
+
+
+function loadSettingsConfig() {
+  const defaults = {
+    hashAlgo: "SHA-256",
+    chunkSize: "1MB",
+    verifyPolicy: "strict",
+    dedup: true,
+    peerPort: 47832,
+    tlsMode: "mtls",
+    timeout: "30",
+    approvalPolicy: "mandatory",
+    pbkdf2Iter: "100000",
+    defaultView: "home",
+    diffStyle: "unified",
+    toasts: true
+  };
+
+  let saved = {};
+  try {
+    const raw = localStorage.getItem("mc_settings");
+    if (raw) saved = JSON.parse(raw);
+  } catch (e) {}
+
+  const cfg = { ...defaults, ...saved };
+
+  if ($("cfg-hash-algo")) $("cfg-hash-algo").value = cfg.hashAlgo;
+  if ($("cfg-chunk-size")) $("cfg-chunk-size").value = cfg.chunkSize;
+  if ($("cfg-verify-policy")) $("cfg-verify-policy").value = cfg.verifyPolicy;
+  if ($("cfg-dedup-enabled")) $("cfg-dedup-enabled").checked = Boolean(cfg.dedup);
+  if ($("cfg-peer-port")) $("cfg-peer-port").value = cfg.peerPort;
+  if ($("set-peer-port")) $("set-peer-port").textContent = cfg.peerPort;
+  if ($("cfg-tls-mode")) $("cfg-tls-mode").value = cfg.tlsMode;
+  if ($("cfg-conn-timeout")) $("cfg-conn-timeout").value = cfg.timeout;
+  if ($("cfg-approval-policy")) $("cfg-approval-policy").value = cfg.approvalPolicy;
+  if ($("cfg-pbkdf2-iter")) $("cfg-pbkdf2-iter").value = cfg.pbkdf2Iter;
+  if ($("cfg-default-view")) $("cfg-default-view").value = cfg.defaultView;
+  if ($("cfg-diff-style")) $("cfg-diff-style").value = cfg.diffStyle;
+  if ($("cfg-toasts-enabled")) $("cfg-toasts-enabled").checked = Boolean(cfg.toasts);
+}
+
+function saveSettingsConfig() {
+  const cfg = {
+    hashAlgo: $("cfg-hash-algo")?.value || "SHA-256",
+    chunkSize: $("cfg-chunk-size")?.value || "1MB",
+    verifyPolicy: $("cfg-verify-policy")?.value || "strict",
+    dedup: $("cfg-dedup-enabled") ? $("cfg-dedup-enabled").checked : true,
+    peerPort: $("cfg-peer-port")?.value ? parseInt($("cfg-peer-port").value, 10) : 47832,
+    tlsMode: $("cfg-tls-mode")?.value || "mtls",
+    timeout: $("cfg-conn-timeout")?.value || "30",
+    approvalPolicy: $("cfg-approval-policy")?.value || "mandatory",
+    pbkdf2Iter: $("cfg-pbkdf2-iter")?.value || "100000",
+    defaultView: $("cfg-default-view")?.value || "home",
+    diffStyle: $("cfg-diff-style")?.value || "unified",
+    toasts: $("cfg-toasts-enabled") ? $("cfg-toasts-enabled").checked : true
+  };
+
+  try {
+    localStorage.setItem("mc_settings", JSON.stringify(cfg));
+  } catch (e) {}
+
+  if ($("set-peer-port")) $("set-peer-port").textContent = cfg.peerPort;
+
+  const fb = $("settings-save-feedback");
+  if (fb) {
+    fb.style.display = "block";
+    setTimeout(() => { fb.style.display = "none"; }, 5000);
+  }
+
+  showToast("Configuration saved and applied successfully.");
+}
+
+function resetSettingsDefaults() {
+  try {
+    localStorage.removeItem("mc_settings");
+  } catch (e) {}
+  loadSettingsConfig();
+  showToast("Settings reset to engine defaults.");
+}

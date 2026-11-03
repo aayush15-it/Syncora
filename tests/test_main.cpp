@@ -51,6 +51,9 @@ void run_peer_service_tests(const mc::fs::path& fixture_root,
                             void (*skip)(const char*));
 namespace mc {
 void run_collab_store_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
+void run_collab_store_lifecycle_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
+void run_collab_store_workspace_locking_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
+void run_collab_store_phase2_recovery_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
 }
 
 int main(int argc,char** argv){
@@ -171,6 +174,47 @@ int main(int argc,char** argv){
     const auto collision_root=base/"executor-stage-collision";const auto collision_source=collision_root/"source";const auto collision_destination=collision_root/"destination";mc::fs::create_directories(collision_source);mc::fs::create_directories(collision_destination);write(collision_source/"new.bin","approved source");auto collision_plan=mc::compare_manifests(mc::scan_folder(collision_source),mc::scan_folder(collision_destination),collision_source,collision_destination);collision_plan.front().id="collision-regression";const auto executor_collision=collision_destination/"new.bin.merklechain-tmp-collision-regression";write(executor_collision,"foreign collision");mc::SyncExecutionOptions collision_options;collision_options.authorization={true,false};collision_options.use_chunking=true;const bool collision_failed=!mc::execute_plan(collision_plan,collision_destination,collision_root/"recovery",{},collision_options);check(collision_failed&&!mc::fs::exists(collision_destination/"new.bin")&&mc::sha256_file(executor_collision)==mc::sha256_data("foreign collision",17),"executor staging collision fails closed and preserves the colliding entry");
     write(base/"a"/"one.txt","alpha");write(base/"a"/"nested"/"two.txt","beta");write(base/"b"/"one.txt","old");write(base/"b"/"extra.txt","preserve");
     check(mc::safe_relative_path("nested/file.txt")&&!mc::safe_relative_path("../secret")&&!mc::safe_relative_path("C:/secret")&&!mc::safe_relative_path("aux.txt")&&!mc::safe_relative_path("con")&&!mc::safe_relative_path("sub/nul")&&!mc::safe_relative_path("com1.log")&&!mc::safe_relative_path("trailing_dot.")&&!mc::safe_relative_path("trailing_space ")&&!mc::safe_relative_path("bad<char>.txt"),"relative path traversal and Windows reserved name rejection");
+
+    // Path containment and boundary prefix checks
+    check(mc::is_path_within_boundary(base / "a", base / "a" / "one.txt"), "canonical containment accepts files within boundary");
+    check(!mc::is_path_within_boundary(base / "a", base / "a" / ".." / "secret.txt"), "canonical containment rejects parent directory traversal");
+    check(!mc::is_path_within_boundary(base / "a", base / "a_suffix" / "file.txt"), "canonical containment rejects boundary prefix attacks");
+
+#ifdef _WIN32
+    // Windows directory junction security tests
+    const auto junc_target = base / "junction-target";
+    const auto junc_link = base / "a" / "junction-folder";
+    mc::fs::create_directories(junc_target);
+    write(junc_target / "outside.txt", "outside data");
+    std::string junc_cmd = "cmd.exe /c mklink /J \"" + junc_link.string() + "\" \"" + junc_target.string() + "\" >nul 2>nul";
+    int junc_res = system(junc_cmd.c_str());
+    if (junc_res == 0 && mc::fs::exists(junc_link)) {
+        check(mc::is_reparse_point_or_symlink(junc_link), "is_reparse_point_or_symlink recognizes Windows directory junction");
+        // scan_folder should NOT recurse into the junction
+        auto scan_with_junc = mc::scan_folder(base / "a");
+        bool has_outside = false;
+        for (const auto& f : scan_with_junc.files) {
+            if (f.relative_path.find("junction-folder") != std::string::npos || f.relative_path.find("outside.txt") != std::string::npos) {
+                has_outside = true;
+            }
+        }
+        check(!has_outside, "scan_folder skips directory junction without recursing or indexing external files");
+
+        // reject_symlink_path should reject junction traversal
+        bool junc_rejected = false;
+        try {
+            mc::reject_symlink_path(base / "a", "junction-folder/outside.txt");
+        } catch (const std::exception&) {
+            junc_rejected = true;
+        }
+        check(junc_rejected, "reject_symlink_path rejects traversal across directory junction");
+
+        // Safely unmount junction with RemoveDirectoryW so target is NOT deleted
+        RemoveDirectoryW(junc_link.wstring().c_str());
+        check(mc::fs::exists(junc_target / "outside.txt"), "junction removal unlinks junction without deleting target");
+    }
+    mc::fs::remove_all(junc_target);
+#endif
     check(mc::sha256_file(base/"a"/"one.txt")==mc::sha256_file(base/"a"/"one.txt"),"repeatable SHA-256");
     write(base/"a"/"empty"," ");write(base/"a"/"empty","");
     check(!mc::sha256_file(base/"a"/"empty").empty(),"empty file hashes");
@@ -284,5 +328,8 @@ int main(int argc,char** argv){
         write(version_root/"collectable.txt","unique content used by one leaf version");auto leaf=reopened.create_snapshot(version_root,"collectable leaf");bool delete_approval=false;try{reopened.delete_version(leaf,false);}catch(...){delete_approval=true;}sqlite3* guard_db=nullptr;sqlite3_open((version_state/"activity.sqlite3").string().c_str(),&guard_db);sqlite3_stmt* guard_insert=nullptr;sqlite3_prepare_v2(guard_db,"INSERT INTO restore_journal(id,folder,rollback_version,status,error,updated_at_ms) VALUES('protect-leaf',?,?,'PENDING','',4)",-1,&guard_insert,nullptr);auto guard_folder=mc::fs::weakly_canonical(version_root).string();sqlite3_bind_text(guard_insert,1,guard_folder.c_str(),-1,SQLITE_TRANSIENT);sqlite3_bind_text(guard_insert,2,leaf.c_str(),-1,SQLITE_TRANSIENT);bool guard_added=sqlite3_step(guard_insert)==SQLITE_DONE;sqlite3_finalize(guard_insert);sqlite3_close(guard_db);bool protected_version=false;try{reopened.delete_version(leaf,true);}catch(...){protected_version=true;}sqlite3_open((version_state/"activity.sqlite3").string().c_str(),&guard_db);sqlite3_exec(guard_db,"UPDATE restore_journal SET status='ROLLED_BACK' WHERE id='protect-leaf'",nullptr,nullptr,nullptr);sqlite3_close(guard_db);reopened.delete_version(leaf,true);const auto unique_hash=mc::sha256_file(version_root/"collectable.txt");const auto unique_object=version_state/"objects"/unique_hash.substr(0,2)/unique_hash.substr(2);auto collected=reopened.collect_unreferenced_objects();check(delete_approval&&guard_added&&protected_version&&collected>=1&&!mc::fs::exists(unique_object),"pending journal protects rollback version until approved leaf deletion and verified collection");
         auto root_before=mc::scan_folder(version_root).merkle_root;auto object=version_state/"objects"/shared_hash.substr(0,2)/shared_hash.substr(2);write(object,"corrupt object");bool corrupt_rejected=false;try{(void)reopened.restore(baseline_version,version_root,true);}catch(...){corrupt_rejected=true;}check(corrupt_rejected&&mc::scan_folder(version_root).merkle_root==root_before,"corrupt content is rejected before restore mutates the folder");}
     mc::run_collab_store_tests(base, check);
+    mc::run_collab_store_lifecycle_tests(base, check);
+    mc::run_collab_store_workspace_locking_tests(base, check);
+    mc::run_collab_store_phase2_recovery_tests(base, check);
     mc::fs::remove_all(base,ec);std::cout<<"Test checks: "<<passes<<" passed, "<<failures<<" failed, "<<skips<<" skipped\n";return failures?1:0;
 }

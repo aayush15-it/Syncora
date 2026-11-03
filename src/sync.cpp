@@ -15,9 +15,19 @@
 
 namespace mc {
 static std::string make_id(){static std::mt19937_64 gen(std::random_device{}());std::ostringstream s;s<<std::hex<<gen();return s.str();}
-static void reject_symlink_path(const fs::path& root,const std::string& relative){
+void reject_symlink_path(const fs::path& root,const std::string& relative){
+    if(is_reparse_point_or_symlink(root))throw std::runtime_error("root path cannot be a symbolic link or directory junction: "+root.string());
     fs::path current=root;
-    for(const auto& part:fs::u8path(relative)){current/=part;std::error_code ec;auto status=fs::symlink_status(current,ec);if(ec==std::errc::no_such_file_or_directory)continue;if(ec)throw std::runtime_error("cannot inspect destination path: "+ec.message());if(fs::is_symlink(status))throw std::runtime_error("destination path crosses a symbolic link");}
+    for(const auto& part:fs::u8path(relative)){
+        current/=part;
+        std::error_code ec;
+        auto status=fs::symlink_status(current,ec);
+        if(ec==std::errc::no_such_file_or_directory)continue;
+        if(ec)throw std::runtime_error("cannot inspect destination path: "+ec.message());
+        if(fs::is_symlink(status)||is_reparse_point_or_symlink(current))throw std::runtime_error("destination path crosses a symbolic link or directory junction: "+current.string());
+    }
+    const auto target=root/fs::u8path(relative);
+    if(!is_path_within_boundary(root,target))throw std::runtime_error("destination path resolves outside boundary root: "+target.string());
 }
 std::vector<SyncJob> compare_manifests(const FileManifest& a,const FileManifest& b,const fs::path& ra,const fs::path& rb,const SyncScope& scope){
     if(!a.complete||!b.complete) throw std::runtime_error("Cannot create a trusted plan from an incomplete scan");

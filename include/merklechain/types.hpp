@@ -67,4 +67,22 @@ struct FileActivityRecord {
     std::int64_t started{}, completed{};
     std::string result, error;
 };
+inline std::string to_hex(const unsigned char* data, std::size_t len) {
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(len * 2);
+    for (std::size_t i = 0; i < len; ++i) {
+        hex.push_back(kHexDigits[(data[i] >> 4) & 0x0f]);
+        hex.push_back(kHexDigits[data[i] & 0x0f]);
+    }
+    return hex;
+}
+
+inline std::string to_lower_ascii(std::string s) {
+    for (auto& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
 } // namespace mc

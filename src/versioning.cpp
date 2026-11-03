@@ -33,11 +33,26 @@ void bind(sqlite3_stmt* s,int index,const std::string& value){
 }
 std::string column(sqlite3_stmt* s,int index){const auto* value=reinterpret_cast<const char*>(sqlite3_column_text(s,index));return value?value:"";}
 fs::path object_path(const fs::path& objects,const std::string& hash){if(hash.size()!=64||!std::all_of(hash.begin(),hash.end(),[](unsigned char c){return std::isxdigit(c)!=0;}))throw std::runtime_error("invalid content hash in version metadata");return objects/hash.substr(0,2)/hash.substr(2);}
-void reject_symlink_if_present(const fs::path& path){std::error_code ec;auto status=fs::symlink_status(path,ec);if(ec==std::errc::no_such_file_or_directory)return;if(ec)throw std::runtime_error("cannot inspect content-store path: "+ec.message());if(fs::is_symlink(status))throw std::runtime_error("content-store path cannot be a symbolic link: "+path.string());}
+void reject_symlink_if_present(const fs::path& path){
+    std::error_code ec;
+    auto status=fs::symlink_status(path,ec);
+    if(ec==std::errc::no_such_file_or_directory)return;
+    if(ec)throw std::runtime_error("cannot inspect content-store path: "+ec.message());
+    if(fs::is_symlink(status)||is_reparse_point_or_symlink(path))throw std::runtime_error("content-store path cannot be a symbolic link or directory junction: "+path.string());
+}
 void ensure_no_symlink(const fs::path& root,const std::string& relative){
     if(!safe_relative_path(relative))throw std::runtime_error("unsafe relative path in version");
+    if(is_reparse_point_or_symlink(root))throw std::runtime_error("root path cannot be a symbolic link or directory junction: "+root.string());
     fs::path current=root;
-    for(const auto& part:fs::u8path(relative)){current/=part;std::error_code ec;auto status=fs::symlink_status(current,ec);if(ec&&ec!=std::errc::no_such_file_or_directory)throw std::runtime_error("cannot inspect restore path: "+ec.message());if(!ec&&fs::is_symlink(status))throw std::runtime_error("restore path crosses a symbolic link");}
+    for(const auto& part:fs::u8path(relative)){
+        current/=part;
+        std::error_code ec;
+        auto status=fs::symlink_status(current,ec);
+        if(ec&&ec!=std::errc::no_such_file_or_directory)throw std::runtime_error("cannot inspect restore path: "+ec.message());
+        if(!ec&&(fs::is_symlink(status)||is_reparse_point_or_symlink(current)))throw std::runtime_error("restore path crosses a symbolic link or directory junction: "+current.string());
+    }
+    const auto target=root/fs::u8path(relative);
+    if(!is_path_within_boundary(root,target))throw std::runtime_error("restore path resolves outside boundary root: "+target.string());
 }
 }
 

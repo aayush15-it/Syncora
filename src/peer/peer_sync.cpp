@@ -230,15 +230,7 @@ std::string digest_to_bytes(const std::string& hex) {
 
 std::string digest_to_hex(const std::string& bytes) {
     if (bytes.size() != 32U) throw std::runtime_error("peer manifest digest has an invalid length");
-    static constexpr char digits[] = "0123456789abcdef";
-    std::string hex;
-    hex.reserve(64U);
-    for (const auto byte : bytes) {
-        const auto value = static_cast<unsigned char>(byte);
-        hex.push_back(digits[value >> 4U]);
-        hex.push_back(digits[value & 0x0fU]);
-    }
-    return hex;
+    return to_hex(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size());
 }
 
 void append_optional_file(std::string& out, const std::optional<FileMetadata>& file) {

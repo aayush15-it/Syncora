@@ -10,9 +10,7 @@
 
 namespace mc {
 static std::string digest_hex(const unsigned char* data, unsigned int n) {
-    std::ostringstream out; out << std::hex << std::setfill('0');
-    for (unsigned int i=0;i<n;++i) out << std::setw(2) << static_cast<unsigned>(data[i]);
-    return out.str();
+    return to_hex(data, n);
 }
 std::string sha256_data(const void* data,std::size_t size) {
     std::array<unsigned char, EVP_MAX_MD_SIZE> digest{}; unsigned int n=0;

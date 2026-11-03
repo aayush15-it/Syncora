@@ -2,7 +2,17 @@
 #include "merklechain/hash.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <system_error>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace mc {
 std::string canonical_relative(const fs::path& path) { auto s=path.generic_u8string(); std::replace(s.begin(),s.end(),'\\','/'); return s; }
@@ -52,20 +62,75 @@ bool safe_relative_path(const std::string& value) {
     }
     return true;
 }
+
+bool is_reparse_point_or_symlink(const fs::path& path) {
+#ifdef _WIN32
+    DWORD attrs = GetFileAttributesW(path.wstring().c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        return true;
+    }
+#endif
+    std::error_code ec;
+    auto status = fs::symlink_status(path, ec);
+    return (!ec && fs::is_symlink(status));
+}
+
+bool is_path_within_boundary(const fs::path& base, const fs::path& target) {
+    std::error_code ec;
+    auto canon_base = fs::weakly_canonical(base, ec);
+    if (ec) return false;
+    auto canon_target = fs::weakly_canonical(target, ec);
+    if (ec) return false;
+
+    auto it_base = canon_base.begin();
+    auto end_base = canon_base.end();
+    auto it_target = canon_target.begin();
+    auto end_target = canon_target.end();
+
+    for (; it_base != end_base; ++it_base, ++it_target) {
+        if (it_target == end_target) {
+            return false;
+        }
+#ifdef _WIN32
+        std::wstring s_base = it_base->wstring();
+        std::wstring s_target = it_target->wstring();
+        while (s_base.size() > 1 && (s_base.back() == L'/' || s_base.back() == L'\\')) s_base.pop_back();
+        while (s_target.size() > 1 && (s_target.back() == L'/' || s_target.back() == L'\\')) s_target.pop_back();
+        if (s_base.size() != s_target.size()) return false;
+        for (std::size_t i = 0; i < s_base.size(); ++i) {
+            wchar_t ca = s_base[i] == L'/' ? L'\\' : towlower(s_base[i]);
+            wchar_t cb = s_target[i] == L'/' ? L'\\' : towlower(s_target[i]);
+            if (ca != cb) return false;
+        }
+#else
+        if (*it_base != *it_target) return false;
+#endif
+    }
+    return true;
+}
+
 FileManifest scan_folder(const fs::path& input) {
     FileManifest manifest; std::error_code ec; auto root=fs::weakly_canonical(input,ec);
     if(ec || !fs::is_directory(root,ec) || ec) { manifest.complete=false; manifest.warnings.push_back("Folder is missing or inaccessible: "+input.string()); return manifest; }
+    if(is_reparse_point_or_symlink(root)) { manifest.complete=false; manifest.warnings.push_back("Folder cannot be a symbolic link or directory junction: "+input.string()); return manifest; }
     fs::recursive_directory_iterator it(root,fs::directory_options::none,ec), end;
     if(ec){manifest.complete=false;manifest.warnings.push_back(ec.message());ec.clear();}
     for(;it!=end;it.increment(ec)) {
         if(ec){manifest.complete=false;manifest.warnings.push_back(ec.message());ec.clear();continue;}
         auto p=it->path(); auto status=it->symlink_status(ec);
         if(ec){manifest.complete=false;manifest.warnings.push_back(p.string()+": "+ec.message());ec.clear();continue;}
-        if(fs::is_symlink(status)){ it.disable_recursion_pending(); continue; }
+        if(fs::is_symlink(status) || is_reparse_point_or_symlink(p)){ it.disable_recursion_pending(); continue; }
+        if(!is_path_within_boundary(root, p)){
+            manifest.complete=false;
+            manifest.warnings.push_back("Path escapes root boundary: "+p.string());
+            it.disable_recursion_pending();
+            continue;
+        }
         auto rel=canonical_relative(fs::relative(p,root,ec));
         if(ec || !safe_relative_path(rel)){manifest.complete=false;manifest.warnings.push_back("Unsafe or unavailable path: "+p.string());ec.clear();continue;}
         auto app_path=rel;std::transform(app_path.begin(),app_path.end(),app_path.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
         if(app_path==".merklechain" || app_path.rfind(".merklechain/",0)==0){if(it->is_directory(ec))it.disable_recursion_pending();continue;}
+        if(app_path==".syncora_op_sentinel" || app_path.rfind(".syncora_op_sentinel/",0)==0){if(it->is_directory(ec))it.disable_recursion_pending();continue;}
         if(!fs::is_regular_file(status)) continue;
         try {
             FileMetadata f; f.relative_path=rel; f.size=it->file_size(ec); if(ec)throw std::runtime_error(ec.message());
