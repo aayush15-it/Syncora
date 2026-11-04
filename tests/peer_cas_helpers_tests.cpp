@@ -66,7 +66,21 @@ void run_peer_cas_helpers_tests(const fs::path& fixture_root, void (*check)(bool
         check(cd_out.chunk_hash == data_hash && cd_out.data == cd_in.data,
               "Stage 1: ChunkDataMessage round-trip");
 
-        // 1.5 FrameDecoder with All New Message Types (10, 11, 12, 13)
+        // 1.5 ChunkManifestPageMessage (Type 14) Round-Trip
+        ChunkManifestPageMessage cp_in;
+        cp_in.relative_path = "large.bin";
+        cp_in.file_sha256 = std::string(64, 'd');
+        cp_in.total_size = 104857600;
+        cp_in.page_index = 0;
+        cp_in.total_pages = 5;
+        cp_in.chunks_in_page = 2000;
+        cp_in.total_chunks = 10000;
+        cp_in.page_payload = {0x01, 0x02, 0x03, 0x04};
+        const std::string cp_wire = encode_chunk_manifest_page(cp_in);
+        const ChunkManifestPageMessage cp_out = decode_chunk_manifest_page(cp_wire);
+        check(cp_out == cp_in, "Stage 1: ChunkManifestPageMessage round-trip");
+
+        // 1.6 FrameDecoder with All New Message Types (10, 11, 12, 13)
         Frame f10{kProtocolVersion, MessageType::ChunkManifestRequest, req_wire};
         Frame f11{kProtocolVersion, MessageType::ChunkManifest, cm_wire};
         Frame f12{kProtocolVersion, MessageType::ChunkRequest, cr_wire};
@@ -138,7 +152,8 @@ void run_peer_cas_helpers_tests(const fs::path& fixture_root, void (*check)(bool
     {
         // 3.1 Invalid Message Types
         check(!valid_message_type(0), "Stage 1: MessageType 0 is invalid");
-        check(!valid_message_type(14), "Stage 1: MessageType 14 is invalid");
+        check(valid_message_type(14), "Stage 1: MessageType 14 (ChunkManifestPage) is valid");
+        check(!valid_message_type(15), "Stage 1: MessageType 15 is invalid");
         check(!valid_message_type(99), "Stage 1: MessageType 99 is invalid");
 
         // 3.2 Malformed ChunkRequest: truncated count
@@ -716,6 +731,205 @@ void run_peer_cas_helpers_tests(const fs::path& fixture_root, void (*check)(bool
               "Stage 2 Edge: local_reused_bytes accounts for both occurrences of chunk 1 (2 * 4096 = 8192)");
         check(mc_res.missing_bytes == 8192,
               "Stage 2 Edge: missing_bytes accounts for chunk 2 and chunk 3 (4096 + 4096 = 8192)");
+    }
+
+    // =========================================================================
+    // SECTION 13: Deterministic Fail-Closed Interprocess Barrier Tests (SEC-05)
+    // =========================================================================
+    {
+        const fs::path sec5_dir = fixture_root / "sec5_barrier_suite";
+        fs::create_directories(sec5_dir);
+        const fs::path lock_file = sec5_dir / ".barrier_test.lock";
+
+        // 13.1 Normal Lock Acquisition & Status
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+            barrier.lock_shared();
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.1: Shared lock acquires OS lock file successfully");
+            barrier.unlock_shared();
+            check(!barrier.is_os_lock_acquired(), "SEC-05 13.1: OS lock released on shared unlock");
+
+            barrier.lock_exclusive();
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.1: Exclusive lock acquires OS lock file successfully");
+            barrier.unlock_exclusive();
+            check(!barrier.is_os_lock_acquired(), "SEC-05 13.1: OS lock released on exclusive unlock");
+        }
+
+        // 13.2 Fail-Closed on EnsureFileOpen failure
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::FailEnsureFileOpen);
+
+            bool shared_threw = false;
+            try {
+                barrier.lock_shared();
+            } catch (const mc::cas::InterprocessLockException& ex) {
+                shared_threw = true;
+                check(ex.status() == mc::cas::BarrierLockStatus::OperatingSystemError,
+                      "SEC-05 13.2: Shared lock throws InterprocessLockException with OperatingSystemError");
+            }
+            check(shared_threw, "SEC-05 13.2: lock_shared fails closed when file cannot be opened");
+            check(!barrier.is_os_lock_acquired(), "SEC-05 13.2: OS lock not marked acquired on open failure");
+
+            bool excl_threw = false;
+            try {
+                barrier.lock_exclusive();
+            } catch (const mc::cas::InterprocessLockException& ex) {
+                excl_threw = true;
+                check(ex.status() == mc::cas::BarrierLockStatus::OperatingSystemError,
+                      "SEC-05 13.2: Exclusive lock throws InterprocessLockException with OperatingSystemError");
+            }
+            check(excl_threw, "SEC-05 13.2: lock_exclusive fails closed when file cannot be opened");
+            check(!barrier.is_os_lock_acquired(), "SEC-05 13.2: OS lock not marked acquired on open failure");
+
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+        }
+
+        // 13.3 Fail-Closed on Shared OS Lock Failure (State Unwinding)
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::FailLockShared);
+
+            bool threw = false;
+            try {
+                barrier.lock_shared();
+            } catch (const mc::cas::InterprocessLockException&) {
+                threw = true;
+            }
+            check(threw, "SEC-05 13.3: Injected FailLockShared throws exception");
+            check(!barrier.is_os_lock_acquired(), "SEC-05 13.3: In-process reader state unwound cleanly");
+
+            // Verify in-process mutex is NOT held and can be re-locked
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+            barrier.lock_shared();
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.3: Barrier successfully acquires lock after fault cleared");
+            barrier.unlock_shared();
+        }
+
+        // 13.4 Fail-Closed on Exclusive OS Lock Failure (State Unwinding)
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::FailLockExclusive);
+
+            bool threw = false;
+            try {
+                barrier.lock_exclusive();
+            } catch (const mc::cas::InterprocessLockException&) {
+                threw = true;
+            }
+            check(threw, "SEC-05 13.4: Injected FailLockExclusive throws exception");
+            check(!barrier.is_os_lock_acquired(), "SEC-05 13.4: In-process exclusive state unwound cleanly");
+
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+            barrier.lock_exclusive();
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.4: Barrier acquires exclusive lock after fault cleared");
+            barrier.unlock_exclusive();
+        }
+
+        // 13.5 Reentrant Depth Tracking on Calling Thread
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            barrier.lock_shared();
+            barrier.lock_shared(); // Reentrant
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.5: Nested shared lock remains acquired");
+            barrier.unlock_shared();
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.5: Inner unlock leaves outer lock acquired");
+            barrier.unlock_shared();
+            check(!barrier.is_os_lock_acquired(), "SEC-05 13.5: Outer unlock releases OS lock");
+        }
+
+        // 13.6 TryLock Contention & Status
+        {
+            mc::cas::InterprocessCasBarrier barrier1(lock_file);
+            barrier1.lock_exclusive();
+
+            mc::cas::InterprocessCasBarrier barrier2(lock_file);
+            auto st = barrier2.try_lock_shared(std::chrono::milliseconds(50));
+            check(st == mc::cas::BarrierLockStatus::Contended,
+                  "SEC-05 13.6: try_lock_shared reports Contended status while exclusive held");
+
+            barrier1.unlock_exclusive();
+
+            st = barrier2.try_lock_shared(std::chrono::milliseconds(50));
+            check(st == mc::cas::BarrierLockStatus::Acquired,
+                  "SEC-05 13.6: try_lock_shared acquires after exclusive lock released");
+            barrier2.unlock_shared();
+        }
+
+        // 13.7 RAII Guards Exception Safety
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::FailLockShared);
+            bool guard_threw = false;
+            try {
+                mc::cas::CasSharedBarrierGuard guard(barrier);
+            } catch (const mc::cas::InterprocessLockException&) {
+                guard_threw = true;
+            }
+            check(guard_threw, "SEC-05 13.7: CasSharedBarrierGuard constructor throws on failed OS lock");
+            check(!barrier.is_os_lock_acquired(), "SEC-05 13.7: Destructor does not double-unlock failed guard");
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+        }
+    }
+
+    // =========================================================================
+    // SECTION 14: Source File Mutation During Chunking Pass (SEC-08)
+    // =========================================================================
+    {
+        const fs::path sec8_dir = fixture_root / "sec8_mutation_suite";
+        fs::create_directories(sec8_dir);
+        const fs::path test_file = sec8_dir / "target.bin";
+
+        // Create initial 64 KB file
+        {
+            std::ofstream out(test_file, std::ios::binary);
+            std::string buf(64 * 1024, 'X');
+            out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+        }
+
+        // 14.1 Normal chunking pass produces valid manifest
+        {
+            set_chunk_stream_mutation_hook(nullptr);
+            mc::cas::FileManifest manifest;
+            std::string err;
+            check(chunk_file_for_peer(test_file.string(), manifest, err),
+                  "SEC-08 14.1: Normal file chunking produces valid manifest");
+            check(manifest.total_size() == 64 * 1024,
+                  "SEC-08 14.1: Manifest total size matches unmutated file");
+        }
+
+        // 14.2 File mutation mid-stream is detected and rejected
+        {
+            set_chunk_stream_mutation_hook([&]() {
+                // Mutate the file on disk during chunk streaming
+                std::ofstream mutate_out(test_file, std::ios::binary | std::ios::app);
+                mutate_out << "CONCURRENT_APPENDED_BYTES_MUTATION";
+            });
+
+            mc::cas::FileManifest manifest;
+            std::string err;
+            const bool ok = chunk_file_for_peer(test_file.string(), manifest, err);
+            check(!ok, "SEC-08 14.2: Concurrent file append during chunking is detected and rejected");
+            check(err.find("mutated") != std::string::npos || err.find("does not match") != std::string::npos,
+                  "SEC-08 14.2: Explicit mutation error reported to caller");
+            set_chunk_stream_mutation_hook(nullptr);
+        }
+
+        // 14.3 File truncation mid-stream is detected and rejected
+        {
+            set_chunk_stream_mutation_hook([&]() {
+                // Truncate the file to 10 bytes mid-chunking
+                std::ofstream trunc_out(test_file, std::ios::binary | std::ios::trunc);
+                trunc_out << "truncated";
+            });
+
+            mc::cas::FileManifest manifest;
+            std::string err;
+            const bool ok = chunk_file_for_peer(test_file.string(), manifest, err);
+            check(!ok, "SEC-08 14.3: Concurrent file truncation during chunking is detected and rejected");
+            set_chunk_stream_mutation_hook(nullptr);
+        }
     }
 }
 

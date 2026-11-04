@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <functional>
 
 namespace mc::peer {
 
@@ -49,6 +50,11 @@ inline bool deserialize_peer_manifest(
     std::string& err) {
     return deserialize_peer_manifest(data.data(), data.size(), out_manifest, err);
 }
+
+// Encodes/decodes raw chunk info slices for paginated manifest wire frames
+std::vector<std::uint8_t> encode_peer_manifest_page_payload(const std::vector<mc::cas::ChunkInfo>& chunks);
+bool decode_peer_manifest_page_payload(const std::vector<std::uint8_t>& payload, std::uint32_t expected_chunks,
+                                       std::vector<mc::cas::ChunkInfo>& out_chunks, std::string& err);
 
 // Session chunk authorization whitelist to prevent unauthorized CAS object probing.
 class SessionChunkAuthorizer {
@@ -156,5 +162,18 @@ bool verify_chunk_payload(
     const void* data,
     std::size_t size,
     std::string& err);
+
+// Testing hook for deterministic file mutation mid-chunking (SEC-08)
+void set_chunk_stream_mutation_hook(std::function<void()> hook);
+
+// Milestone 3.4 Fault injection for testing real subprocess receiver crashes (SEC-03)
+enum class PeerCasFaultPointForTesting {
+    None,
+    CrashDuringChunkIngestion,
+    CrashBeforeReconstruction,
+    CrashDuringReconstruction
+};
+void set_peer_cas_fault_point_for_testing(PeerCasFaultPointForTesting fp);
+PeerCasFaultPointForTesting get_peer_cas_fault_point_for_testing();
 
 } // namespace mc::peer

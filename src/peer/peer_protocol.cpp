@@ -17,6 +17,11 @@ void append_u32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xffU));
     out.push_back(static_cast<std::uint8_t>(value & 0xffU));
 }
+void append_u64(std::vector<std::uint8_t>& out, std::uint64_t value) {
+    for (int i = 56; i >= 0; i -= 8) {
+        out.push_back(static_cast<std::uint8_t>((value >> static_cast<unsigned>(i)) & 0xffU));
+    }
+}
 std::uint16_t read_u16(const std::uint8_t* p) {
     return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8U) |
                                       static_cast<std::uint16_t>(p[1]));
@@ -26,6 +31,13 @@ std::uint32_t read_u32(const std::uint8_t* p) {
            (static_cast<std::uint32_t>(p[1]) << 16U) |
            (static_cast<std::uint32_t>(p[2]) << 8U) |
            static_cast<std::uint32_t>(p[3]);
+}
+std::uint64_t read_u64(const std::uint8_t* p) {
+    std::uint64_t val = 0;
+    for (int i = 0; i < 8; ++i) {
+        val = (val << 8U) | static_cast<std::uint64_t>(p[i]);
+    }
+    return val;
 }
 void validate_header(const std::vector<std::uint8_t>& header,
                      std::uint16_t& version, MessageType& type,
@@ -48,7 +60,7 @@ void validate_header(const std::vector<std::uint8_t>& header,
 
 bool valid_message_type(std::uint16_t type) noexcept {
     return type >= static_cast<std::uint16_t>(MessageType::Hello) &&
-           type <= static_cast<std::uint16_t>(MessageType::ChunkData);
+           type <= static_cast<std::uint16_t>(MessageType::ChunkManifestPage);
 }
 
 bool is_valid_hex_sha256(const std::string& hash) noexcept {
@@ -321,6 +333,76 @@ ChunkDataMessage decode_chunk_data(const std::string& payload) {
     ChunkDataMessage msg;
     msg.chunk_hash = std::move(chunk_hash);
     msg.data.assign(payload.begin() + static_cast<std::ptrdiff_t>(kMaxChunkHashHexSize), payload.end());
+    return msg;
+}
+
+std::string encode_chunk_manifest_page(const ChunkManifestPageMessage& msg) {
+    if (msg.relative_path.size() > 65535U) {
+        throw std::runtime_error("relative_path exceeds 65535 bytes");
+    }
+    if (msg.file_sha256.size() != 64) {
+        throw std::runtime_error("file_sha256 must be 64 characters");
+    }
+    const std::size_t total_size = 2U + msg.relative_path.size() +
+                                   2U + 64U +
+                                   8U + 4U + 4U + 4U + 4U + 4U +
+                                   msg.page_payload.size();
+    if (total_size > kMaximumFramePayload) {
+        throw std::runtime_error("ChunkManifestPage exceeds maximum frame payload");
+    }
+    std::vector<std::uint8_t> out;
+    out.reserve(total_size);
+    append_u16(out, static_cast<std::uint16_t>(msg.relative_path.size()));
+    out.insert(out.end(), msg.relative_path.begin(), msg.relative_path.end());
+    append_u16(out, 64U);
+    out.insert(out.end(), msg.file_sha256.begin(), msg.file_sha256.end());
+    append_u64(out, msg.total_size);
+    append_u32(out, msg.page_index);
+    append_u32(out, msg.total_pages);
+    append_u32(out, msg.chunks_in_page);
+    append_u32(out, msg.total_chunks);
+    append_u32(out, static_cast<std::uint32_t>(msg.page_payload.size()));
+    out.insert(out.end(), msg.page_payload.begin(), msg.page_payload.end());
+    return std::string(reinterpret_cast<const char*>(out.data()), out.size());
+}
+
+ChunkManifestPageMessage decode_chunk_manifest_page(const std::string& payload) {
+    if (payload.size() < 2U + 2U + 64U + 8U + 4U + 4U + 4U + 4U + 4U) {
+        throw std::runtime_error("truncated ChunkManifestPage frame");
+    }
+    const auto* p = reinterpret_cast<const std::uint8_t*>(payload.data());
+    std::size_t offset = 0;
+    const std::uint16_t path_len = read_u16(p + offset);
+    offset += 2;
+    if (payload.size() < offset + path_len + 2 + 64 + 28) {
+        throw std::runtime_error("truncated path in ChunkManifestPage frame");
+    }
+    ChunkManifestPageMessage msg;
+    msg.relative_path = payload.substr(offset, path_len);
+    offset += path_len;
+    const std::uint16_t sha_len = read_u16(p + offset);
+    offset += 2;
+    if (sha_len != 64 || payload.size() < offset + 64 + 28) {
+        throw std::runtime_error("invalid sha256 in ChunkManifestPage frame");
+    }
+    msg.file_sha256 = payload.substr(offset, 64);
+    offset += 64;
+    msg.total_size = read_u64(p + offset);
+    offset += 8;
+    msg.page_index = read_u32(p + offset);
+    offset += 4;
+    msg.total_pages = read_u32(p + offset);
+    offset += 4;
+    msg.chunks_in_page = read_u32(p + offset);
+    offset += 4;
+    msg.total_chunks = read_u32(p + offset);
+    offset += 4;
+    const std::uint32_t payload_len = read_u32(p + offset);
+    offset += 4;
+    if (payload.size() != offset + payload_len) {
+        throw std::runtime_error("ChunkManifestPage payload size mismatch");
+    }
+    msg.page_payload.assign(p + offset, p + offset + payload_len);
     return msg;
 }
 

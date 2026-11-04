@@ -4108,4 +4108,80 @@ GcReport CollabStore::garbage_collect(const GcOptions& options) {
     return report;
 }
 
+CompactionReport CollabStore::compact_cas_metadata(const CompactionOptions& options) {
+    OperationGuard op_guard(*this);
+    cas::CasExclusiveBarrierGuard cas_lock(cas_barrier_);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
+    CompactionReport report;
+    std::error_code ec;
+    report.db_size_before = fs::exists(db_path_, ec) ? fs::file_size(db_path_, ec) : 0;
+
+    try {
+        const char* sql_candidates = R"(
+            SELECT c.chunk_hash
+            FROM cas_chunks c
+            WHERE c.reference_count <= 0
+              AND c.storage_state != 'PENDING_SWEEP'
+              AND NOT EXISTS (
+                  SELECT 1 FROM version_manifest_chunks vmc
+                  WHERE vmc.chunk_hash = c.chunk_hash
+              )
+        )";
+        sqlite3_stmt* stmt = stmt_registry_.prepare(db_, sql_candidates);
+        if (!stmt) {
+            report.success = false;
+            report.error = "Failed to prepare compaction query: " + std::string(sqlite3_errmsg(db_));
+            return report;
+        }
+
+        std::vector<std::string> to_prune;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            to_prune.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+        }
+        stmt_registry_.finalize(stmt);
+
+        if (to_prune.size() < options.unreferenced_threshold) {
+            report.success = true;
+            report.unreferenced_pruned = 0;
+            report.db_size_after = report.db_size_before;
+            return report;
+        }
+
+        execute_sql("BEGIN IMMEDIATE;");
+        const char* sql_del = "DELETE FROM cas_chunks WHERE chunk_hash = ?";
+        sqlite3_stmt* del_stmt = stmt_registry_.prepare(db_, sql_del);
+        if (!del_stmt) {
+            execute_sql("ROLLBACK;");
+            report.success = false;
+            report.error = "Failed to prepare prune delete statement";
+            return report;
+        }
+
+        for (const auto& h : to_prune) {
+            sqlite3_bind_text(del_stmt, 1, h.c_str(), -1, SQLITE_STATIC);
+            if (sqlite3_step(del_stmt) == SQLITE_DONE) {
+                ++report.unreferenced_pruned;
+            }
+            sqlite3_reset(del_stmt);
+            sqlite3_clear_bindings(del_stmt);
+        }
+        stmt_registry_.finalize(del_stmt);
+        execute_sql("COMMIT;");
+
+        if (options.vacuum) {
+            execute_sql("VACUUM;");
+        }
+
+        report.db_size_after = fs::exists(db_path_, ec) ? fs::file_size(db_path_, ec) : 0;
+        report.success = true;
+    } catch (const std::exception& e) {
+        execute_sql("ROLLBACK;");
+        report.success = false;
+        report.error = "Compaction exception: " + std::string(e.what());
+    }
+
+    return report;
+}
+
 } // namespace mc

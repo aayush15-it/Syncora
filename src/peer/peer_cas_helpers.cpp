@@ -7,8 +7,11 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
+#include <iomanip>
 #include <stdexcept>
 #include <unordered_map>
+#include <cstring>
+#include <openssl/evp.h>
 
 namespace mc::peer {
 
@@ -207,6 +210,50 @@ bool deserialize_peer_manifest(
     return validate_peer_manifest(out_manifest, err);
 }
 
+std::vector<std::uint8_t> encode_peer_manifest_page_payload(const std::vector<mc::cas::ChunkInfo>& chunks) {
+    std::vector<std::uint8_t> payload(chunks.size() * 80);
+    std::uint8_t* ptr = payload.data();
+    for (const auto& c : chunks) {
+        std::uint64_t off = c.offset;
+        std::uint64_t sz = c.size;
+        std::memcpy(ptr, &off, 8);
+        ptr += 8;
+        std::memcpy(ptr, &sz, 8);
+        ptr += 8;
+        std::memcpy(ptr, c.hash.data(), 64);
+        ptr += 64;
+    }
+    return payload;
+}
+
+bool decode_peer_manifest_page_payload(const std::vector<std::uint8_t>& payload, std::uint32_t expected_chunks,
+                                       std::vector<mc::cas::ChunkInfo>& out_chunks, std::string& err) {
+    if (payload.size() != static_cast<std::size_t>(expected_chunks) * 80) {
+        err = "manifest page payload size mismatch: expected " + std::to_string(expected_chunks * 80) +
+              " bytes, got " + std::to_string(payload.size());
+        return false;
+    }
+    out_chunks.clear();
+    out_chunks.reserve(expected_chunks);
+    const std::uint8_t* ptr = payload.data();
+    for (std::uint32_t i = 0; i < expected_chunks; ++i) {
+        std::uint64_t off = 0;
+        std::uint64_t sz = 0;
+        std::memcpy(&off, ptr, 8);
+        ptr += 8;
+        std::memcpy(&sz, ptr, 8);
+        ptr += 8;
+        std::string hash(reinterpret_cast<const char*>(ptr), 64);
+        ptr += 64;
+        if (!is_valid_hex_sha256(hash)) {
+            err = "manifest page chunk " + std::to_string(i) + " contains invalid hash";
+            return false;
+        }
+        out_chunks.push_back({off, sz, std::move(hash)});
+    }
+    return true;
+}
+
 void SessionChunkAuthorizer::authorize_manifest(const mc::cas::FileManifest& manifest) {
     for (const auto& c : manifest.chunks()) {
         if (is_valid_hex_sha256(c.hash)) {
@@ -377,6 +424,29 @@ std::vector<ChunkRequestMessage> build_chunk_requests(
     return result;
 }
 
+namespace {
+std::function<void()>& testing_mutation_hook() {
+    static std::function<void()> hook;
+    return hook;
+}
+PeerCasFaultPointForTesting& peer_cas_fault_point_ref() noexcept {
+    static PeerCasFaultPointForTesting fp = PeerCasFaultPointForTesting::None;
+    return fp;
+}
+} // namespace
+
+void set_peer_cas_fault_point_for_testing(PeerCasFaultPointForTesting fp) {
+    peer_cas_fault_point_ref() = fp;
+}
+
+PeerCasFaultPointForTesting get_peer_cas_fault_point_for_testing() {
+    return peer_cas_fault_point_ref();
+}
+
+void set_chunk_stream_mutation_hook(std::function<void()> hook) {
+    testing_mutation_hook() = std::move(hook);
+}
+
 bool chunk_file_for_peer(
     const std::string& file_path,
     mc::cas::FileManifest& out_manifest,
@@ -387,13 +457,14 @@ bool chunk_file_for_peer(
         err = "file does not exist or is not a regular file: " + file_path;
         return false;
     }
-    const auto file_size = fs::file_size(p, ec);
+    const auto initial_size = fs::file_size(p, ec);
     if (ec) {
         err = "failed to get file size for " + file_path + ": " + ec.message();
         return false;
     }
+    const auto initial_mtime = fs::last_write_time(p, ec);
 
-    if (file_size == 0) {
+    if (initial_size == 0) {
         out_manifest.clear();
         out_manifest.set_version(mc::cas::FileManifest::kCurrentVersion);
         out_manifest.set_total_size(0);
@@ -401,12 +472,86 @@ bool chunk_file_for_peer(
         return true;
     }
 
-    const std::string whole_sha = mc::sha256_file(p);
-    mc::cas::FastCDCChunker chunker(get_peer_chunker_config());
-    auto chunks = chunker.chunk_file(p);
+    // Incremental EVP SHA-256 computation in single streaming pass
+    EVP_MD_CTX* md_ctx = EVP_MD_CTX_new();
+    if (!md_ctx) {
+        err = "failed to allocate EVP_MD_CTX";
+        return false;
+    }
+    if (EVP_DigestInit_ex(md_ctx, EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(md_ctx);
+        err = "failed to initialize SHA-256 context";
+        return false;
+    }
+
+    std::vector<mc::cas::ChunkInfo> chunks;
+    std::uint64_t accumulated_bytes = 0;
+    bool stream_failed = false;
+    std::string stream_err;
+    bool invoked_hook = false;
+
+    try {
+        mc::cas::FastCDCChunker chunker(get_peer_chunker_config());
+        chunker.chunk_file_stream(p, [&](const mc::cas::ChunkInfo& info, const std::uint8_t* data) {
+            chunks.push_back(info);
+            accumulated_bytes += info.size;
+            if (EVP_DigestUpdate(md_ctx, data, static_cast<size_t>(info.size)) != 1) {
+                stream_failed = true;
+                stream_err = "failed to update SHA-256 digest during stream";
+            }
+            if (!invoked_hook && testing_mutation_hook()) {
+                invoked_hook = true;
+                testing_mutation_hook()();
+            }
+        });
+    } catch (const std::exception& e) {
+        stream_failed = true;
+        stream_err = e.what();
+    }
+
+    if (stream_failed) {
+        EVP_MD_CTX_free(md_ctx);
+        err = "error during chunk streaming: " + stream_err;
+        return false;
+    }
+
+    std::array<unsigned char, 32> hash_buf{};
+    unsigned int hash_len = 0;
+    if (EVP_DigestFinal_ex(md_ctx, hash_buf.data(), &hash_len) != 1 || hash_len != 32) {
+        EVP_MD_CTX_free(md_ctx);
+        err = "failed to finalize SHA-256 digest";
+        return false;
+    }
+    EVP_MD_CTX_free(md_ctx);
+
+    std::ostringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < hash_len; ++i) {
+        ss << std::setw(2) << static_cast<unsigned>(hash_buf[i]);
+    }
+    const std::string computed_whole_sha = ss.str();
+
+    // Verify consistency: verify post-read size, timestamp and accumulated bytes
+    const auto post_size = fs::file_size(p, ec);
+    if (!ec && post_size != initial_size) {
+        err = "source file size mutated during chunking pass: was " + std::to_string(initial_size) +
+              ", now " + std::to_string(post_size);
+        return false;
+    }
+    const auto post_mtime = fs::last_write_time(p, ec);
+    if (!ec && post_mtime != initial_mtime) {
+        err = "source file modification timestamp mutated during chunking pass";
+        return false;
+    }
+    if (accumulated_bytes != initial_size) {
+        err = "accumulated chunk bytes (" + std::to_string(accumulated_bytes) +
+              ") does not match file size (" + std::to_string(initial_size) + ")";
+        return false;
+    }
 
     out_manifest.set_version(mc::cas::FileManifest::kCurrentVersion);
-    out_manifest.set_file_sha256(whole_sha);
+    out_manifest.set_total_size(accumulated_bytes);
+    out_manifest.set_file_sha256(computed_whole_sha);
     out_manifest.set_chunks(std::move(chunks));
 
     return validate_peer_manifest(out_manifest, err);
@@ -434,6 +579,7 @@ bool chunk_buffer_for_peer(
     auto chunks = chunker.chunk_buffer(data, size);
 
     out_manifest.set_version(mc::cas::FileManifest::kCurrentVersion);
+    out_manifest.set_total_size(size);
     out_manifest.set_file_sha256(whole_sha);
     out_manifest.set_chunks(std::move(chunks));
 

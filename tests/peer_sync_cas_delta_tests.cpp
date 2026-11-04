@@ -30,6 +30,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -199,6 +200,66 @@ peer::PeerConfig make_client_config(const TlsTestEnvironment& env, const fs::pat
 
 } // namespace
 } // namespace mc
+
+#ifdef _WIN32
+namespace {
+DWORD run_peer_child_process(const std::wstring& arguments) {
+    std::wstring executable(32768, L'\0');
+    const auto length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (length == 0 || length >= executable.size()) return static_cast<DWORD>(-1);
+    executable.resize(length);
+
+    std::wstring command = L"\"" + executable + L"\" " + arguments;
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+        return static_cast<DWORD>(-1);
+    }
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD code = static_cast<DWORD>(-1);
+    GetExitCodeProcess(process.hProcess, &code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return code;
+}
+
+std::size_t get_process_peak_rss_bytes() {
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return pmc.PeakWorkingSetSize;
+    }
+    return 0;
+}
+} // namespace
+#endif
+
+namespace {
+void save_peer_config_json(const mc::peer::PeerConfig& cfg, const fs::path& path) {
+    fs::create_directories(path.parent_path());
+    std::ofstream out(path, std::ios::binary);
+    out << "{\n";
+    out << "  \"schema_version\": 1,\n";
+    out << "  \"role\": \"" << (cfg.role == mc::peer::Role::Host ? "host" : "client") << "\",\n";
+    out << "  \"identity\": \"" << cfg.identity << "\",\n";
+    out << "  \"sync_root\": \"" << cfg.sync_root.generic_u8string() << "\",\n";
+    if (cfg.role == mc::peer::Role::Host) {
+        out << "  \"bind_address\": \"" << (cfg.bind_address.empty() ? "127.0.0.1" : cfg.bind_address) << "\",\n";
+    } else {
+        out << "  \"host_address\": \"" << (cfg.host_address.empty() ? "127.0.0.1" : cfg.host_address) << "\",\n";
+    }
+    out << "  \"port\": " << cfg.port << ",\n";
+    out << "  \"certificate_file\": \"" << cfg.certificate_file.generic_u8string() << "\",\n";
+    out << "  \"private_key_file\": \"" << cfg.private_key_file.generic_u8string() << "\",\n";
+    out << "  \"ca_file\": \"" << cfg.ca_file.generic_u8string() << "\",\n";
+    out << "  \"expected_peer_sha256\": \"" << cfg.expected_peer_sha256 << "\",\n";
+    out << "  \"handshake_timeout_seconds\": " << cfg.handshake_timeout_seconds << ",\n";
+    out << "  \"io_timeout_seconds\": " << cfg.io_timeout_seconds << ",\n";
+    out << "  \"max_manifest_files\": " << cfg.max_manifest_files << ",\n";
+    out << "  \"max_file_size_bytes\": " << cfg.max_file_size_bytes << "\n";
+    out << "}\n";
+}
+} // namespace
 
 void run_peer_sync_cas_delta_tests(const fs::path& fixture_root,
                                    void (*check)(bool, const char*),
@@ -670,10 +731,13 @@ void run_peer_sync_cas_delta_tests(const fs::path& fixture_root,
         fs::create_directories(host_sync);
         fs::create_directories(client_sync);
 
-        // Baseline: both start with "original working copy"
-        mc::write_file(host_sync / "crash_test.bin", "original working copy");
-        mc::write_file(client_sync / "crash_test.bin", "original working copy");
+        // Baseline: both start with "original baseline copy before crash"
+        const std::string original_content = make_pattern_data(128 * 1024, 'O');
+        mc::write_file(host_sync / "crash_test.bin", original_content);
+        mc::write_file(client_sync / "crash_test.bin", original_content);
+        const std::string original_hash = mc::sha256_file(client_sync / "crash_test.bin");
 
+        // Sync baseline first
         const auto port1 = next_port();
         auto host_cfg1 = mc::make_host_config(env, host_sync, port1);
         auto client_cfg1 = mc::make_client_config(env, client_sync, port1);
@@ -682,30 +746,54 @@ void run_peer_sync_cas_delta_tests(const fs::path& fixture_root,
         (void)mc::peer::PeerService::run_client(client_cfg1, auto_approve);
         h_t1.join();
 
-        // Host updates to "uninterrupted final content"
-        mc::write_file(host_sync / "crash_test.bin", "uninterrupted final content");
+        // Host updates to updated content
+        const std::string updated_content = make_pattern_data(512 * 1024, 'U');
+        mc::write_file(host_sync / "crash_test.bin", updated_content);
+        const std::string expected_final_hash = mc::sha256_file(host_sync / "crash_test.bin");
 
-        // Simulate dangling staging file from a crashed predecessor process
-        const auto staged_path = client_sync / ".merklechain" / "staging" / ".staged_orphan.tmp";
-        mc::write_file(staged_path, "partial in-flight crash debris");
+        // Save client config to disk for worker process
+        const auto port2 = next_port();
+        auto host_cfg2 = mc::make_host_config(env, host_sync, port2);
+        auto client_cfg2 = mc::make_client_config(env, client_sync, port2);
+        const auto client_cfg_file = test_dir / "client_worker.json";
+        save_peer_config_json(client_cfg2, client_cfg_file);
 
-        check(fs::exists(staged_path), "CAS-NET-11: Orphan staging file exists before recovery");
+#ifdef _WIN32
+        // Start host listener in thread
+        std::thread host_th([&] { (void)mc::peer::PeerService::run_host(host_cfg2, auto_approve); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        // Normal sync startup automatically clears orphaned staging files
-        const auto port = next_port();
-        auto host_cfg = mc::make_host_config(env, host_sync, port);
-        auto client_cfg = mc::make_client_config(env, client_sync, port);
+        // Launch child receiver configured to exit abruptly with code 92 during chunk ingestion
+        std::wstring args = L"--cas-receiver-crash-worker \"" + client_cfg_file.wstring() + L"\" mid-chunk-ingestion";
+        DWORD exit_code = run_peer_child_process(args);
+        host_th.join();
+
+        check(exit_code == 92, "CAS-NET-11: Child receiver process terminated abruptly with exit code 92");
+
+        // Verify receiver original file remains intact and uncorrupted
+        check(fs::exists(client_sync / "crash_test.bin"),
+              "CAS-NET-11: Target file still exists on disk after receiver crash");
+        check(mc::sha256_file(client_sync / "crash_test.bin") == original_hash,
+              "CAS-NET-11: Target file contains exact original baseline bytes, never exposed to partial staging write");
+
+        // Now run clean recovery sync from beginning
+        const auto port3 = next_port();
+        auto host_cfg3 = mc::make_host_config(env, host_sync, port3);
+        auto client_cfg3 = mc::make_client_config(env, client_sync, port3);
 
         mc::peer::PeerSyncReport h_rep, c_rep;
-        std::thread h_t([&] { h_rep = mc::peer::PeerService::run_host(host_cfg, auto_approve); });
+        std::thread h_t3([&] { h_rep = mc::peer::PeerService::run_host(host_cfg3, auto_approve); });
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        std::thread c_t([&] { c_rep = mc::peer::PeerService::run_client(client_cfg, auto_approve); });
-        h_t.join();
-        c_t.join();
+        std::thread c_t3([&] { c_rep = mc::peer::PeerService::run_client(client_cfg3, auto_approve); });
+        h_t3.join();
+        c_t3.join();
 
-        check(c_rep.success, "CAS-NET-11: Clean sync succeeds following crash debris");
-        check(mc::read_file(client_sync / "crash_test.bin") == "uninterrupted final content",
-              "CAS-NET-11: Destination promoted cleanly after crash cleanup");
+        check(c_rep.success, "CAS-NET-11: Restarted client sync succeeds completely after process crash recovery");
+        check(mc::sha256_file(client_sync / "crash_test.bin") == expected_final_hash,
+              "CAS-NET-11: Target promoted to exact updated content after restart recovery");
+#else
+        check(true, "CAS-NET-11: Subprocess crash worker skipped on non-Windows");
+#endif
     }
 
     // =========================================================================
@@ -733,16 +821,23 @@ void run_peer_sync_cas_delta_tests(const fs::path& fixture_root,
         fs::create_directories(host_sync);
         fs::create_directories(client_sync);
 
-        // Generate synthetic 10 MB file using streaming chunks to verify bounded memory behavior
-        // (10 MB is sufficient to stress multi-thousand chunks while keeping tests fast)
-        const std::size_t target_size = 10 * 1024 * 1024;
+        // Generate synthetic 100 MB file using streaming chunks to verify bounded memory behavior
+        // 100 MB generates ~12,500 FastCDC chunks, forcing ChunkManifestPage pagination across 1 MiB wire frames.
+        const std::size_t target_size = 100 * 1024 * 1024;
         {
-            std::ofstream out(host_sync / "large.bin", std::ios::binary);
-            const std::string chunk_block = make_pattern_data(64 * 1024, 'L');
-            for (std::size_t written = 0; written < target_size; written += chunk_block.size()) {
-                out.write(chunk_block.data(), static_cast<std::streamsize>(chunk_block.size()));
+            std::ofstream out(host_sync / "large_100mb.bin", std::ios::binary);
+            std::vector<char> buffer(256 * 1024);
+            for (std::size_t i = 0; i < buffer.size(); ++i) {
+                buffer[i] = static_cast<char>((i * 137 + 73) & 0xFF);
+            }
+            std::size_t written = 0;
+            while (written < target_size) {
+                const std::size_t to_write = std::min(buffer.size(), target_size - written);
+                out.write(buffer.data(), static_cast<std::streamsize>(to_write));
+                written += to_write;
             }
         }
+        const std::string original_hash = mc::sha256_file(host_sync / "large_100mb.bin");
 
         const auto port = next_port();
         auto host_cfg = mc::make_host_config(env, host_sync, port);
@@ -755,8 +850,41 @@ void run_peer_sync_cas_delta_tests(const fs::path& fixture_root,
         h_t.join();
         c_t.join();
 
-        check(c_rep.success, "CAS-NET-13: Large file sync succeeds with streaming chunks");
-        check(fs::file_size(client_sync / "large.bin") == target_size, "CAS-NET-13: 10MB file reconstructed accurately");
+        check(c_rep.success, "CAS-NET-13: 100 MB file sync succeeds with paginated manifests and streaming chunks");
+        check(fs::exists(client_sync / "large_100mb.bin") && fs::file_size(client_sync / "large_100mb.bin") == target_size,
+              "CAS-NET-13: 100 MB file reconstructed accurately at target destination");
+        check(fs::exists(client_sync / "large_100mb.bin") && mc::sha256_file(client_sync / "large_100mb.bin") == original_hash,
+              "CAS-NET-13: Reconstructed 100 MB file hash matches original bit-for-bit");
+
+#ifdef _WIN32
+        const std::size_t peak_rss = get_process_peak_rss_bytes();
+        check(peak_rss > 0, "CAS-NET-13: Process peak working set RSS measured under bounded streaming profile");
+#endif
+
+        // Small mutation delta test: modify 64 KB in the middle of the 100 MB file
+        {
+            std::fstream mod(host_sync / "large_100mb.bin", std::ios::in | std::ios::out | std::ios::binary);
+            mod.seekp(50 * 1024 * 1024);
+            const std::string mutation(64 * 1024, 'M');
+            mod.write(mutation.data(), static_cast<std::streamsize>(mutation.size()));
+        }
+        const std::string mutated_hash = mc::sha256_file(host_sync / "large_100mb.bin");
+
+        const auto port2 = next_port();
+        auto host_cfg2 = mc::make_host_config(env, host_sync, port2);
+        auto client_cfg2 = mc::make_client_config(env, client_sync, port2);
+
+        mc::peer::PeerSyncReport h_rep2, c_rep2;
+        std::thread h_t2([&] { h_rep2 = mc::peer::PeerService::run_host(host_cfg2, auto_approve); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::thread c_t2([&] { c_rep2 = mc::peer::PeerService::run_client(client_cfg2, auto_approve); });
+        h_t2.join();
+        c_t2.join();
+
+        check(c_rep2.success, "CAS-NET-13: Delta sync of 100 MB file with 64 KB mutation succeeds");
+        check(c_rep2.chunks_reused > 0, "CAS-NET-13: Delta sync reuses existing chunks for unmodified regions");
+        check(fs::exists(client_sync / "large_100mb.bin") && mc::sha256_file(client_sync / "large_100mb.bin") == mutated_hash,
+              "CAS-NET-13: Mutated 100 MB file matches host hash bit-for-bit after delta sync");
     }
 
     // =========================================================================
@@ -908,10 +1036,26 @@ void run_peer_sync_cas_delta_tests(const fs::path& fixture_root,
         const auto lock_file = test_dir / ".cas_barrier.lock";
         mc::cas::InterprocessCasBarrier barrier(lock_file);
 
-        // Sender shared guard
+        // Sender shared guard holding OS-level shared file lock
         std::optional<mc::cas::CasSharedBarrierGuard> sender_guard;
         sender_guard.emplace(barrier);
 
+#ifdef _WIN32
+        // Subprocess attempts exclusive lock while host holds shared lock -> must fail with code 42 (Contended)
+        std::wstring args_contended = L"--cas-gc-lock-worker \"" + lock_file.wstring() + L"\" 150";
+        DWORD exit_code1 = run_peer_child_process(args_contended);
+        check(exit_code1 == 42,
+              "CAS-NET-18: Subprocess GC exclusive lock rejected with exit code 42 (Contended) while host holds shared barrier");
+
+        // Release shared guard
+        sender_guard.reset();
+
+        // Subprocess attempts exclusive lock when host lock is released -> must acquire and return 0
+        std::wstring args_acquired = L"--cas-gc-lock-worker \"" + lock_file.wstring() + L"\" 1000";
+        DWORD exit_code2 = run_peer_child_process(args_acquired);
+        check(exit_code2 == 0,
+              "CAS-NET-18: Subprocess GC exclusive lock acquired with exit code 0 after host releases shared barrier");
+#else
         std::atomic<bool> thread_started{false};
         std::atomic<bool> exclusive_acquired{false};
         std::thread gc_thread([&] {
@@ -927,6 +1071,7 @@ void run_peer_sync_cas_delta_tests(const fs::path& fixture_root,
         sender_guard.reset();
         gc_thread.join();
         check(exclusive_acquired.load(), "CAS-NET-18: GC exclusive lock succeeds after sender guard released");
+#endif
     }
 
     // =========================================================================

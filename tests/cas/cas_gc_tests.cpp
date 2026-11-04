@@ -1223,6 +1223,77 @@ void run_cas_gc_tests(const mc::fs::path& fixture_root, void (*check)(bool, cons
         check(true, "GC-TEST-20: Subprocess recovery idempotency skipped on non-Windows");
 #endif
     }
+
+    // =========================================================================
+    // GC-TEST-21: CAS Metadata Compaction & Unreferenced Pruning (SEC-07)
+    // =========================================================================
+    {
+        const auto t21_root = test_dir / "t21_compaction";
+        fs::create_directories(t21_root);
+        const auto comp_db_path = t21_root / "collab.sqlite3";
+        const auto comp_storage_dir = t21_root / "storage";
+
+        CollabStore store(comp_db_path, comp_storage_dir);
+        store.init_schema();
+        store.seed_default_accounts_if_empty();
+
+        const auto host = store.find_user_by_username("host");
+        const auto ws = store.create_workspace("Compaction Test Workspace", "Testing metadata growth");
+        store.assign_user_to_workspace(ws.id, host->id);
+
+        // Submit and publish version 1
+        const auto src1 = t21_root / "src1";
+        fs::create_directories(src1);
+        const std::string s1_content = "Initial content version 1 for compaction test";
+        write_test_file(src1 / "file1.txt", s1_content.data(), s1_content.size());
+        auto sub1 = store.create_submission(host->id, ws.id, src1);
+        store.accept_submission(sub1.id, host->id, "Accept v1");
+        auto v1 = store.publish_version(ws.id, host->id, "v1", "v1 notes");
+
+        // Submit and publish version 2 with updated file
+        const auto src2 = t21_root / "src2";
+        fs::create_directories(src2);
+        const std::string s2_content = "Updated content version 2 with completely different text for compaction";
+        write_test_file(src2 / "file1.txt", s2_content.data(), s2_content.size());
+        auto sub2 = store.create_submission(host->id, ws.id, src2);
+        store.accept_submission(sub2.id, host->id, "Accept v2");
+        auto v2 = store.publish_version(ws.id, host->id, "v2", "v2 notes");
+
+        // Run initial live GC
+        GcOptions gc_opts;
+        gc_opts.dry_run = false;
+        gc_opts.grace_period_ms = 0;
+        store.garbage_collect(gc_opts);
+
+        // Prune version 1
+        std::string prune_err;
+        check(store.prune_version(v1.id, prune_err), "GC-TEST-21: prune_version succeeded");
+
+        // Run live GC to sweep unreferenced chunk from v1
+        auto gc_rep = store.garbage_collect(gc_opts);
+        check(gc_rep.success, "GC-TEST-21: Live GC completed after v1 deletion");
+
+        // Execute CAS metadata compaction
+        CompactionOptions comp_opts;
+        comp_opts.vacuum = true;
+        comp_opts.unreferenced_threshold = 0;
+        auto comp_rep = store.compact_cas_metadata(comp_opts);
+        check(comp_rep.success, "GC-TEST-21: CAS metadata compaction completed successfully");
+        check(comp_rep.db_size_before >= comp_rep.db_size_after,
+              "GC-TEST-21: Database size after compaction is less than or equal to before");
+
+        // Verify version 2 can still be reconstructed bit-exactly
+        const auto restore_dir = t21_root / "restored_v2";
+        std::string rec_err;
+        check(store.reconstruct_version(v2.id, restore_dir, rec_err),
+              "GC-TEST-21: Live version 2 reconstructs successfully after metadata compaction");
+
+        // Verify idempotency of repeated compaction
+        auto repeat_rep = store.compact_cas_metadata(comp_opts);
+        check(repeat_rep.success, "GC-TEST-21: Repeated metadata compaction is idempotent");
+        check(repeat_rep.unreferenced_pruned == 0,
+              "GC-TEST-21: Repeated compaction reports zero additional records pruned");
+    }
 }
 
 } // namespace mc::cas

@@ -200,11 +200,35 @@ void serve_peer_requests(PeerConnection& connection,
 
             authorizer.authorize_manifest(manifest_req.relative_path, manifest);
 
-            ChunkManifestMessage msg;
-            msg.relative_path = manifest_req.relative_path;
-            msg.serialized_manifest = serialize_peer_manifest(manifest);
-            connection.send_frame(Frame{kProtocolVersion, MessageType::ChunkManifest,
-                                        encode_chunk_manifest_message(msg)});
+            constexpr std::size_t kChunksPerPage = 2000;
+            const auto& all_chunks = manifest.chunks();
+            if (all_chunks.size() <= 4000) {
+                ChunkManifestMessage msg;
+                msg.relative_path = manifest_req.relative_path;
+                msg.serialized_manifest = serialize_peer_manifest(manifest);
+                connection.send_frame(Frame{kProtocolVersion, MessageType::ChunkManifest,
+                                            encode_chunk_manifest_message(msg)});
+            } else {
+                const std::uint32_t total_chunks = static_cast<std::uint32_t>(all_chunks.size());
+                const std::uint32_t total_pages = static_cast<std::uint32_t>((total_chunks + kChunksPerPage - 1) / kChunksPerPage);
+                for (std::uint32_t page_idx = 0; page_idx < total_pages; ++page_idx) {
+                    const std::size_t start_idx = page_idx * kChunksPerPage;
+                    const std::size_t count = std::min(kChunksPerPage, all_chunks.size() - start_idx);
+                    std::vector<mc::cas::ChunkInfo> page_chunks(all_chunks.begin() + start_idx,
+                                                                 all_chunks.begin() + start_idx + count);
+                    ChunkManifestPageMessage page_msg;
+                    page_msg.relative_path = manifest_req.relative_path;
+                    page_msg.file_sha256 = manifest.file_sha256();
+                    page_msg.total_size = manifest.total_size();
+                    page_msg.page_index = page_idx;
+                    page_msg.total_pages = total_pages;
+                    page_msg.chunks_in_page = static_cast<std::uint32_t>(count);
+                    page_msg.total_chunks = total_chunks;
+                    page_msg.page_payload = encode_peer_manifest_page_payload(page_chunks);
+                    connection.send_frame(Frame{kProtocolVersion, MessageType::ChunkManifestPage,
+                                                encode_chunk_manifest_page(page_msg)});
+                }
+            }
             ++report.files_transferred;
             if (progress_cb) {
                 progress_cb({"Transferring", "Sent chunk manifest for " + manifest_req.relative_path + " to " + remote_identity,
@@ -296,20 +320,68 @@ void stage_file_from_peer(PeerConnection& connection,
         return;
     }
 
-    if (frame.type != MessageType::ChunkManifest) {
-        throw std::runtime_error("expected ChunkManifest frame from peer, got type " +
-                                 std::to_string(static_cast<int>(frame.type)));
-    }
-
-    const auto cm_msg = decode_chunk_manifest_message(frame.payload);
-    if (cm_msg.relative_path != op.relative_path) {
-        throw std::runtime_error("peer sent ChunkManifest for unexpected path: " + cm_msg.relative_path);
-    }
-
     mc::cas::FileManifest manifest;
-    std::string des_err;
-    if (!deserialize_peer_manifest(cm_msg.serialized_manifest, manifest, des_err)) {
-        throw std::runtime_error("failed to deserialize peer manifest: " + des_err);
+    if (frame.type == MessageType::ChunkManifest) {
+        const auto cm_msg = decode_chunk_manifest_message(frame.payload);
+        if (cm_msg.relative_path != op.relative_path) {
+            throw std::runtime_error("peer sent ChunkManifest for unexpected path: " + cm_msg.relative_path);
+        }
+        std::string des_err;
+        if (!deserialize_peer_manifest(cm_msg.serialized_manifest, manifest, des_err)) {
+            throw std::runtime_error("failed to deserialize peer manifest: " + des_err);
+        }
+    } else if (frame.type == MessageType::ChunkManifestPage) {
+        auto page_0 = decode_chunk_manifest_page(frame.payload);
+        if (page_0.relative_path != op.relative_path) {
+            throw std::runtime_error("peer sent ChunkManifestPage for unexpected path: " + page_0.relative_path);
+        }
+        if (page_0.page_index != 0 || page_0.total_pages == 0 || page_0.total_pages > 10000) {
+            throw std::runtime_error("invalid page index or total_pages in initial ChunkManifestPage");
+        }
+
+        std::vector<mc::cas::ChunkInfo> all_chunks;
+        all_chunks.reserve(page_0.total_chunks);
+
+        std::vector<mc::cas::ChunkInfo> p0_chunks;
+        std::string p0_err;
+        if (!decode_peer_manifest_page_payload(page_0.page_payload, page_0.chunks_in_page, p0_chunks, p0_err)) {
+            throw std::runtime_error("failed to deserialize ChunkManifestPage 0: " + p0_err);
+        }
+        all_chunks.insert(all_chunks.end(), p0_chunks.begin(), p0_chunks.end());
+
+        for (std::uint32_t expected_page = 1; expected_page < page_0.total_pages; ++expected_page) {
+            const auto next_frame = connection.receive_frame();
+            if (next_frame.type != MessageType::ChunkManifestPage) {
+                throw std::runtime_error("expected ChunkManifestPage " + std::to_string(expected_page) +
+                                         ", got frame type " + std::to_string(static_cast<int>(next_frame.type)));
+            }
+            auto page_n = decode_chunk_manifest_page(next_frame.payload);
+            if (page_n.relative_path != op.relative_path || page_n.file_sha256 != page_0.file_sha256) {
+                throw std::runtime_error("ChunkManifestPage metadata mismatch at page " + std::to_string(expected_page));
+            }
+            if (page_n.page_index != expected_page || page_n.total_pages != page_0.total_pages) {
+                throw std::runtime_error("ChunkManifestPage out of order: expected " + std::to_string(expected_page) +
+                                         ", got " + std::to_string(page_n.page_index));
+            }
+            std::vector<mc::cas::ChunkInfo> pn_chunks;
+            std::string pn_err;
+            if (!decode_peer_manifest_page_payload(page_n.page_payload, page_n.chunks_in_page, pn_chunks, pn_err)) {
+                throw std::runtime_error("failed to deserialize ChunkManifestPage " + std::to_string(expected_page) + ": " + pn_err);
+            }
+            all_chunks.insert(all_chunks.end(), pn_chunks.begin(), pn_chunks.end());
+        }
+
+        manifest.set_version(mc::cas::FileManifest::kCurrentVersion);
+        manifest.set_total_size(page_0.total_size);
+        manifest.set_file_sha256(page_0.file_sha256);
+        manifest.set_chunks(std::move(all_chunks));
+        std::string val_err;
+        if (!validate_peer_manifest(manifest, val_err)) {
+            throw std::runtime_error("assembled paginated manifest failed validation: " + val_err);
+        }
+    } else {
+        throw std::runtime_error("expected ChunkManifest or ChunkManifestPage frame from peer, got type " +
+                                 std::to_string(static_cast<int>(frame.type)));
     }
 
     if (manifest.file_sha256() != op.expected_new_hash) {
@@ -356,8 +428,17 @@ void stage_file_from_peer(PeerConnection& connection,
                 }
                 report.bytes_transferred += data_msg.data.size();
                 ++report.chunks_transferred;
+
+                if (get_peer_cas_fault_point_for_testing() == PeerCasFaultPointForTesting::CrashDuringChunkIngestion &&
+                    report.chunks_transferred >= 1) {
+                    std::_Exit(92);
+                }
             }
         }
+    }
+
+    if (get_peer_cas_fault_point_for_testing() == PeerCasFaultPointForTesting::CrashBeforeReconstruction) {
+        std::_Exit(92);
     }
 
     // Reconstruct file into staging
@@ -373,6 +454,10 @@ void stage_file_from_peer(PeerConnection& connection,
             }
             staging.write(chunk_data.data(), chunk_data.size());
             reconstructed_bytes += chunk_data.size();
+            if (get_peer_cas_fault_point_for_testing() == PeerCasFaultPointForTesting::CrashDuringReconstruction &&
+                reconstructed_bytes > 0) {
+                std::_Exit(92);
+            }
         }
     }
     if (reconstructed_bytes != manifest.total_size()) {

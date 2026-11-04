@@ -340,6 +340,22 @@ struct GcReport {
 };
 
 // ---------------------------------------------------------------------------
+// Milestone 3.4: CAS Metadata Compaction Options & Report (SEC-07)
+// ---------------------------------------------------------------------------
+struct CompactionOptions {
+    bool vacuum{false};
+    std::size_t unreferenced_threshold{0}; // 0 = compact all qualifying unreferenced catalog entries
+};
+
+struct CompactionReport {
+    bool success{false};
+    std::string error;
+    std::size_t unreferenced_pruned{0};
+    std::uintmax_t db_size_before{0};
+    std::uintmax_t db_size_after{0};
+};
+
+// ---------------------------------------------------------------------------
 // CollabStore
 // ---------------------------------------------------------------------------
 class CollabStore {
@@ -476,6 +492,9 @@ public:
     // Milestone 3.3: CAS Garbage Collection & Sweeping Engine
     GcReport garbage_collect(const GcOptions& options = GcOptions{});
     GcReport gc_dry_run(std::uint64_t grace_period_ms = 3600 * 1000);
+
+    // Milestone 3.4: CAS Metadata Growth Management & Compaction (SEC-07)
+    CompactionReport compact_cas_metadata(const CompactionOptions& options = CompactionOptions{});
 
     // ---------------------------------------------------------------------------
     // Infrastructure accessors for testing only

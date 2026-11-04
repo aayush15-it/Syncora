@@ -1,8 +1,9 @@
 # Syncora Threat Model & Security Architecture
 
-**Document Version:** 1.0  
+**Document Version:** 1.1 (Remediation & Hardening Edition)  
 **Classification:** Internal Technical Security Architecture  
 **Target Release:** v0.3.0-m3.4 (`b31dbfe1341a8b06dd8be2bd03017ff5c1376753`)  
+**Status:** Remediated & Empirically Verified  
 **Auditor:** Independent Security Review  
 
 ---
@@ -15,7 +16,7 @@ Syncora is a high-assurance, peer-to-peer distributed file synchronization engin
 - **Merkle Tree State Graphs** for rapid hierarchical divergence detection.
 - **ACID Transactional Journaling** backed by SQLite3.
 - **Mutual TLS (mTLS)** transport with hard cryptographic certificate pinning.
-- **Multi-Process Concurrency Control** via OS-level advisory file locks (`LockFileEx`/`flock`) and in-process shared mutexes.
+- **Multi-Process Concurrency Control** via fail-closed OS-level advisory file locks (`LockFileEx`/`flock`) and in-process shared mutexes.
 - **Local Web Management Dashboard** exposed via loopback HTTP/WebSocket.
 
 This document establishes the formal **Threat Model** for Syncora across all system surfaces, enumerating trust boundaries, entry points, adversary profiles, assets, and security guarantees.
@@ -50,7 +51,7 @@ This document establishes the formal **Threat Model** for Syncora across all sys
 |         v                                                           v              |
 |  +-------------------------------+                         +--------------------+  |
 |  | Interprocess CAS Barrier      |                         | Transaction        |  |
-|  | (Shared/Exclusive OS Lock)    |                         | Coordinator        |  |
+|  | (Fail-Closed Shared/Exclusive)|                         | Coordinator        |  |
 |  +---------------+---------------+                         +---------+----------+  |
 |                  |                                                   |             |
 |                  v                                                   v             |
@@ -80,11 +81,11 @@ Syncora segregates its operational environment into distinct security zones sepa
 
 | Boundary ID | Boundary Name | Untrusted Domain | Trusted Domain | Enforcement Mechanism |
 | :--- | :--- | :--- | :--- | :--- |
-| **TB-NET** | Network Transport Boundary | External Network / Public Internet | Local Peer Process Space | Mutual TLS 1.3, X.509 CA chain verification, SHA-256 public key certificate pinning, 1 MiB framing bounds. |
-| **TB-PROC** | Inter-Process Concurrency Boundary | Concurrent OS Processes (Worker, CLI, Web) | Active Storage Pool | `InterprocessCasBarrier` with OS file locking (`LockFileEx`/`flock`), PID liveness checks, and cooperative shared/exclusive lock states. |
+| **TB-NET** | Network Transport Boundary | External Network / Public Internet | Local Peer Process Space | Mutual TLS 1.3, X.509 CA chain verification, SHA-256 public key certificate pinning, 1 MiB framing bounds, multi-page manifest pagination. |
+| **TB-PROC** | Inter-Process Concurrency Boundary | Concurrent OS Processes (Worker, CLI, Web) | Active Storage Pool | `InterprocessCasBarrier` with fail-closed OS file locking (`LockFileEx`/`flock`), counter rollback on failure, `InterprocessLockException`, and shared/exclusive lock states. |
 | **TB-FS** | Filesystem Sandbox Boundary | Arbitrary Filesystem & Peer Path Directives | Canonical Sync Root Tree | Handle-based atomic renames (`FILE_RENAME_FLAG_POSIX_SEMANTICS`), path sanitization rejecting `..`, UNC, drive letters, and Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`). |
 | **TB-WEB** | Local Dashboard Loopback Boundary | Local Web Browsers & Third-Party Origin Scripts | Dashboard API & Management State | Strict `127.0.0.1` binding, `Host` header enforcement, `Origin` whitelist validation on state-modifying requests, cryptographically strong anti-CSRF tokens, restrictive CSP. |
-| **TB-DB** | Metadata Persistence Boundary | Malicious Input File Metadata / Query Data | SQLite Database Filesystem | 100% parameterized SQLite statements (`sqlite3_bind_*`), absence of raw string interpolation, explicit WAL mode, and transactional rollback journals. |
+| **TB-DB** | Metadata Persistence Boundary | Malicious Input File Metadata / Query Data | SQLite Database Filesystem | 100% parameterized SQLite statements (`sqlite3_bind_*`), absence of raw string interpolation, explicit WAL mode, metadata compaction (`compact_cas_metadata()`), and transactional rollback journals. |
 | **TB-CAS** | Content Verification Boundary | Remote Peer Chunks / Staged Bit Streams | Content-Addressed Store | Cryptographic SHA-256 pre-verification of raw chunk bytes before object promotion; quarantine of mismatched chunks. |
 
 ---
@@ -96,7 +97,7 @@ The system exposes five primary entry points accessible to external or local act
 1. **EP-1: Peer Network Transport Listener (TCP Socket)**  
    - *Interface:* TLS 1.3 server socket listening on configured peer port (e.g., 42424).
    - *Protocol:* Custom binary framed protocol over TLS (`merklechain::peer::PeerProtocol`).
-   - *Potential Inputs:* Raw byte frames, Handshake tokens, Manifest payloads, Chunk request vectors, Raw chunk data blobs.
+   - *Potential Inputs:* Raw byte frames, Handshake tokens, Paginated chunk manifest pages, Chunk request vectors, Raw chunk data blobs.
 
 2. **EP-2: Web Dashboard Management Interface (HTTP/WebSocket)**  
    - *Interface:* Local HTTP/1.1 and WebSocket server bound to `127.0.0.1:47831`.
@@ -104,7 +105,7 @@ The system exposes five primary entry points accessible to external or local act
 
 3. **EP-3: Monitored Local Sync Root (Filesystem Scanner & Watcher)**  
    - *Interface:* Local directory tree traversed by recursive directory scanner.
-   - *Potential Inputs:* Symlinks, hardlinks, junction points, Alternate Data Streams (ADS), deep directory hierarchies, non-UTF8 filenames, files modified concurrently during scanning.
+   - *Potential Inputs:* Symlinks, hardlinks, junction points, Alternate Data Streams (ADS), deep directory hierarchies, non-UTF8 filenames, concurrent file modifications during scanning.
 
 4. **EP-4: CLI & Configuration Ingestion**  
    - *Interface:* Command-line invocation flags and `config.ini` files.
@@ -127,7 +128,8 @@ To thoroughly evaluate Syncora's defensive architecture, ten adversary profiles 
 * **Mitigations in Syncora:**
   - Strict mutual TLS handshake with SHA-256 certificate pinning (`CRYPTO_memcmp`). Untrusted peers are terminated prior to protocol execution.
   - Mandatory frame length validation capping frame payloads at `kMaximumFramePayload` (1 MiB).
-  - Validation of all manifest counts against `kMaxChunksPerManifest` (10,000) and `kMaxTotalFileSize` (1 TiB).
+  - Validation of all manifest counts against `kMaxPeerManifestChunks` (50,000) and `kMaxTotalFileSize` (1 TiB).
+  - Multi-frame manifest pagination (`ChunkManifestPage`) bounds payload frames to $\le 160\text{ KB}$ per page, strictly preventing allocation bombs while supporting multi-gigabyte transfers.
   - SHA-256 pre-verification of every received chunk against its advertised hash before writing to CAS.
 
 ### Category 2: Network Man-in-the-Middle / Traffic Tamperer (CAT-02)
@@ -146,7 +148,7 @@ To thoroughly evaluate Syncora's defensive architecture, ten adversary profiles 
 * **Mitigations in Syncora:**
   - Web dashboard enforces strict CSRF token validation and rejects requests with mismatched `Host` or foreign `Origin` headers.
   - SQLite database files and CAS directories inherit host user ACLs.
-  - Inter-process barrier uses OS-level mandatory/advisory locks keyed to the unique canonical path of the sync directory.
+  - Inter-process barrier uses fail-closed OS-level locks keyed to the unique canonical path of the sync directory. If the OS file lock cannot be acquired, execution immediately fails closed with `InterprocessLockException`.
 
 ### Category 4: Cross-Origin / Malicious Browser Attacker (CAT-04)
 * **Profile:** An attacker who induces the user to visit a malicious website in their browser while Syncora is running.
@@ -159,12 +161,12 @@ To thoroughly evaluate Syncora's defensive architecture, ten adversary profiles 
   - **Strict Content Security Policy (CSP):** `default-src 'self'`.
 
 ### Category 5: Process Crash, Power Failure & Disruption Adversary (CAT-05)
-* **Profile:** Sudden abnormal termination of the Syncora process or system (e.g., `kill -9`, blue screen, power loss, disk full) during critical operations.
+* **Profile:** Sudden abnormal termination of the Syncora process or system (e.g., `kill -9`, process exit via `_Exit(92)`, power loss) during critical operations.
 * **Capabilities:** Leaves incomplete staging files, half-written CAS objects, partially populated SQLite journals, or locked mutexes.
 * **Objectives:** Induce corrupted file state, orphaned locks preventing future restart, metadata desynchronization, lost data.
 * **Mitigations in Syncora:**
-  - **Atomic File Promotion:** Target files are assembled in isolated staging paths and promoted via atomic filesystem move operations (`MoveFileExW` / POSIX rename).
-  - **Atomic CAS Writes:** Chunks are written to PID-tagged temporary files (`.tmp.<pid>.<uuid>`) and atomically renamed into CAS object storage only after SHA-256 verification.
+  - **Atomic File Promotion:** Target files are assembled in isolated staging paths (`<target>.mc-stage-<op_id>`) and promoted via atomic filesystem move operations (`MoveFileExW` / POSIX rename). Empirically verified via `--cas-receiver-crash-worker` child process crash tests (`CAS-NET-11`).
+  - **Atomic CAS Writes:** Chunks are written to PID-tagged temporary files and atomically renamed into CAS object storage only after SHA-256 verification.
   - **SQLite WAL Mode & Journaling:** Operations are tracked in an ACID journal (`restore_journal`, `active_operations`), replaying or rolling back unfinished operations upon startup.
   - **Lock File Auto-Release:** OS file handles are automatically cleaned up and unlocked by the kernel upon process termination.
 
@@ -190,9 +192,9 @@ To thoroughly evaluate Syncora's defensive architecture, ten adversary profiles 
 * **Capabilities:** Concurrent read/write to `.merklechain/activity.sqlite3`, concurrent GC unlinking objects while a sync process is reading or referencing them.
 * **Objectives:** Data race, file locking violations, dangling CAS chunk references, database corruption.
 * **Mitigations in Syncora:**
-  - `InterprocessCasBarrier` implements two-tier locking: in-process `std::shared_mutex` plus OS file locks (`LockFileEx` on Windows / `flock` on POSIX).
-  - Operations categorize locks: Version publication and chunk ingestion take **Shared** locks; Garbage Collection sweeps take **Exclusive** locks.
-  - GC implements a configurable grace period (`grace_period_ms`) preventing recently staged or referenced chunks from being purged prematurely.
+  - `InterprocessCasBarrier` implements fail-closed two-tier locking: in-process `std::shared_mutex` plus OS file locks (`LockFileEx` on Windows / `flock` on POSIX).
+  - Hard failure guarantee: If the OS lock fails, internal state is completely rolled back and `InterprocessLockException` is thrown.
+  - Verified empirically across process boundaries with `--cas-gc-lock-worker`, demonstrating exit code 42 contention against active sender shared barriers (`CAS-NET-18`).
 
 ### Category 9: Supply Chain & Build Pipeline Adversary (CAT-09)
 * **Profile:** An adversary targeting third-party dependencies, build toolchains, or artifact distribution pipelines.
@@ -201,15 +203,17 @@ To thoroughly evaluate Syncora's defensive architecture, ten adversary profiles 
 * **Mitigations in Syncora:**
   - Minimal dependency footprint: Syncora depends solely on the C++17 Standard Library, OpenSSL (libcrypto/libssl), SQLite3, and native OS APIs (Win32 / POSIX).
   - All compiler warnings treated strictly (`-Wall -Wextra -Wpedantic -Wconversion -Wshadow`).
-  - Windows binary signing support via Authenticode (`Set-AuthenticodeSignature`).
+  - Parameterized Windows binary signing via `SIGNING_THUMBPRINT ?=` environment variable, removing developer-specific hardcoded certificates (`SEC-06`).
 
 ### Category 10: Resource Exhaustion & Denial of Service (DoS) Adversary (CAT-10)
 * **Profile:** A peer or client sending inputs calculated to maximize resource consumption (CPU, memory, disk, network bandwidth).
 * **Capabilities:** Sending manifests claiming billions of chunks, requesting missing chunks repeatedly in an infinite loop, streaming massive continuous files.
 * **Objectives:** Out-of-Memory (OOM) crashes, CPU starvation, disk exhaustion.
 * **Mitigations in Syncora:**
-  - Strict upper bounds: `kMaxChunksPerManifest = 10000`, `kMaxTotalFileSize = 1 TiB`, `kMaximumFramePayload = 1 MiB`.
-  - Bounded memory streaming: Chunk payloads are transferred and verified sequentially; receiver does not buffer entire multi-gigabyte files in RAM.
+  - Strict upper bounds: `kMaxPeerManifestChunks = 50000`, `kMaxTotalFileSize = 1 TiB`, `kMaximumFramePayload = 1 MiB`.
+  - Manifest pagination: Files with $>4,000$ chunks are paginated into 2,000-chunk frames (~160 KB payload), strictly bounded under 1 MiB.
+  - Bounded memory streaming: Verified empirically at 100 MB scale with `get_process_peak_rss_bytes()`, demonstrating bounded RAM consumption during sequential chunk streaming (`CAS-NET-13`).
+  - Proactive metadata compaction: `CollabStore::compact_cas_metadata()` prunes unreferenced rows, preventing unbounded SQLite growth (`SEC-07`).
 
 ---
 
@@ -229,4 +233,4 @@ To thoroughly evaluate Syncora's defensive architecture, ten adversary profiles 
 
 1. **OS Kernel & Local Administrator:** Syncora relies on the host operating system's kernel for process isolation and access control. If an attacker possesses local Administrator or `root` privileges on the host, all user-space isolation guarantees are nullified.
 2. **Cryptographic Foundations:** The security of Syncora relies on the cryptographic strength of SHA-256 and TLS 1.3 primitives provided by OpenSSL.
-3. **Physical Security:** Hardware memory corruption (e.g., non-ECC RAM bit-flips) or physical physical storage extraction is out of scope.
+3. **Physical Security:** Hardware memory corruption (e.g., non-ECC RAM bit-flips) or physical storage extraction is out of scope.

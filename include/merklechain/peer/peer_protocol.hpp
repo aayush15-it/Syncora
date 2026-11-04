@@ -33,7 +33,8 @@ enum class MessageType : std::uint16_t {
     ChunkManifestRequest = 10, // Request chunk manifest for relative path
     ChunkManifest = 11,        // Binary serialized mc::cas::FileManifest
     ChunkRequest = 12,         // List of missing chunk hashes requested by receiver
-    ChunkData = 13             // Content-addressed chunk payload
+    ChunkData = 13,            // Content-addressed chunk payload
+    ChunkManifestPage = 14     // Paginated chunk manifest page (SEC-01 / SEC-02)
 };
 
 struct Frame {
@@ -127,5 +128,30 @@ struct ChunkDataMessage {
 };
 std::string encode_chunk_data(const ChunkDataMessage& msg);
 ChunkDataMessage decode_chunk_data(const std::string& payload);
+
+// MessageType::ChunkManifestPage (14)
+struct ChunkManifestPageMessage {
+    std::string relative_path;
+    std::string file_sha256;
+    std::uint64_t total_size{0};
+    std::uint32_t page_index{0};
+    std::uint32_t total_pages{1};
+    std::uint32_t chunks_in_page{0};
+    std::uint32_t total_chunks{0};
+    std::vector<std::uint8_t> page_payload;
+
+    bool operator==(const ChunkManifestPageMessage& o) const noexcept {
+        return relative_path == o.relative_path &&
+               file_sha256 == o.file_sha256 &&
+               total_size == o.total_size &&
+               page_index == o.page_index &&
+               total_pages == o.total_pages &&
+               chunks_in_page == o.chunks_in_page &&
+               total_chunks == o.total_chunks &&
+               page_payload == o.page_payload;
+    }
+};
+std::string encode_chunk_manifest_page(const ChunkManifestPageMessage& msg);
+ChunkManifestPageMessage decode_chunk_manifest_page(const std::string& payload);
 
 } // namespace mc::peer

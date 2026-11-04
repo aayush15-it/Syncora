@@ -11,11 +11,14 @@
 #include "merklechain/peer/peer_transport.hpp"
 #include "merklechain/peer/peer_sync.hpp"
 #include "merklechain/peer/peer_session.hpp"
+#include "merklechain/peer/peer_service.hpp"
+#include "merklechain/peer/peer_cas_helpers.hpp"
 #include "merklechain/cas/cas_types.hpp"
 #include "merklechain/cas/chunker.hpp"
 #include "merklechain/cas/file_manifest.hpp"
 #include "merklechain/cas/manifest_serializer.hpp"
 #include "merklechain/cas/object_store.hpp"
+#include "merklechain/cas/interprocess_barrier.hpp"
 #include "merklechain/collab_store.hpp"
 #include <random>
 #include <sqlite3.h>
@@ -263,6 +266,36 @@ int main(int argc,char** argv){
         }
         return 0;
     }
+    if (argc >= 4 && std::string(argv[1]) == "--cas-receiver-crash-worker") {
+        const std::string config_path = argv[2];
+        const std::string fault_str = argv[3];
+        if (fault_str == "mid-chunk-ingestion") {
+            mc::peer::set_peer_cas_fault_point_for_testing(mc::peer::PeerCasFaultPointForTesting::CrashDuringChunkIngestion);
+        } else if (fault_str == "before-reconstruction") {
+            mc::peer::set_peer_cas_fault_point_for_testing(mc::peer::PeerCasFaultPointForTesting::CrashBeforeReconstruction);
+        } else if (fault_str == "during-reconstruction") {
+            mc::peer::set_peer_cas_fault_point_for_testing(mc::peer::PeerCasFaultPointForTesting::CrashDuringReconstruction);
+        }
+        mc::peer::PeerConfig cfg = mc::peer::load_peer_config(mc::fs::u8path(config_path), mc::peer::Role::Client);
+        auto rep = mc::peer::PeerService::run_client(cfg, [](const mc::peer::PeerSyncPlan&) {
+            return std::make_pair(true, true);
+        });
+        return rep.success ? 0 : 1;
+    }
+    if (argc >= 4 && std::string(argv[1]) == "--cas-gc-lock-worker") {
+        const mc::fs::path lock_path = mc::fs::u8path(argv[2]);
+        const int timeout_ms = std::stoi(argv[3]);
+        mc::cas::InterprocessCasBarrier barrier(lock_path);
+        const auto st = barrier.try_lock_exclusive(std::chrono::milliseconds(timeout_ms));
+        if (st == mc::cas::BarrierLockStatus::Contended) {
+            return 42;
+        }
+        if (st == mc::cas::BarrierLockStatus::Acquired) {
+            barrier.unlock_exclusive();
+            return 0;
+        }
+        return 50;
+    }
 #else
     (void)argc;(void)argv;
 #endif
@@ -337,7 +370,7 @@ int main(int argc,char** argv){
         const auto malformed=[&](std::vector<std::uint8_t> bytes){try{FrameDecoder d;(void)d.feed(bytes);return false;}catch(...){return true;}};
         auto bad_magic=wire;bad_magic[0]='X';check(malformed(bad_magic),"peer protocol rejects invalid magic");
         auto bad_version=wire;bad_version[5]=2;check(malformed(bad_version),"peer protocol rejects unsupported versions");
-        auto bad_type=wire;bad_type[6]=0;bad_type[7]=14;check(malformed(bad_type),"peer protocol rejects unknown message types");
+        auto bad_type=wire;bad_type[6]=0;bad_type[7]=99;check(malformed(bad_type),"peer protocol rejects unknown message types");
         std::vector<std::uint8_t> oversized{'M','C','R','P',0,1,0,1,0,0x10,0,1};check(malformed(oversized),"peer protocol rejects an oversized frame before payload allocation");
         bool encode_oversized=false;try{(void)encode_frame(Frame{kProtocolVersion,MessageType::Manifest,std::string(static_cast<std::size_t>(kMaximumFramePayload)+1U,'x')});}catch(...){encode_oversized=true;}check(encode_oversized,"peer protocol encoder enforces its payload bound");
         bool truncated=false;try{FrameDecoder d;(void)d.feed(wire.data(),wire.size()-1);d.finish();}catch(...){truncated=true;}check(truncated,"peer protocol rejects a truncated frame at end of stream");
