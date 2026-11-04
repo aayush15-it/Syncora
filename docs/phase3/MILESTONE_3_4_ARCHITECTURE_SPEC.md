@@ -3,21 +3,24 @@
 
 **Author**: Senior C++ Storage & Distributed Systems Architecture Team  
 **Date**: November 4, 2026  
-**Document Status**: Architecture Specification & Implementation Plan  
+**Document Status**: Frozen Architecture Specification & Implementation Plan  
 **Target Release**: Milestone 3.4 (`v0.3.0-m3.4`)  
 **Base Commit**: `e1ab1b0` (Release Tag `v0.3.0-m3.3`)  
-**Stack**: C++17, SQLite (WAL mode), OpenSSL (TLS 1.2+ & SHA-256), Win32 / POSIX Sockets
+**Stack**: C++17, SQLite (WAL mode), OpenSSL (TLS 1.2+ & SHA-256), Win32 / POSIX Sockets  
 
 ---
 
 ## 1. Executive Summary & Problem Statement
 
-### The Problem: Whole-File Transfer Bottleneck
-Milestones 3.1 through 3.3 established a high-performance Content-Addressed Storage (CAS) engine with FastCDC chunking, immutable object storage, reference counting, multi-process coordination (`InterprocessCasBarrier`), and autonomous crash recovery.
+### 1.1 The Problem: Whole-File Transfer Bottleneck
+Milestones 3.1 through 3.3 established a high-performance Content-Addressed Storage (CAS) engine in Syncora:
+- **M3.1**: FastCDC content-defined chunking (4 KB min, 8 KB avg, 16 KB max), SHA-256 content addressing, and file reconstruction.
+- **M3.2**: Integration with `CollabStore`, version manifests, chunk reference counting, and atomic version publication.
+- **M3.3**: GC sweeping engine, reference compaction, active temporary-file ownership, and OS-level multi-process coordination (`InterprocessCasBarrier`).
 
-However, the existing bilateral network synchronization subsystem (`mc::peer::PeerService`, `mc::peer::PeerSession`) still transfers **entire files sequentially**:
-- If a 100 MB file has only 2 MB modified in the middle, `PeerService` streams all 100 MB across the TLS wire via sequential `MessageType::FileData` frames.
-- This creates excessive network I/O, saturates low-bandwidth peer connections, and completely fails to leverage the local CAS deduplication engine.
+However, Syncora's bilateral network synchronization subsystem (`mc::peer::PeerService`, `mc::peer::PeerSession`) still operates in **whole-file transfer mode**:
+- When a 100 MB file undergoes a 2 MB modification, `PeerService` transmits all 100 MB across the TLS wire using sequential `MessageType::FileData` frames.
+- This creates severe network I/O overhead, saturates low-bandwidth peer connections, and completely ignores the local CAS deduplication engine.
 
 ```
 Current Whole-File Transfer (M3.3):
@@ -31,31 +34,33 @@ Peer A ---------------- 2 MB Delta Chunks (H32..H64) --------------------> Peer 
                                                                                         (98 MB bandwidth saved!)
 ```
 
-### Milestone 3.4 Objective
-Milestone 3.4 connects the Content-Addressed Storage engine to the bilateral peer network layer. It introduces:
-1. **CAS-Aware Wire Protocol**: Extensions to `mc::peer::MessageType` allowing manifest exchange and chunk-level negotiation.
-2. **Chunk Set Difference ($O(\Delta)$ Wire Transfer)**: The receiver identifies missing chunks and requests *only* what it does not already possess in its local CAS root.
-3. **Chunk Verification & Ingestion**: Ingests missing chunks into local CAS, verifying hash and size before promotion.
-4. **Local File Reconstruction**: Reconstructs the target working file using existing local chunks and newly ingested delta chunks through `ObjectStore::reconstruct_file()`.
-5. **Atomic Transactional Commit**: Uses the existing Phase 2/3 `PeerTransactionCoordinator` staging and baseline advance mechanisms.
-6. **Concurrent GC Safety**: Employs `InterprocessCasBarrier` shared guards to ensure active network transfers cannot have their constituent chunks swept by concurrent GC.
+### 1.2 Milestone 3.4 Objectives
+Milestone 3.4 bridges the Content-Addressed Storage engine to the bilateral peer network layer:
+1. **CAS-Aware Wire Protocol**: Backward-compatible extensions to `mc::peer::MessageType` enabling chunk manifest exchange and missing-chunk negotiation.
+2. **Chunk Set Difference ($O(\Delta)$ Wire Transfer)**: The receiver identifies missing chunks and requests *only* what it does not already possess in its local CAS object store.
+3. **Chunk Verification & Ingestion**: Ingests missing chunks into the local CAS store, cryptographically verifying each chunk's SHA-256 hash before storage.
+4. **Local File Reconstruction**: Reconstructs the target file using existing local chunks and newly ingested delta chunks via `ObjectStore::reconstruct_file()`.
+5. **Atomic Transactional Commit**: Leverages the existing Phase 2/3 `PeerTransactionCoordinator` two-phase staging and baseline advance mechanisms.
+6. **Concurrent GC Safety**: Maintains `InterprocessCasBarrier` shared guards across the entire receiver pipeline (negotiation $\to$ transfer $\to$ reconstruction $\to$ promotion) and sender serving paths to prevent concurrent GC sweeps from removing in-flight chunks.
+7. **Zero-Trust Security & Anti-Probing**: Enforces strict relative path validation, manifest bounds checking, and sender-side chunk request authorization to prevent arbitrary CAS object harvesting.
 
 ---
 
 ## 2. Architecture & Gap Analysis (Current vs Target State)
 
-### Component Comparison Matrix
+### 2.1 Component Comparison Matrix
 
 | Subsystem Component | Current Implementation (M3.3) | Target Milestone 3.4 Implementation |
 | :--- | :--- | :--- |
 | **Peer Frame Protocol** (`peer_protocol.hpp`) | 9 frame types (`Hello`, `ManifestRequest`, `Manifest`, `FileRequest`, `FileData`, `FileEnd`, `Approval`, `SyncResult`, `Error`). | Add 4 backward-compatible frame types: `ChunkManifestRequest` (10), `ChunkManifest` (11), `ChunkRequest` (12), `ChunkData` (13). |
-| **Manifest Exchange** (`peer_sync.hpp`) | Directory-level `FileManifest` exchanging file paths, sizes, and whole-file SHA-256. | Two-stage manifest: (1) Directory-level manifest establishes sync plan; (2) Per-file `mc::cas::FileManifest` carries chunk list. |
-| **Missing Content Resolution** | Receiver requests entire file by relative path (`FileRequest`). | Receiver computes hash difference against local `ObjectStore::has_object()` and requests only missing chunk hashes. |
-| **Wire Data Transfer** | Sequential file byte stream chunks (64 KB buffers, `FileData`). | Content-addressed chunk transfer (`ChunkData`), keyed by SHA-256 chunk hash. |
+| **Manifest Exchange** (`peer_sync.hpp`) | Directory-level `FileManifest` exchanging file paths, sizes, and whole-file SHA-256. | Two-stage manifest: (1) Directory-level manifest establishes sync plan; (2) Per-file `mc::cas::FileManifest` carries FastCDC chunk descriptors. |
+| **Missing Content Resolution** | Receiver requests entire file by relative path (`FileRequest`). | Receiver computes hash set difference against local `ObjectStore::has_object()` and requests only missing chunk hashes. |
+| **Wire Data Transfer** | Sequential file byte stream chunks (64 KB buffers, `FileData`). | Content-addressed chunk transfer (`ChunkData`), keyed by SHA-256 chunk hash (max 16 KB payload per chunk). |
 | **File Assembly on Receiver** | Bytes appended linearly to `StagingFile`. | Chunks stored into local CAS; file reconstructed via `ObjectStore::reconstruct_file()` from local + newly received chunks. |
-| **Whole-File Validation** | Receiver hashes linear staging file on `FileEnd`. | Dual validation: (1) Per-chunk SHA-256 verified on receipt; (2) Reconstructed whole-file SHA-256 verified against manifest. |
-| **GC & Multi-Process Safety** | In-process `cas_barrier_` + OS-level `.cas_barrier.lock`. Peer transfer does not hold CAS barrier. | Peer transfer holds `CasSharedBarrierGuard` during chunk read/ingestion/reconstruction; GC cannot sweep active transfer chunks. |
-| **Backward Compatibility** | Rejects unknown frame types. | Protocol version negotiation: if peer does not advertise CAS capability in `Hello`, fall back cleanly to whole-file streaming. |
+| **Whole-File Validation** | Receiver hashes linear staging file on `FileEnd`. | Dual validation: (1) Per-chunk SHA-256 verified upon receipt; (2) Reconstructed whole-file SHA-256 verified against manifest. |
+| **GC & Multi-Process Safety** | In-process `cas_barrier_` + OS-level `.cas_barrier.lock`. Peer transfer does not hold CAS barrier. | Receiver holds `CasSharedBarrierGuard` from negotiation through promotion; sender holds barrier during chunk reads; GC cannot sweep active transfer chunks. |
+| **Request Authorization** | Receiver requests any file path in workspace. | Senders validate `ChunkRequest` hashes against `session_advertised_hashes`; arbitrary CAS object probing is rejected. |
+| **Protocol Compatibility** | Rejects unknown frame types. | Capability negotiation in `Hello`: if peer does not advertise `cas_delta_v1`, automatically fall back to legacy whole-file sync. |
 
 ---
 
@@ -68,7 +73,7 @@ Milestone 3.4 connects the Content-Addressed Storage engine to the bilateral pee
 |   +-----------------------+       +------------------------+       +--------------------------------+   |
 |   | 1. Manifest Exchange  | ----> | 2. Chunk Negotiation   | ----> | 3. Delta Transfer              |   |
 |   | Exchange & validate   |       | Query local CAS;       |       | Stream missing chunks          |   |
-|   | chunk manifests       |       | find missing set       |       | over TLS wire                  |   |
+|   | FastCDC chunk lists   |       | find missing set       |       | over TLS wire                  |   |
 |   +-----------------------+       +------------------------+       +--------------------------------+   |
 |                                                                                    |                    |
 |   +-----------------------+       +------------------------+                       |                    |
@@ -79,19 +84,33 @@ Milestone 3.4 connects the Content-Addressed Storage engine to the bilateral pee
 +---------------------------------------------------------------------------------------------------------+
 ```
 
-### Workstream 1: Manifest Exchange
+### Workstream 1: Manifest Exchange & Validation
 - **Sender Responsibilities**:
-  - When a file mutation (`AddLocal`, `UpdateLocal`, `AddRemote`, `UpdateRemote`) is planned, the sender loads or computes the `mc::cas::FileManifest`.
+  - When a file transfer (`AddLocal`, `UpdateLocal`, `AddRemote`, `UpdateRemote`) is planned, the sender loads or computes the `mc::cas::FileManifest`.
   - Encodes the manifest using `mc::cas::ManifestSerializer::serialize_binary()`.
-  - Sends a `ChunkManifest` frame containing the relative path, file size, whole-file SHA-256, and chunk descriptors (hash, offset, size).
-- **Receiver Responsibilities**:
-  - Validates relative path: rejects absolute paths, `..` traversal, null bytes, backslashes (normalized to `/`), and illegal characters.
-  - Validates manifest structure: verifies chunk count $> 0$, contiguous non-overlapping offsets, chunk size within $[16\text{ KB}, 256\text{ KB}]$ bounds, and sum of chunk sizes equals `total_size`.
+  - Records all chunk hashes in `session_advertised_hashes` (for request authorization).
+  - Transmits a `MessageType::ChunkManifest` frame containing the relative path and serialized chunk manifest.
+- **Receiver Responsibilities & FastCDC Bounds Validation**:
+  - Validates `relative_path`: rejects absolute paths, `..` traversal, null bytes, backslashes (normalized to `/`), and illegal characters.
+  - Validates manifest structure according to FastCDC parameters (`kDefaultFastCDCConfig`):
+    - Non-final chunks: `size >= 4096` and `size <= 16384` bytes.
+    - Final chunk: `size >= 1` and `size <= 16384` bytes (for non-empty files).
+    - Empty file: `chunks.empty()` and `total_size == 0`.
+    - Offsets must be strictly contiguous: `chunk[0].offset == 0` and `chunk[i].offset == chunk[i-1].offset + chunk[i-1].size`.
+    - Sum of chunk sizes must exactly equal `total_size`.
+  - Rejects malformed manifests with `MessageType::Error("malformed chunk manifest")`.
 
-### Workstream 2: Chunk Negotiation
+### Workstream 2: Chunk Negotiation & Preconditions
+- **Precondition Clarification (Local CAS Presence vs Working Copy)**:
+  - Having a file present in the working copy directory does **not** guarantee its chunks exist in the CAS object store (`cas/objects/`).
+  - Chunks exist in CAS only if they were previously ingested (via `publish_version`, `accept_submission`, prior delta sync, or explicit CAS scan).
+  - Therefore, chunk negotiation queries the **local CAS object store directly** (`ObjectStore::has_object()`), not the filesystem directory.
 - **Algorithm**:
   Given received `FileManifest` with chunks $C = \{h_1, h_2, \dots, h_n\}$:
   ```cpp
+  // Receiver acquires shared barrier BEFORE querying local CAS
+  mc::cas::CasSharedBarrierGuard barrier_guard(cas_barrier_);
+
   std::vector<std::string> missing_chunks;
   for (const auto& chunk : manifest.chunks()) {
       if (!object_store.has_object(chunk.hash)) {
@@ -102,52 +121,58 @@ Milestone 3.4 connects the Content-Addressed Storage engine to the bilateral pee
 - **Negotiation Frame**:
   - Receiver sends `MessageType::ChunkRequest` containing:
     - Relative path (context binding).
-    - List of 64-hex lowercase chunk hashes requested.
-  - If `missing_chunks.empty()`, the receiver already possesses all chunks (e.g. file was renamed, or reverted to a prior version). Zero chunk transfer required!
+    - Missing chunk count (uint32).
+    - Array of 64-hex lowercase chunk hashes requested.
+  - **Zero-Chunk Transfer**: If `missing_chunks.empty()`, the receiver already possesses 100% of the chunks in its local CAS store (e.g. file rename, revert, or duplicate content). Zero chunk bytes are transferred over the wire!
 
-### Workstream 3: Delta Transfer
-- **Streaming Protocol**:
-  - Sender receives `ChunkRequest`.
-  - For each requested chunk hash:
-    - Verifies hash syntax (64 hex characters).
-    - Reads chunk data from local `ObjectStore::get_object(hash, data)`.
-    - Transmits a `MessageType::ChunkData` frame:
-      - Header: 64-character chunk hash (ASCII hex).
-      - Payload: Chunk binary content (bounded by `kMaximumFramePayload` = 1 MB).
-- **Backpressure & Bounded Memory**:
-  - Chunks are read and transmitted one-by-one. No batch chunk loading into RAM.
-  - Memory consumption is strictly bounded by single chunk size (max 256 KB).
+### Workstream 3: Delta Transfer & Remote Request Authorization
+- **Remote Request Authorization (Anti-Probing Defense)**:
+  - Senders maintain `session_advertised_hashes` (hashes of all chunks present in manifests sent during this session).
+  - Upon receiving `ChunkRequest`:
+    1. Validates hash syntax (exactly 64 lowercase hex characters).
+    2. Validates that every requested hash exists in `session_advertised_hashes`.
+    3. If any hash was not advertised: sender rejects the request immediately with `MessageType::Error("unauthorized chunk request: hash not in session manifest")` and terminates the transfer. This prevents malicious peers from probing the sender's CAS catalog for arbitrary objects.
+- **Request & Frame Bounds**:
+  - Maximum missing chunk hashes in a single `ChunkRequest`: 4096 hashes (representing up to 64 MB of data per request, payload size $\approx 262\text{ KB}$, well within the 1 MB frame bound). Requests exceeding 4096 hashes are rejected as DoS attempts.
+- **Streaming Transfer**:
+  - Sender reads chunks one by one from local `ObjectStore::get_object(hash, data)` under `CasSharedBarrierGuard`.
+  - Transmits individual `MessageType::ChunkData` frames:
+    - Header: 64-character chunk hash.
+    - Payload: Raw chunk bytes ($\le 16\text{ KB}$).
+  - Memory consumption is strictly bounded by single chunk size ($\le 16\text{ KB}$), keeping peak RAM $< 10\text{ MB}$.
 
 ### Workstream 4: Chunk Verification & Ingestion
-- **Cryptographic Invariant**: Never trust remote data.
+- **Cryptographic Invariant**: Never trust remote input.
   Upon receiving `ChunkData` with reported hash $H_{claimed}$ and payload $B$:
-  1. Verify length of $B$ matches expected size from the manifest.
-  2. Compute $H_{actual} = \text{SHA-256}(B)$.
-  3. If $H_{actual} \ne H_{claimed}$, drop connection and send `MessageType::Error("corrupted chunk payload")`.
+  1. Verify length of $B$ matches expected size from the manifest ($\le 16\text{ KB}$).
+  2. Compute cryptographic digest: $H_{actual} = \text{SHA-256}(B)$.
+  3. Verify $H_{actual} == H_{claimed}$. If mismatched, drop the connection and send `MessageType::Error("corrupted chunk payload")`.
   4. Ingest chunk into local store via `object_store.put_object(B.data(), B.size(), H_{actual})`.
   5. The object is now an immutable, verified CAS entity in `cas/objects/xx/hash`.
 
-### Workstream 5: File Reconstruction
+### Workstream 5: Local File Reconstruction
 - **Streaming Reconstruction**:
   - Receiver invokes `object_store.reconstruct_file(manifest, staging_path, err, true)`.
-  - `reconstruct_file()` reads chunk by chunk from local CAS into the staging file.
-  - Verifies whole-file SHA-256 digest on the fly.
+  - `reconstruct_file()` reads chunk by chunk from local CAS into the staging file (`.staged_<hash>.tmp`).
+  - Verifies whole-file SHA-256 digest on the fly against `manifest.file_sha256()`.
+  - Verifies reconstructed file size matches `manifest.total_size()`.
   - Guarantees working files are never hardlinked directly to CAS objects (mutation safety).
 
 ### Workstream 6: Atomic Integration & Journaling
-- **Commit Safety**:
-  - Reconstructed staging file is handed to `PeerTransactionCoordinator`.
-  - Coordinator verifies file hash matches `expected_new_hash` recorded in `peer_operations` journal.
+- **Commit Safety & Baseline Advance**:
+  - Staged file is passed to `PeerTransactionCoordinator`.
+  - Coordinator verifies file hash matches `expected_new_hash` in `peer_operations` journal.
   - Creates backup recovery artifact for destination file.
   - Executes verified filesystem replacement via atomic rename / transaction commit.
   - Commits updated manifest to `PeerBaselineStore`.
   - Releases recovery material only after bilateral terminal state.
+  - Releases `CasSharedBarrierGuard`.
 
 ---
 
 ## 4. Wire Protocol Evolution & Message Types
 
-### Extended MessageType Definition (`include/merklechain/peer/peer_protocol.hpp`)
+### 4.1 Extended MessageType Definition (`include/merklechain/peer/peer_protocol.hpp`)
 ```cpp
 enum class MessageType : std::uint16_t {
     Hello = 1,
@@ -168,18 +193,48 @@ enum class MessageType : std::uint16_t {
 };
 ```
 
-### Capability Advertisement in `Hello` Frame
-- In `MessageType::Hello`, peers advertise their capability string:
-  ```
-  identity:peer_alpha;capabilities:cas_delta_v1,whole_file
-  ```
+### 4.2 Standard Syncora Frame Header (12 Bytes)
+All frames use the standard 12-byte big-endian header:
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Magic 'M' 'C'           |       Protocol '0' '1'        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|      MessageType (uint16)     |         Flags (uint16)        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Payload Length (uint32)                   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Payload Data...                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+- Magic: `0x4D433031` ("MC01").
+- `kMaximumFramePayload`: 1,048,576 bytes (1 MB).
+
+### 4.3 Capability Advertisement in `Hello` Frame
+In `MessageType::Hello`, peers exchange capability strings:
+```
+identity=peer_alpha;version=1.0;caps=cas_delta_v1,whole_file
+```
+- **Parsing Rules**: Semicolon-delimited key-value tokens. Unknown tokens are silently ignored (forward compatibility).
+- **Capability Flag**: `caps` contains comma-separated features. The presence of `cas_delta_v1` activates CAS delta synchronization.
 - **Backward Compatibility Guarantee**:
-  - If a connected peer does *not* advertise `cas_delta_v1`, the session automatically falls back to existing `FileRequest` / `FileData` whole-file transfer.
-  - Existing Phase 2 test suites continue to pass without modification.
+  - If remote peer does *not* include `cas_delta_v1` in `Hello`, the session automatically configures itself for legacy whole-file transfer (`FileRequest` / `FileData` / `FileEnd`).
+  - Existing Phase 2 whole-file test suites continue to pass without modification.
 
-### Binary Framing for CAS Messages
+### 4.4 Binary Payload Specifications for CAS Messages
 
-#### `ChunkManifest` Frame Payload
+#### `ChunkManifestRequest` Frame Payload (Type 10)
+```
++-----------------------------------+---------------------------------------+
+| Field                             | Format / Size                         |
++-----------------------------------+---------------------------------------+
+| Relative Path Length              | uint16_t (big-endian)                 |
+| Relative Path                     | UTF-8 string (normalized '/')         |
++-----------------------------------+---------------------------------------+
+```
+
+#### `ChunkManifest` Frame Payload (Type 11)
 ```
 +-----------------------------------+---------------------------------------+
 | Field                             | Format / Size                         |
@@ -187,28 +242,29 @@ enum class MessageType : std::uint16_t {
 | Relative Path Length              | uint16_t (big-endian)                 |
 | Relative Path                     | UTF-8 string (normalized '/')         |
 | Serialized FileManifest           | Binary payload from ManifestSerializer|
+|                                   | (Magic 'MCAS', version, chunk table)  |
 +-----------------------------------+---------------------------------------+
 ```
 
-#### `ChunkRequest` Frame Payload
+#### `ChunkRequest` Frame Payload (Type 12)
 ```
 +-----------------------------------+---------------------------------------+
 | Field                             | Format / Size                         |
 +-----------------------------------+---------------------------------------+
 | Relative Path Length              | uint16_t (big-endian)                 |
 | Relative Path                     | UTF-8 string                          |
-| Missing Chunk Count               | uint32_t (big-endian)                 |
-| Repeated Chunk Hashes             | 64 ASCII hex bytes per chunk hash     |
+| Missing Chunk Count ($N$)         | uint32_t (big-endian, max 4096)       |
+| Repeated Chunk Hashes             | $N \times 64$ ASCII hex bytes         |
 +-----------------------------------+---------------------------------------+
 ```
 
-#### `ChunkData` Frame Payload
+#### `ChunkData` Frame Payload (Type 13)
 ```
 +-----------------------------------+---------------------------------------+
 | Field                             | Format / Size                         |
 +-----------------------------------+---------------------------------------+
 | Chunk Hash                        | 64 ASCII hex bytes                    |
-| Chunk Payload                     | Raw chunk bytes (variable size)       |
+| Chunk Payload                     | Raw chunk bytes ($1 \le \text{size} \le 16384$) |
 +-----------------------------------+---------------------------------------+
 ```
 
@@ -229,98 +285,172 @@ enum class MessageType : std::uint16_t {
    - The reconstructed file's SHA-256 must match `manifest.file_sha256()`.
    - The reconstructed file's size must match `manifest.total_size()`.
    - If either fails, the staging file is unlinked, the operation is flagged `Failed`, and the session halts safely.
-4. **Denial-of-Service (DoS) Protection**:
-   - Maximum frame payload enforced at $1\text{ MB}$ (`kMaximumFramePayload`).
-   - Maximum chunk manifest entries bounded (e.g. 50,000 chunks = 3.2 GB file maximum per manifest).
+4. **Remote Chunk Request Authorization (Anti-Probing)**:
+   - Senders maintain `session_advertised_hashes`.
+   - Any `ChunkRequest` referencing a hash outside this set is rejected with `MessageType::Error`.
+5. **Denial-of-Service (DoS) Protection**:
+   - Maximum frame payload strictly enforced at $1\text{ MB}$ (`kMaximumFramePayload`).
+   - Maximum missing chunk count per `ChunkRequest` bounded at 4096 hashes.
+   - Maximum chunks per file bounded at 50,000 chunks (supporting files up to $\sim 800\text{ MB}$).
 
 ---
 
-## 6. Concurrency & Lock Hierarchy
+## 6. Concurrency, Lock Hierarchy & CAS Barrier Lifetime
 
-### Network Transfer vs Global Maintenance Barrier
-A network transfer can take seconds or minutes. Holding an exclusive lock or blocking the entire database during a network transfer is an anti-pattern.
-
+### 6.1 Total Lock Hierarchy Order
+To prevent deadlocks across multi-process and multi-threaded operations, locks must strictly be acquired in this global order:
 ```
-Total Lock Hierarchy Order:
 OperationGuard (Lifecycle) -> InterprocessCasBarrier (Shared) -> Workspace Mutex -> DB Mutex
 ```
 
-### Invariants:
-1. **Never Hold DB Mutex During Network I/O**:
-   - Database operations (logging progress, updating session state) acquire `db_mutex_`, execute in $< 5\text{ ms}$, and release `db_mutex_`.
-   - Socket `send()` and `recv()` occur completely outside `db_mutex_`.
-2. **Shared Barrier for Transfer Operations**:
-   - When the receiver is ingesting chunks into `ObjectStore` or reconstructing a file, it acquires a `CasSharedBarrierGuard cas_lock(cas_barrier)`.
-   - This allows concurrent readers, submissions, and publications.
-   - It blocks any concurrent `garbage_collect` sweep from unlinking chunks while the transfer is assembling the file!
-   - As soon as reconstruction finishes, the shared barrier is released.
-3. **No Deadlocks with Crash Recovery**:
-   - If the network drops or the remote peer crashes during transfer, RAII guard releases `CasSharedBarrierGuard`.
-   - The OS kernel automatically cleans any locks on process termination.
+### 6.2 Receiver Pipeline CAS Barrier Lifetime (Mandatory Issue A Resolution)
+Holding a CAS barrier only during physical chunk writing is insufficient: if the receiver identifies that chunks $H_1$ and $H_2$ exist locally, a concurrent GC sweep in another process could delete those chunks before the receiver reconstructs the file.
+
+**Enforced Receiver Lifetime Invariant**:
+1. The receiver acquires `CasSharedBarrierGuard` **before** querying `ObjectStore::has_object()` during chunk negotiation.
+2. The guard is held **continuously** through:
+   - Missing chunk set difference calculation.
+   - Delta chunk streaming and ingestion (`put_object()`).
+   - File reconstruction (`reconstruct_file()`).
+   - Atomic transactional promotion and baseline advance (`commit_operations()`).
+3. The guard is released **only after** the destination file is atomically promoted and committed to the database.
+4. **Result**: Any concurrent GC sweep (`InterprocessCasBarrier` exclusive lock) is blocked from sweeping *any* CAS chunk until the entire transfer and reconstruction pipeline completes.
+
+```
+Receiver Execution Timeline:
+[Acquire CasSharedBarrierGuard]
+   |---> 1. Query has_object() & compute missing set
+   |---> 2. Receive missing ChunkData & ingest via put_object()
+   |---> 3. Reconstruct file to staging path
+   |---> 4. Atomic rename & commit baseline in SQLite
+[Release CasSharedBarrierGuard]
+```
+
+### 6.3 Sender Pipeline CAS Barrier Lifetime
+1. Sender acquires `CasSharedBarrierGuard` when generating the chunk manifest.
+2. Sender retains `CasSharedBarrierGuard` while reading chunk data from `ObjectStore::get_object()` to transmit `ChunkData` frames.
+3. GC cannot sweep chunks while the sender is actively reading and serving them.
 
 ---
 
-## 7. Adversarial Test Matrix (14 Mandatory Scenarios)
+## 7. Failure Modes & Transfer Recovery (Safe Restart Strategy)
 
-The test suite will implement 14 deterministic adversarial test scenarios in `tests/peer_sync_cas_delta_tests.cpp`:
+Milestone 3.4 adopts **Strategy 1: Safe Restart** for handling interruptions, crashes, and network disconnections:
+
+```
++-------------------------------------------------------------------------------+
+|                       Safe Restart Recovery Pipeline                          |
+|                                                                               |
+|   Network Drop / Crash Mid-Transfer                                           |
+|          |                                                                    |
+|          v                                                                    |
+|   1. Clean Incomplete Staging Artifacts (.staged_*.tmp)                       |
+|   2. Verified Chunks Remain in CAS Store (put_object is immutable)            |
+|   3. RAII / Process Exit releases CasSharedBarrierGuard                       |
+|          |                                                                    |
+|          v Reconnect / Startup Recovery                                       |
+|   4. Peer Re-Exchanges Manifests                                              |
+|   5. Receiver Queries Local CAS: Previously received chunks ARE present!      |
+|   6. Receiver Requests ONLY remaining unreceived chunks                       |
+|   7. Sync completes successfully (Natural Resume, Zero Duplication)           |
++-------------------------------------------------------------------------------+
+```
+
+### 7.1 Invariants of Safe Restart:
+1. **Uncommitted Staging Cleanup**: Any incomplete `.staged_*.tmp` file is unlinked immediately upon session disconnect or during startup recovery (`CollabStore::recover_startup()`).
+2. **Immutable Chunk Preservation**: Chunks received and cryptographically verified prior to the interruption remain stored in `cas/objects/xx/hash`. Because CAS objects are immutable and content-addressed, their presence in CAS does not corrupt any catalog or baseline.
+3. **Natural Deduplicated Resume**: On reconnection, the peers re-negotiate. The receiver's `has_object()` check detects the previously ingested chunks as present. The receiver requests *only* the remaining missing chunks, providing seamless resume without complex checkpoint state machines.
+4. **Process Crash Idempotency**: If a worker process terminates abruptly (`std::_Exit(94)`), OS file locks are released automatically, startup recovery unlinks dangling temporary files, and working copy files remain completely intact.
+
+---
+
+## 8. Adversarial Test Matrix (21 Mandatory Scenarios)
+
+The test suite will implement 21 deterministic adversarial test scenarios in `tests/peer_sync_cas_delta_tests.cpp`:
 
 | Scenario ID | Test Name | Simulated Condition | Expected Invariant & Behavior |
 | :--- | :--- | :--- | :--- |
-| **CAS-NET-01** | Identical Files Sync | Peer A and Peer B have identical files. | Zero chunks transferred; 0 bytes delta payload; instant manifest agreement. |
-| **CAS-NET-02** | Partial Chunk Reuse | Peer B possesses 80% of chunks from prior versions. | Exactly 20% missing chunks requested; 80% chunks reused locally without transfer. |
-| **CAS-NET-03** | Middle Modification | 1 MB file modified in 64 KB middle region. | Chunks before and after edit reused; only 1 or 2 affected chunks transferred. |
-| **CAS-NET-04** | File Rename / Move | File renamed with unchanged contents. | Manifest path updated; 0 chunks transferred; file reconstructed/promoted from local CAS. |
-| **CAS-NET-05** | Corrupted Chunk Payload | Wire payload tampered by 1 flipped bit. | SHA-256 mismatch detected; chunk rejected; error frame sent; staging unlinked. |
-| **CAS-NET-06** | Mismatched Manifest Root | Remote peer sends manifest with falsified whole-file root. | Reconstruction verification detects discrepancy; transaction aborted cleanly. |
-| **CAS-NET-07** | Network Interruption | Connection severed mid-chunk stream. | Session marked `RecoveryRequired` / `Aborted`; partial chunks unlinked; resumeable. |
-| **CAS-NET-08** | Duplicate Chunk Delivery | Same chunk hash delivered multiple times or exists locally. | Handled idempotently via `ObjectStore::put_object()`; zero duplicate storage. |
-| **CAS-NET-09** | Concurrent Transfers | Multiple bilateral sessions transferring concurrently. | Workspace-isolated journals prevent crosstalk; zero catalog corruption. |
-| **CAS-NET-10** | Concurrent GC during Transfer | GC runs while peer is receiving and reconstructing. | `InterprocessCasBarrier` shared guard protects in-flight chunks from sweep. |
-| **CAS-NET-11** | Receiver Crash Mid-Transfer | Receiver process terminated with `std::_Exit(94)`. | Startup recovery cleans orphan staging; working copy completely untouched. |
-| **CAS-NET-12** | Path Traversal Injection | Remote manifest contains `../../etc/passwd`. | Path validation rejects entry immediately; session terminated with error. |
-| **CAS-NET-13** | Large File Streaming | 100 MB file transfer under tight memory limit. | Bounded 64 KB memory streaming; peak RAM remains $< 10\text{ MB}$. |
-| **CAS-NET-14** | Legacy Peer Compatibility | Remote peer does not support CAS delta messages. | Gracefully falls back to whole-file `FileRequest`/`FileData` streaming. |
+| **CAS-NET-01** | Identical Files Sync (Pre-Populated CAS) | Both peers possess identical files with chunks already in local CAS. | `missing_chunks` is empty; 0 `ChunkData` frames transferred; 0 wire payload bytes; instant agreement. |
+| **CAS-NET-02** | Partial Chunk Reuse (80% Baseline) | 80% of chunks already exist in receiver's CAS from prior versions. | Exactly 20% missing chunks requested; 80% chunks fetched from local CAS; whole-file SHA-256 verified. |
+| **CAS-NET-03** | Middle Modification | 1 MB file modified in 64 KB middle region. | Non-modified chunks before and after edit reused; only affected chunks transferred ($> 80\%$ bandwidth reduction). |
+| **CAS-NET-04** | File Rename / Move | File renamed with unchanged contents; chunks exist in receiver CAS. | Manifest path updated; 0 chunks transferred; file reconstructed at new path from local CAS. |
+| **CAS-NET-05** | Corrupted Chunk Payload | Single bit flipped in transit in `ChunkData` payload. | SHA-256 mismatch detected; chunk rejected; error frame returned; staging unlinked. |
+| **CAS-NET-06** | Mismatched Manifest Root | Sender sends manifest where `file_sha256` does not match chunk chain. | Reconstruction whole-file hash check fails; transaction aborted cleanly; destination untouched. |
+| **CAS-NET-07** | Network Interruption & Safe Restart | Connection severed after 50% of missing chunks transferred. | Partial staging unlinked; verified chunks preserved; re-sync requests only remaining 50% chunks. |
+| **CAS-NET-08** | Duplicate Chunk Delivery | Redundant or identical chunk hash delivered multiple times. | Handled idempotently via `ObjectStore::put_object()`; zero duplicate storage; refcounts intact. |
+| **CAS-NET-09** | Concurrent Bilateral Transfers | Multiple bilateral sessions transferring concurrently across workspaces. | Workspace-isolated journals prevent crosstalk; zero catalog corruption; independent locks. |
+| **CAS-NET-10** | Concurrent GC during Transfer | GC runs while receiver is ingesting chunks and reconstructing. | Receiver holds `CasSharedBarrierGuard` from negotiation to promotion; GC blocked until promotion finishes. |
+| **CAS-NET-11** | Receiver Crash Mid-Transfer | Receiver process terminated with `std::_Exit(94)` during ingestion. | Startup recovery cleans orphan staging; working copy completely untouched and uncorrupted. |
+| **CAS-NET-12** | Path Traversal Injection | Manifest contains `../../etc/passwd`, `C:\`, or null bytes. | `validate_relative_path()` rejects entry immediately; session terminated with error. |
+| **CAS-NET-13** | Large File Streaming | 100 MB file transfer under tight memory profile. | Bounded 16 KB chunk streaming; peak RAM remains $< 10\text{ MB}$. |
+| **CAS-NET-14** | Legacy Peer Compatibility | Remote peer `Hello` lacks `cas_delta_v1` capability flag. | Gracefully falls back to whole-file `FileRequest`/`FileData` streaming; sync succeeds. |
+| **CAS-NET-15** | Initial Full Sync on Empty CAS | Receiver CAS store is completely empty (`has_object` returns false for all chunks). | Receiver requests 100% of chunks; all chunks transferred, verified, ingested into CAS, and reconstructed. |
+| **CAS-NET-16** | Remote Chunk Request Authorization | Peer requests chunk hash not advertised in session's manifests. | Sender checks `session_advertised_hashes`; rejects with `MessageType::Error("unauthorized chunk request")`. |
+| **CAS-NET-17** | Malformed Chunk Manifest Validation | Manifest with chunk $> 16\text{ KB}$, non-final chunk $< 4\text{ KB}$, or non-contiguous offsets. | Manifest parser rejects frame as malformed; transfer aborted safely without writing to disk. |
+| **CAS-NET-18** | Sender Interprocess GC Safety | Sender reading chunks while concurrent GC attempts sweep. | Sender holds `CasSharedBarrierGuard` during chunk read; GC cannot sweep chunks being streamed. |
+| **CAS-NET-19** | Request Flooding & Frame Limit Bounds | Remote peer sends `ChunkRequest` with $> 4096$ hashes or payload $> 1\text{ MB}$. | Sender rejects request immediately as protocol violation / DoS attempt. |
+| **CAS-NET-20** | Repeated Crash & Safe Restart Recovery | Receiver crashes on chunk 10, restarts, crashes on chunk 20, restarts. | Each restart recovers cleanly; previously verified chunks retained; final run completes successfully. |
+| **CAS-NET-21** | Zero-Byte / Empty File CAS Sync | File with 0 bytes total size, 0 chunks, and empty manifest. | Handled cleanly; zero chunk requests generated; empty file created and staged atomically. |
 
 ---
 
-## 8. Performance Benchmark Plan
+## 9. Performance Benchmark Plan
 
-To validate the real-world bandwidth and performance advantage of CAS delta sync, a dedicated benchmark executable `benchmarks/cas_network_benchmark.cpp` will be implemented:
+To validate real-world bandwidth savings and CPU efficiency, a dedicated benchmark executable `benchmarks/cas_network_benchmark.cpp` will be implemented:
 
-### Benchmark Datasets:
-1. **Dataset A (Initial Full Sync)**: 50 MB mixed directory (code, text, binary assets).
+### 9.1 Benchmark Datasets:
+1. **Dataset A (Initial Full Sync)**: 50 MB mixed directory (source code, text, binary assets) with empty receiver CAS.
 2. **Dataset B (Small In-Place Edit)**: 50 MB directory with a 10-line edit inside a 5 MB file.
-3. **Dataset C (Head Insertion)**: 10 MB file with 500 bytes inserted at byte offset 0 (testing FastCDC shifting resilience).
+3. **Dataset C (Head Insertion)**: 10 MB file with 500 bytes inserted at byte offset 0 (testing FastCDC boundary-shifting resilience).
 4. **Dataset D (Many Small Files)**: 500 files of 4 KB each with 5 files modified.
 
-### Metrics Recorded:
-- **Total Bytes Transferred** (Wire bytes: whole-file vs CAS delta).
-- **Deduplication Ratio** ($\frac{\text{Bytes Saved}}{\text{Total File Size}}$).
-- **Transfer Duration** (Milliseconds).
-- **Peak RAM Consumption** (Megabytes).
-- **Reconstruction Time** (Milliseconds).
+### 9.2 Metrics Recorded:
+- **Actual Wire Payload Bytes** (total TCP/TLS socket bytes transmitted, including headers and framing).
+- **Bandwidth Reduction Ratio**:
+  $$\text{Reduction} = \left(1 - \frac{\text{CAS Delta Wire Bytes}}{\text{Whole File Wire Bytes}}\right) \times 100\%$$
+- **Transfer Duration** (milliseconds).
+- **Peak RAM Consumption** (RSS in megabytes).
+- **Reconstruction Duration** (milliseconds).
 
-**Target Success Criterion**: Demonstrating $> 80\%$ bandwidth reduction on Dataset B and Dataset C compared to legacy whole-file transfer.
+### 9.3 Realistic Success Targets:
+- **Dataset B & Dataset C**: Demonstrating $> 80\%$ bandwidth reduction compared to legacy whole-file transfer (typically $> 95\%$ on Dataset B and $> 85\%$ on Dataset C).
+- **Dataset A (Initial Full Sync)**: Expected $\sim 0\%$ bandwidth reduction (slight framing overhead), confirming baseline overhead remains $< 2\%$.
+- **Peak RAM**: Remains $< 15\text{ MB}$ across all datasets during streaming transfer and reconstruction.
 
 ---
 
-## 9. Implementation Roadmap & Milestones
+## 10. Implementation Roadmap & Execution Stages
 
 ```
 Phase 3 Milestone 3.4 Execution Stages:
-1. [Stage 1] Protocol Wire Extensions: Add ChunkManifest/ChunkRequest frame types to peer_protocol.
-2. [Stage 2] Chunker & Manifest Peer Helpers: Helper methods for peer manifest serialization and missing chunk resolution.
-3. [Stage 3] PeerService CAS Delta Engine: Integrate chunk negotiation, streaming, and verification into peer_service.cpp.
-4. [Stage 4] Atomic Reconstruction & Staging: Connect ObjectStore reconstruct to PeerTransactionCoordinator.
-5. [Stage 5] Adversarial Testing (CAS-NET-01 to CAS-NET-14): Implement all 14 tests in tests/peer_sync_cas_delta_tests.cpp.
-6. [Stage 6] Benchmarking: Implement and run benchmarks/cas_network_benchmark.cpp.
-7. [Stage 7] Independent Audit & Release: Formal audit report and release v0.3.0-m3.4.
+1. [Stage 1] Protocol Wire Extensions:
+   - Add ChunkManifestRequest (10), ChunkManifest (11), ChunkRequest (12), ChunkData (13) to peer_protocol.hpp/cpp.
+   - Add binary framing serialization/deserialization helpers and frame bound enforcement.
+2. [Stage 2] Chunker & Manifest Peer Helpers:
+   - Implement peer manifest conversion helpers, FastCDC parameter validation, and missing-chunk resolution.
+   - Implement session_advertised_hashes authorization tracker.
+3. [Stage 3] PeerService CAS Delta Engine:
+   - Integrate capability negotiation into Hello frame exchange.
+   - Integrate chunk negotiation, streaming, and SHA-256 verification into peer_service.cpp.
+   - Wire CasSharedBarrierGuard across the receiver pipeline (negotiation -> promotion).
+4. [Stage 4] Atomic Reconstruction & Staging:
+   - Connect ObjectStore::reconstruct_file() to PeerTransactionCoordinator staging pipeline.
+   - Implement Safe Restart recovery and uncommitted staging cleanup.
+5. [Stage 5] Adversarial Testing (CAS-NET-01 through CAS-NET-21):
+   - Implement all 21 deterministic adversarial test scenarios in tests/peer_sync_cas_delta_tests.cpp.
+6. [Stage 6] Benchmarking:
+   - Implement and execute benchmarks/cas_network_benchmark.cpp across Datasets A-D.
+7. [Stage 7] Independent Audit & Release:
+   - Formal M3.4 audit report and release freeze at v0.3.0-m3.4.
 ```
 
 ---
 
-## 10. Approval & Next Steps
+## 11. Implementation Gate & Authorization Criteria
 
-This specification establishes the architectural foundation for Milestone 3.4.
+This document represents the frozen architecture specification for Milestone 3.4.
 
-**Next Action**: Upon user review and approval of this specification, we will proceed to **Stage 1 & Stage 2**: implementing the protocol frame extensions and missing-chunk negotiation engine.
+### Mandatory Gate Invariants:
+1. **Preservation of Existing Releases**: Release tags `v0.2.0-phase2`, `v0.3.0-m3.2`, `v0.3.2-cas-integration`, and `v0.3.0-m3.3` remain completely frozen and unmodified.
+2. **Implementation Gate**: No production C++ or test code shall be modified until this revised specification has been reviewed and committed.
+3. **Commit SHA Verification**: The specification commit SHA must be reported and verified against a clean working tree.
