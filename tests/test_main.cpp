@@ -56,6 +56,9 @@ void run_peer_session_tests(const mc::fs::path& fixture_root,
 void run_peer_service_tests(const mc::fs::path& fixture_root,
                             void (*check)(bool, const char*),
                             void (*skip)(const char*));
+namespace mc::peer {
+void run_peer_cas_helpers_tests(const mc::fs::path& fixture_root, void (*check)(bool, const char*));
+}
 namespace mc {
 void run_collab_store_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
 void run_collab_store_lifecycle_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
@@ -331,7 +334,7 @@ int main(int argc,char** argv){
         const auto malformed=[&](std::vector<std::uint8_t> bytes){try{FrameDecoder d;(void)d.feed(bytes);return false;}catch(...){return true;}};
         auto bad_magic=wire;bad_magic[0]='X';check(malformed(bad_magic),"peer protocol rejects invalid magic");
         auto bad_version=wire;bad_version[5]=2;check(malformed(bad_version),"peer protocol rejects unsupported versions");
-        auto bad_type=wire;bad_type[6]=0;bad_type[7]=10;check(malformed(bad_type),"peer protocol rejects unknown message types");
+        auto bad_type=wire;bad_type[6]=0;bad_type[7]=14;check(malformed(bad_type),"peer protocol rejects unknown message types");
         std::vector<std::uint8_t> oversized{'M','C','R','P',0,1,0,1,0,0x10,0,1};check(malformed(oversized),"peer protocol rejects an oversized frame before payload allocation");
         bool encode_oversized=false;try{(void)encode_frame(Frame{kProtocolVersion,MessageType::Manifest,std::string(static_cast<std::size_t>(kMaximumFramePayload)+1U,'x')});}catch(...){encode_oversized=true;}check(encode_oversized,"peer protocol encoder enforces its payload bound");
         bool truncated=false;try{FrameDecoder d;(void)d.feed(wire.data(),wire.size()-1);d.finish();}catch(...){truncated=true;}check(truncated,"peer protocol rejects a truncated frame at end of stream");
@@ -350,6 +353,7 @@ int main(int argc,char** argv){
     run_peer_sync_tests(base, check);
     run_peer_session_tests(base, check);
     run_peer_service_tests(base, check, skip);
+    mc::peer::run_peer_cas_helpers_tests(base, check);
     const auto stage_dir=base/"staging-security";mc::fs::create_directories(stage_dir);const auto collision=stage_dir/"collision.tmp";write(collision,"owned by another process");bool collision_rejected=false;try{mc::StagingFile refused(collision);}catch(...){collision_rejected=true;}check(collision_rejected&&mc::sha256_file(collision)==mc::sha256_data("owned by another process",24),"exclusive staging creation rejects collisions without changing or deleting the existing file");
     const auto directory_collision=stage_dir/"directory.tmp";mc::fs::create_directory(directory_collision);bool directory_rejected=false;try{mc::StagingFile refused(directory_collision);}catch(...){directory_rejected=true;}check(directory_rejected&&mc::fs::is_directory(directory_collision),"failed staging creation leaves a colliding directory intact");
     const auto cleanup_path=stage_dir/"cleanup.tmp";{mc::StagingFile owned(cleanup_path);owned.write("incomplete",10);}check(!mc::fs::exists(cleanup_path),"staging owner removes its incomplete file through the retained handle");
