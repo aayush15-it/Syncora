@@ -24,6 +24,12 @@ struct PeerSyncReport {
     std::size_t bytes_transferred{0};
     bool baseline_advanced{false};
     bool cancelled{false};
+
+    // Milestone 3.4 CAS Delta Metrics
+    bool cas_delta_used{false};
+    std::size_t chunks_reused{0};
+    std::size_t chunks_transferred{0};
+    std::size_t cas_delta_bytes_saved{0};
 };
 
 using PeerApprovalCallback = std::function<std::pair<bool, bool>(const PeerSyncPlan& plan)>;

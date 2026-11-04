@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include <memory>
+#include <unordered_map>
 #include "merklechain/hash.hpp"
 
 #ifdef _WIN32
@@ -45,6 +46,7 @@ public:
 
     ~InterprocessCasBarrier() {
         close_file();
+        shared_depth_map().erase(this);
     }
 
     InterprocessCasBarrier(const InterprocessCasBarrier&) = delete;
@@ -53,14 +55,32 @@ public:
     InterprocessCasBarrier& operator=(InterprocessCasBarrier&&) = delete;
 
     void lock_shared() {
-        in_proc_mutex_.lock_shared();
-        std::lock_guard<std::mutex> lk(os_mutex_);
-        if (++in_proc_shared_readers_ == 1) {
-            acquire_os_lock(false);
+        auto& depth = shared_depth_map()[this];
+        if (depth > 0) {
+            ++depth;
+            return;
         }
+        in_proc_mutex_.lock_shared();
+        {
+            std::lock_guard<std::mutex> lk(os_mutex_);
+            if (++in_proc_shared_readers_ == 1) {
+                acquire_os_lock(false);
+            }
+        }
+        depth = 1;
     }
 
     void unlock_shared() {
+        auto& map = shared_depth_map();
+        auto it = map.find(this);
+        if (it == map.end() || it->second <= 0) {
+            return;
+        }
+        if (it->second > 1) {
+            --(it->second);
+            return;
+        }
+        it->second = 0;
         {
             std::lock_guard<std::mutex> lk(os_mutex_);
             if (--in_proc_shared_readers_ == 0) {
@@ -91,6 +111,11 @@ public:
     const fs::path& lock_file_path() const noexcept { return lock_file_path_; }
 
 private:
+    static std::unordered_map<const InterprocessCasBarrier*, int>& shared_depth_map() {
+        static thread_local std::unordered_map<const InterprocessCasBarrier*, int> map;
+        return map;
+    }
+
     fs::path lock_file_path_;
 #ifdef _WIN32
     HANDLE file_handle_{INVALID_HANDLE_VALUE};

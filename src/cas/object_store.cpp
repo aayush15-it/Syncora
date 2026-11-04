@@ -312,7 +312,7 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
         if (!config_.verify_on_read) {
             return true;
         }
-        for (int attempt = 0; attempt < 5; ++attempt) {
+        for (int attempt = 0; attempt < 10; ++attempt) {
             try {
                 std::uintmax_t existing_bytes = 0;
                 const std::string existing_hash = mc::sha256_file(target, &existing_bytes);
@@ -321,7 +321,7 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
                 }
             } catch (const std::exception&) {
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         out_confirmed_corrupt = true;
         return false;
@@ -406,13 +406,13 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
     // Atomic move/replace to final object location without deletion gap
     std::string repl_err;
     bool promoted = false;
-    for (int attempt = 0; attempt < 3; ++attempt) {
+    for (int attempt = 0; attempt < 10; ++attempt) {
         if (atomic_replace_file(tmp_path, dest_path, repl_err)) {
             promoted = true;
             temp_guard.promoted = true;
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
     if (!promoted) {
@@ -448,15 +448,20 @@ bool ObjectStore::get_object(const ChunkHash& hash, std::vector<std::uint8_t>& o
 
     const fs::path p = object_path(hash);
     std::error_code ec;
-    if (!fs::exists(p, ec) || !fs::is_regular_file(p, ec)) {
-        return false;
+    std::ifstream in;
+    std::uintmax_t fsize = 0;
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        ec.clear();
+        if (fs::exists(p, ec) && fs::is_regular_file(p, ec)) {
+            fsize = fs::file_size(p, ec);
+            if (!ec) {
+                in.open(p, std::ios::binary);
+                if (in.is_open()) break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-
-    const auto fsize = fs::file_size(p, ec);
-    if (ec) return false;
-
-    std::ifstream in(p, std::ios::binary);
-    if (!in) return false;
+    if (!in.is_open()) return false;
 
     out_data.resize(static_cast<std::size_t>(fsize));
     if (fsize > 0) {

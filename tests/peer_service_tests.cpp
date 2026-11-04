@@ -2,6 +2,9 @@
 #include "merklechain/peer/peer_transport.hpp"
 #include "merklechain/peer/peer_sync.hpp"
 #include "merklechain/peer/peer_session.hpp"
+#include "merklechain/peer/peer_protocol.hpp"
+#include "merklechain/peer/peer_cas_helpers.hpp"
+#include "merklechain/cas/interprocess_barrier.hpp"
 #include "merklechain/hash.hpp"
 #include "merklechain/scanner.hpp"
 #include "merklechain/storage.hpp"
@@ -12,12 +15,16 @@
 #include <openssl/rsa.h>
 #include <openssl/x509v3.h>
 
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 namespace mc {
 namespace {
@@ -949,6 +956,256 @@ void run_peer_service_tests(const mc::fs::path& fixture_root,
 
         check(err_frame.type == mc::peer::MessageType::Error && host_rejected_bad_path,
               "host service rejects traversal and unauthorized file requests with Error frame");
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 3 Test 1: Bilateral CAS Delta Synchronization with Chunks Reused
+    // -------------------------------------------------------------------------
+    {
+        const auto test_dir = base_dir / "t_cas_delta_reuse";
+        const auto host_sync = test_dir / "host";
+        const auto client_sync = test_dir / "client";
+        fs::create_directories(host_sync);
+        fs::create_directories(client_sync);
+
+        // Generate a 128 KB base file with deterministic pattern
+        std::string base_data(128 * 1024, 'A');
+        for (std::size_t i = 0; i < base_data.size(); ++i) {
+            base_data[i] = static_cast<char>('A' + (i % 26));
+        }
+
+        // Initial state: both host and client share the base file
+        mc::write_file(client_sync / "document.bin", base_data);
+        mc::write_file(host_sync / "document.bin", base_data);
+
+        // Perform initial baseline sync so both peers establish baseline agreement
+        const auto port1 = next_port();
+        auto host_cfg1 = mc::make_host_config(env, host_sync, port1);
+        auto client_cfg1 = mc::make_client_config(env, client_sync, port1);
+        std::thread host_t1([&] { (void)mc::peer::PeerService::run_host(host_cfg1, auto_approve); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        (void)mc::peer::PeerService::run_client(client_cfg1, auto_approve);
+        host_t1.join();
+
+        // Host has modified version (change 4KB in the middle)
+        std::string host_data = base_data;
+        for (std::size_t i = 64 * 1024; i < 68 * 1024; ++i) {
+            host_data[i] = 'X';
+        }
+        mc::write_file(host_sync / "document.bin", host_data);
+
+        // Bilateral CAS delta synchronization
+        const auto port2 = next_port();
+        auto host_cfg2 = mc::make_host_config(env, host_sync, port2);
+        auto client_cfg2 = mc::make_client_config(env, client_sync, port2);
+
+        mc::peer::PeerSyncReport host_rep, client_rep;
+        std::thread host_t2([&] { host_rep = mc::peer::PeerService::run_host(host_cfg2, auto_approve); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::thread client_t2([&] { client_rep = mc::peer::PeerService::run_client(client_cfg2, auto_approve); });
+
+        host_t2.join();
+        client_t2.join();
+
+        check(host_rep.success && client_rep.success,
+              "Stage 3: Bilateral CAS Delta synchronization completes successfully");
+        check(client_rep.cas_delta_used,
+              "Stage 3: CAS Delta engine was utilized for file transfer");
+        check(client_rep.chunks_reused > 0,
+              "Stage 3: Receiver reused unmodified local chunks from document.bin");
+        check(client_rep.cas_delta_bytes_saved > 0,
+              "Stage 3: Receiver recorded byte savings from local chunk deduplication");
+        check(client_rep.bytes_transferred < 128 * 1024,
+              "Stage 3: Transferred wire payload is substantially smaller than full file");
+        check(host_rep.final_merkle_root == client_rep.final_merkle_root,
+              "Stage 3: Final Merkle roots converge between Host and Client");
+        check(mc::read_file(client_sync / "document.bin") == host_data,
+              "Stage 3: Client reconstructed exact updated content from Host");
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 3 Test 2: Legacy Peer Fallback (Whole-file transfer when no cas_delta_v1)
+    // -------------------------------------------------------------------------
+    {
+        const auto test_dir = base_dir / "t_legacy_fallback";
+        const auto host_sync = test_dir / "host";
+        const auto client_sync = test_dir / "client";
+        fs::create_directories(host_sync);
+        fs::create_directories(client_sync);
+
+        mc::write_file(host_sync / "legacy_file.txt", "Whole file payload for legacy compatibility test");
+
+        const auto port = next_port();
+        auto host_cfg = mc::make_host_config(env, host_sync, port);
+
+        // Host runs normally
+        std::thread host_t([&] {
+            auto rep = mc::peer::PeerService::run_host(host_cfg, auto_approve);
+            check(rep.success, "Stage 3: Host succeeds with legacy client");
+            check(!rep.cas_delta_used, "Stage 3: Host falls back to whole-file sync for legacy client");
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        auto client_cfg = mc::make_client_config(env, client_sync, port);
+        mc::peer::PeerTlsContext tls(client_cfg, mc::peer::Role::Client);
+        auto conn = mc::peer::PeerConnection::connect(client_cfg, tls);
+
+        // Send legacy plain Hello without capabilities string
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::Hello, client_cfg.identity});
+        auto h_hello = conn.receive_frame();
+        check(h_hello.type == mc::peer::MessageType::Hello, "Stage 3: Received Host Hello");
+
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::ManifestRequest, "sess_leg_1"});
+        auto hm_frame = conn.receive_frame();
+        auto hm = mc::peer::decode_peer_manifest(hm_frame.payload, 1000, 100000000);
+
+        auto cm = mc::scan_folder(client_sync);
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::Manifest,
+                        mc::peer::encode_peer_manifest(cm, 1000, 100000000)});
+
+        auto plan = mc::peer::plan_bidirectional(host_cfg.identity, "default", {}, cm, hm);
+
+        std::string appr_data;
+        appr_data.append(plan.plan_hash);
+        while (appr_data.size() < 64) appr_data.push_back(' ');
+        appr_data.append(hm.merkle_root);
+        while (appr_data.size() < 128) appr_data.push_back(' ');
+        appr_data.push_back('\1');
+        appr_data.push_back('\1');
+        appr_data.append("sess_leg_1");
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::Approval, appr_data});
+        (void)conn.receive_frame(); // Host approval
+
+        // Legacy client sends FileRequest (not ChunkManifestRequest)
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::FileRequest, "legacy_file.txt"});
+        std::string received_bytes;
+        while (true) {
+            auto f = conn.receive_frame();
+            if (f.type == mc::peer::MessageType::FileData) {
+                received_bytes.append(f.payload);
+            } else if (f.type == mc::peer::MessageType::FileEnd) {
+                break;
+            }
+        }
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::SyncResult, "PREPARED"});
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::SyncResult, "COMMITTED:" + hm.merkle_root});
+        (void)conn.receive_frame(); // Host commit
+
+        host_t.join();
+        check(received_bytes == "Whole file payload for legacy compatibility test",
+              "Stage 3: Host successfully served file via legacy whole-file stream");
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 3 Test 3: Session Authorizer Rejects Unauthorized Chunk Request
+    // -------------------------------------------------------------------------
+    {
+        const auto test_dir = base_dir / "t_unauth_chunk";
+        const auto host_sync = test_dir / "host";
+        const auto client_sync = test_dir / "client";
+        fs::create_directories(host_sync);
+        fs::create_directories(client_sync);
+
+        mc::write_file(host_sync / "secret.txt", "Some confidential content");
+
+        const auto port = next_port();
+        auto host_cfg = mc::make_host_config(env, host_sync, port);
+
+        bool host_rejected_unauthorized = false;
+        std::thread host_t([&] {
+            auto rep = mc::peer::PeerService::run_host(host_cfg, auto_approve);
+            if (!rep.success && rep.error.find("unauthorized") != std::string::npos) {
+                host_rejected_unauthorized = true;
+            }
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        auto client_cfg = mc::make_client_config(env, client_sync, port);
+        mc::peer::PeerTlsContext tls(client_cfg, mc::peer::Role::Client);
+        auto conn = mc::peer::PeerConnection::connect(client_cfg, tls);
+
+        mc::peer::PeerCapabilities caps{client_cfg.identity, "1.0", {mc::peer::kCapCasDeltaV1, mc::peer::kCapWholeFile}};
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::Hello, mc::peer::encode_hello_payload(caps)});
+        (void)conn.receive_frame();
+
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::ManifestRequest, "sess_unauth"});
+        auto hm_frame = conn.receive_frame();
+        auto hm = mc::peer::decode_peer_manifest(hm_frame.payload, 1000, 100000000);
+
+        auto cm = mc::scan_folder(client_sync);
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::Manifest,
+                        mc::peer::encode_peer_manifest(cm, 1000, 100000000)});
+
+        auto plan = mc::peer::plan_bidirectional(host_cfg.identity, "default", {}, cm, hm);
+
+        std::string appr_data;
+        appr_data.append(plan.plan_hash);
+        while (appr_data.size() < 64) appr_data.push_back(' ');
+        appr_data.append(hm.merkle_root);
+        while (appr_data.size() < 128) appr_data.push_back(' ');
+        appr_data.push_back('\1');
+        appr_data.push_back('\1');
+        appr_data.append("sess_unauth");
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::Approval, appr_data});
+        (void)conn.receive_frame();
+
+        // Attempt to request an unadvertised / arbitrary chunk hash
+        mc::peer::ChunkRequestMessage bad_chunk_req;
+        bad_chunk_req.relative_path = "secret.txt";
+        bad_chunk_req.requested_hashes = {"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+        conn.send_frame(mc::peer::Frame{mc::peer::kProtocolVersion, mc::peer::MessageType::ChunkRequest,
+                                        mc::peer::encode_chunk_request(bad_chunk_req)});
+
+        auto err_frame = conn.receive_frame();
+        host_t.join();
+
+        check(err_frame.type == mc::peer::MessageType::Error,
+              "Stage 3: Host replies with Error frame on unauthorized chunk hash request");
+        check(host_rejected_unauthorized,
+              "Stage 3: Host terminates cleanly after rejecting unauthorized chunk request");
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 3 Test 4: Concurrent GC Mutual Exclusion under Receiver Barrier Guard
+    // -------------------------------------------------------------------------
+    {
+        const auto test_dir = base_dir / "t_cas_gc_barrier";
+        const auto cas_root = test_dir / "cas";
+        fs::create_directories(cas_root);
+
+        const auto lock_file = cas_root / ".cas_barrier.lock";
+        mc::cas::InterprocessCasBarrier barrier(lock_file);
+
+        // Main thread acquires shared lock (as receiver does)
+        std::optional<mc::cas::CasSharedBarrierGuard> shared_guard;
+        shared_guard.emplace(barrier);
+
+        // Attempt to acquire exclusive lock (as GC does) in a background thread
+        std::atomic<bool> thread_started{false};
+        std::atomic<bool> exclusive_acquired{false};
+        std::thread gc_thread([&] {
+            thread_started = true;
+            mc::cas::CasExclusiveBarrierGuard exclusive_guard(barrier);
+            exclusive_acquired = true;
+        });
+
+        while (!thread_started) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // While shared_guard is held, GC exclusive lock must NOT be acquired
+        check(!exclusive_acquired.load(),
+              "Stage 3: Exclusive GC sweep lock is blocked while receiver holds shared CAS barrier");
+
+        // Release shared guard (simulating receiver finishing commit)
+        shared_guard.reset();
+
+        gc_thread.join();
+        check(exclusive_acquired.load(),
+              "Stage 3: Exclusive GC sweep lock unblocks immediately after receiver releases barrier");
     }
 
     mc::fs::remove_all(base_dir, ec);

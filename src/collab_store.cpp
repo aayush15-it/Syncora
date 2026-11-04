@@ -1495,7 +1495,11 @@ void CollabStore::quarantine_directory(const fs::path& suspect_dir,
     std::error_code ec;
     fs::create_directories(q_base, ec);
     const auto dest = q_base / (suspect_dir.filename().string() + "_" + std::to_string(now_ms()));
-    fs::rename(suspect_dir, dest, ec);
+    for (int attempt = 0; attempt < 15; ++attempt) {
+        fs::rename(suspect_dir, dest, ec);
+        if (!ec) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     if (!ec) {
         record_event("SYSTEM", "recovery", "QUARANTINE_DIRECTORY",
                      "workspace:" + ws_id, "WARNING",
