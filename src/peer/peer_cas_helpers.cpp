@@ -3,11 +3,38 @@
 #include "merklechain/hash.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace mc::peer {
+
+namespace {
+bool is_windows_reserved_device_name(const std::string& segment) {
+    if (segment.empty()) return false;
+    auto dot_pos = segment.find('.');
+    std::string base = (dot_pos == std::string::npos) ? segment : segment.substr(0, dot_pos);
+    if (base.empty()) return false;
+    std::string upper;
+    upper.reserve(base.size());
+    for (char ch : base) {
+        upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+    }
+    if (upper == "CON" || upper == "PRN" || upper == "AUX" || upper == "NUL") {
+        return true;
+    }
+    if (upper.size() == 4) {
+        if ((upper.rfind("COM", 0) == 0 || upper.rfind("LPT", 0) == 0) &&
+            upper[3] >= '1' && upper[3] <= '9') {
+            return true;
+        }
+    }
+    return false;
+}
+}
 
 mc::cas::ChunkerConfig get_peer_chunker_config() {
     mc::cas::ChunkerConfig cfg;
@@ -29,6 +56,10 @@ bool validate_peer_path(const std::string& path, std::string& err) {
     }
     if (path[0] == '/' || path[0] == '\\') {
         err = "path must be relative, got leading slash: " + path;
+        return false;
+    }
+    if (path.back() == '/' || path.back() == '\\') {
+        err = "path must refer to a file, got trailing slash: " + path;
         return false;
     }
     if (path.size() >= 2U && path[1] == ':') {
@@ -53,8 +84,20 @@ bool validate_peer_path(const std::string& path, std::string& err) {
         }
 
         if (c == '/' || c == '\\') {
+            if (segment.empty() && i > 0 && i < path.size()) {
+                err = "path contains empty directory segment (consecutive slashes): " + path;
+                return false;
+            }
             if (segment == "..") {
                 err = "path contains directory traversal ('..'): " + path;
+                return false;
+            }
+            if (!segment.empty() && (segment.back() == ' ' || segment.back() == '.')) {
+                err = "path segment ends with trailing space or dot: " + segment;
+                return false;
+            }
+            if (is_windows_reserved_device_name(segment)) {
+                err = "path contains reserved Windows device name: " + segment;
                 return false;
             }
             segment.clear();
@@ -126,6 +169,16 @@ bool validate_peer_manifest(const mc::cas::FileManifest& manifest, std::string& 
             }
         }
 
+        // Integer overflow checks
+        if (std::numeric_limits<std::uint64_t>::max() - expected_offset < c.size) {
+            err = "manifest offset integer overflow at chunk " + std::to_string(i);
+            return false;
+        }
+        if (std::numeric_limits<std::uint64_t>::max() - accumulated_size < c.size) {
+            err = "manifest total size integer overflow at chunk " + std::to_string(i);
+            return false;
+        }
+
         expected_offset += c.size;
         accumulated_size += c.size;
     }
@@ -162,6 +215,27 @@ void SessionChunkAuthorizer::authorize_manifest(const mc::cas::FileManifest& man
     }
 }
 
+void SessionChunkAuthorizer::authorize_manifest(const std::string& relative_path, const mc::cas::FileManifest& manifest) {
+    std::string path_err;
+    if (validate_peer_path(relative_path, path_err)) {
+        authorized_paths_.insert(relative_path);
+    }
+    authorize_manifest(manifest);
+}
+
+bool SessionChunkAuthorizer::authorize_path(const std::string& relative_path) {
+    std::string path_err;
+    if (!validate_peer_path(relative_path, path_err)) {
+        return false;
+    }
+    authorized_paths_.insert(relative_path);
+    return true;
+}
+
+bool SessionChunkAuthorizer::is_path_authorized(const std::string& relative_path) const noexcept {
+    return authorized_paths_.find(relative_path) != authorized_paths_.end();
+}
+
 bool SessionChunkAuthorizer::authorize_hash(const std::string& chunk_hash) {
     if (!is_valid_hex_sha256(chunk_hash)) {
         return false;
@@ -178,6 +252,10 @@ bool SessionChunkAuthorizer::validate_chunk_request(
     const ChunkRequestMessage& request,
     std::string& err) const {
     if (!validate_peer_path(request.relative_path, err)) {
+        return false;
+    }
+    if (!authorized_paths_.empty() && !is_path_authorized(request.relative_path)) {
+        err = "unauthorized relative path in chunk request: " + request.relative_path;
         return false;
     }
     if (request.requested_hashes.empty()) {
@@ -203,22 +281,73 @@ bool SessionChunkAuthorizer::validate_chunk_request(
     return true;
 }
 
-std::vector<std::string> compute_missing_chunks(
+bool compute_missing_chunks(
     const mc::cas::FileManifest& manifest,
-    const mc::cas::ObjectStore& object_store) {
-    std::vector<std::string> missing;
+    const mc::cas::ObjectStore& object_store,
+    MissingChunksResult& out_result,
+    std::string& err) {
+    out_result.missing_hashes.clear();
+    out_result.corrupt_hashes.clear();
+    out_result.valid_hashes.clear();
+    out_result.total_chunks = 0;
+    out_result.missing_bytes = 0;
+    out_result.local_reused_bytes = 0;
+
     if (manifest.is_empty()) {
-        return missing;
+        return true;
     }
-    std::unordered_set<std::string> seen;
+
+    std::unordered_map<std::string, mc::cas::ObjectAvailability> seen_status;
+
     for (const auto& c : manifest.chunks()) {
-        if (seen.insert(c.hash).second) {
-            if (!object_store.has_object(c.hash)) {
-                missing.push_back(c.hash);
+        out_result.total_chunks++;
+
+        auto it = seen_status.find(c.hash);
+        if (it == seen_status.end()) {
+            const auto st = object_store.verify_object(c.hash, c.size);
+            if (st.availability == mc::cas::ObjectAvailability::InvalidHash) {
+                err = "manifest contains invalid chunk hash format: " + c.hash;
+                return false;
+            }
+            if (st.availability == mc::cas::ObjectAvailability::IoError) {
+                err = "I/O error verifying chunk " + c.hash + ": " + st.error;
+                return false;
+            }
+
+            seen_status[c.hash] = st.availability;
+
+            if (st.availability == mc::cas::ObjectAvailability::AvailableValid) {
+                out_result.valid_hashes.push_back(c.hash);
+                out_result.local_reused_bytes += c.size;
+            } else if (st.availability == mc::cas::ObjectAvailability::Missing) {
+                out_result.missing_hashes.push_back(c.hash);
+                out_result.missing_bytes += c.size;
+            } else if (st.availability == mc::cas::ObjectAvailability::Corrupt) {
+                out_result.corrupt_hashes.push_back(c.hash);
+                out_result.missing_hashes.push_back(c.hash);
+                out_result.missing_bytes += c.size;
+            }
+        } else {
+            const auto prev_avail = it->second;
+            if (prev_avail == mc::cas::ObjectAvailability::AvailableValid) {
+                out_result.local_reused_bytes += c.size;
+            } else {
+                out_result.missing_bytes += c.size;
             }
         }
     }
-    return missing;
+    return true;
+}
+
+std::vector<std::string> compute_missing_chunks(
+    const mc::cas::FileManifest& manifest,
+    const mc::cas::ObjectStore& object_store) {
+    MissingChunksResult res;
+    std::string err;
+    if (!compute_missing_chunks(manifest, object_store, res, err)) {
+        throw std::runtime_error("compute_missing_chunks failed: " + err);
+    }
+    return res.missing_hashes;
 }
 
 std::vector<ChunkRequestMessage> build_chunk_requests(

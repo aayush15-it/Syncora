@@ -86,6 +86,16 @@ void copy_directory_recursive(const fs::path& source, const fs::path& target) {
     }
 }
 
+void safe_rename_directory(const fs::path& from, const fs::path& to) {
+    std::error_code ec;
+    for (int attempt = 0; attempt < 15; ++attempt) {
+        fs::rename(from, to, ec);
+        if (!ec) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    throw fs::filesystem_error("cannot rename", from, to, ec);
+}
+
 namespace {
 
 std::vector<std::string> split_lines(const std::string& text) {
@@ -2096,7 +2106,7 @@ bool CollabStore::accept_submission(const std::string& sub_id, const std::string
 
         // 7. Backup baseline and working copy
         if (fs::exists(base_dir)) {
-            fs::rename(base_dir, backup_base);
+            safe_rename_directory(base_dir, backup_base);
             if (!create_sentinel_file(backup_base, op_id, ws_id, "ACCEPT_SUBMISSION", "backup_base")) {
                 throw std::runtime_error("backup_base sentinel already exists");
             }
@@ -2106,7 +2116,7 @@ bool CollabStore::accept_submission(const std::string& sub_id, const std::string
         }
 
         if (fs::exists(work_dir)) {
-            fs::rename(work_dir, backup_work);
+            safe_rename_directory(work_dir, backup_work);
             if (!create_sentinel_file(backup_work, op_id, ws_id, "ACCEPT_SUBMISSION", "backup_work")) {
                 throw std::runtime_error("backup_work sentinel already exists");
             }
@@ -2125,7 +2135,7 @@ bool CollabStore::accept_submission(const std::string& sub_id, const std::string
 
         // Remove temporary sentinel from staging before promotion
         fs::remove(staging_base / ".syncora_op_sentinel");
-        fs::rename(staging_base, base_dir);
+        safe_rename_directory(staging_base, base_dir);
 
         trigger_collab_fault_point(CollabFaultPoint::FailAfterBaselinePromotion, "FailAfterBaselinePromotion");
 
@@ -2136,7 +2146,7 @@ bool CollabStore::accept_submission(const std::string& sub_id, const std::string
         }
 
         fs::remove(staging_work / ".syncora_op_sentinel");
-        fs::rename(staging_work, work_dir);
+        safe_rename_directory(staging_work, work_dir);
 
         trigger_collab_fault_point(CollabFaultPoint::FailAfterWorkingCopyPromotion, "FailAfterWorkingCopyPromotion");
 
@@ -2638,7 +2648,7 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
             throw std::runtime_error("staged version root mismatch");
         }
 
-        fs::rename(staging_ver, final_ver);
+        safe_rename_directory(staging_ver, final_ver);
         create_sentinel_file(final_ver, op_id, actual_ws_id, "PUBLISH_VERSION", "version_snapshot");
 
         trigger_collab_fault_point(CollabFaultPoint::FailAfterSnapshotPromotion, "FailAfterSnapshotPromotion");
@@ -2665,7 +2675,7 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
         }
 
         if (fs::exists(base_dir)) {
-            fs::rename(base_dir, backup_base);
+            safe_rename_directory(base_dir, backup_base);
             if (!create_sentinel_file(backup_base, op_id, actual_ws_id, "PUBLISH_VERSION", "backup_base")) {
                 throw std::runtime_error("backup_base sentinel already exists");
             }
@@ -2683,7 +2693,7 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
         }
 
         fs::remove(staging_base / ".syncora_op_sentinel");
-        fs::rename(staging_base, base_dir);
+        safe_rename_directory(staging_base, base_dir);
 
         trigger_collab_fault_point(CollabFaultPoint::FailAfterBaselinePromotion, "FailAfterBaselinePromotion");
 

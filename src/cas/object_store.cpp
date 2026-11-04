@@ -228,6 +228,50 @@ bool ObjectStore::has_object(const ChunkHash& hash) const {
     return fs::exists(p, ec) && fs::is_regular_file(p, ec);
 }
 
+ObjectStatus ObjectStore::verify_object(const ChunkHash& hash, std::uintmax_t expected_size) const {
+    if (!is_valid_hex_hash(hash)) {
+        return {ObjectAvailability::InvalidHash, 0, "", "Invalid hex hash format: " + hash};
+    }
+    const fs::path p = object_path(hash);
+    std::error_code ec;
+    if (!fs::exists(p, ec)) {
+        if (ec) {
+            return {ObjectAvailability::IoError, 0, "", "Filesystem error checking object: " + ec.message()};
+        }
+        return {ObjectAvailability::Missing, 0, "", "Object does not exist"};
+    }
+    if (!fs::is_regular_file(p, ec)) {
+        if (ec) {
+            return {ObjectAvailability::IoError, 0, "", "Filesystem error checking regular file: " + ec.message()};
+        }
+        return {ObjectAvailability::Corrupt, 0, "", "Object path is not a regular file"};
+    }
+    const auto fsz = fs::file_size(p, ec);
+    if (ec) {
+        return {ObjectAvailability::IoError, 0, "", "Failed to read file size: " + ec.message()};
+    }
+    if (expected_size > 0 && fsz != expected_size) {
+        return {ObjectAvailability::Corrupt, fsz, "", "Object size mismatch: expected " + std::to_string(expected_size) + ", actual " + std::to_string(fsz)};
+    }
+    try {
+        std::uintmax_t read_bytes = 0;
+        const std::string actual_hash = mc::sha256_file(p, &read_bytes);
+        if (expected_size > 0 && read_bytes != expected_size) {
+            return {ObjectAvailability::Corrupt, read_bytes, actual_hash, "Read bytes " + std::to_string(read_bytes) + " did not match expected size " + std::to_string(expected_size)};
+        }
+        if (actual_hash != hash) {
+            return {ObjectAvailability::Corrupt, read_bytes, actual_hash, "Hash mismatch: expected " + hash + ", actual " + actual_hash};
+        }
+        return {ObjectAvailability::AvailableValid, read_bytes, actual_hash, ""};
+    } catch (const std::exception& e) {
+        return {ObjectAvailability::IoError, fsz, "", "Exception hashing object file: " + std::string(e.what())};
+    }
+}
+
+PutResult ObjectStore::repair_object(const void* data, std::size_t size, const std::string& expected_hash) {
+    return put_object(data, size, expected_hash);
+}
+
 std::uintmax_t ObjectStore::object_size(const ChunkHash& hash) const {
     if (!is_valid_hex_hash(hash)) return 0;
     const fs::path p = object_path(hash);
@@ -289,9 +333,8 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
         ++deduplicated_puts_;
         return {PutResultStatus::AlreadyExists, actual_hash, size, ""};
     }
-    if (is_corrupt) {
-        fs::remove(dest_path, ec);
-    }
+    // Do NOT remove dest_path upfront even if corrupt: prevent deletion gaps!
+    // Staging into a unique temp file first ensures atomic replacement upon promotion.
 
     // Write object through a unique temporary file on the same filesystem
     const fs::path tmp_path = generate_temp_path();
@@ -360,43 +403,28 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
         return {PutResultStatus::IoError, actual_hash, size, "Failed to create shard directory: " + ec.message()};
     }
 
-    // Atomic move to final object location
-    fs::rename(tmp_path, dest_path, ec);
-    if (ec) {
-        // If rename failed because another concurrent process/thread created it in the meantime, handle cleanly
+    // Atomic move/replace to final object location without deletion gap
+    std::string repl_err;
+    bool promoted = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (atomic_replace_file(tmp_path, dest_path, repl_err)) {
+            promoted = true;
+            temp_guard.promoted = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    if (!promoted) {
+        // If atomic replacement failed, check if another concurrent process/thread stored it validly
         bool rename_corrupt = false;
         if (verify_existing_dest(dest_path, rename_corrupt)) {
             std::lock_guard<std::mutex> lock(stats_mutex_);
             ++deduplicated_puts_;
             return {PutResultStatus::AlreadyExists, actual_hash, size, ""};
-        } else if (rename_corrupt) {
-            // If the object at dest_path was corrupt, heal it by atomic replacement without deletion gap
-            std::string repl_err;
-            bool replaced = false;
-            for (int attempt = 0; attempt < 3; ++attempt) {
-                if (atomic_replace_file(tmp_path, dest_path, repl_err)) {
-                    replaced = true;
-                    temp_guard.promoted = true;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
-            if (replaced) {
-                std::lock_guard<std::mutex> lock(stats_mutex_);
-                ++new_puts_;
-                return {PutResultStatus::StoredNew, actual_hash, size, ""};
-            }
-            // Check if another concurrent worker healed it in the meantime
-            if (verify_existing_dest(dest_path, rename_corrupt)) {
-                std::lock_guard<std::mutex> lock(stats_mutex_);
-                ++deduplicated_puts_;
-                return {PutResultStatus::AlreadyExists, actual_hash, size, ""};
-            }
         }
-        return {PutResultStatus::IoError, actual_hash, size, "Failed to move temp object to CAS store: " + ec.message()};
+        return {PutResultStatus::IoError, actual_hash, size, "Failed to atomically promote temp object to CAS store: " + repl_err};
     }
-
-    temp_guard.promoted = true;
 
     if (g_cas_fault_point.load() == CasFaultPointForTesting::CrashAfterPromotion) {
 #ifdef MERKLECHAIN_TESTING

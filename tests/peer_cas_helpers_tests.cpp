@@ -2,6 +2,7 @@
 #include "merklechain/peer/peer_cas_helpers.hpp"
 #include "merklechain/cas/object_store.hpp"
 #include "merklechain/cas/cas_types.hpp"
+#include "merklechain/cas/interprocess_barrier.hpp"
 #include "merklechain/hash.hpp"
 
 #include <iostream>
@@ -10,6 +11,10 @@
 #include <filesystem>
 #include <fstream>
 #include <cassert>
+#include <atomic>
+#include <thread>
+#include <limits>
+#include <optional>
 
 namespace fs = std::filesystem;
 
@@ -371,6 +376,346 @@ void run_peer_cas_helpers_tests(const fs::path& fixture_root, void (*check)(bool
         corrupted_data[5] ^= '\x01';
         check(!verify_chunk_payload(good_hash, corrupted_data.data(), corrupted_data.size(), verify_err),
               "Stage 2: verify_chunk_payload detects bit-flip corruption");
+    }
+
+    // =========================================================================
+    // SECTION 9: Complete CAS Object Integrity Verification (5 States)
+    // =========================================================================
+    {
+        const fs::path integrity_root = test_dir / "cas_integrity_store";
+        fs::create_directories(integrity_root, ec);
+        mc::cas::ObjectStoreConfig cfg;
+        cfg.root_path = integrity_root;
+        mc::cas::ObjectStore store(cfg);
+        std::string init_err;
+        check(store.initialize(init_err), "Stage 2 Integrity: ObjectStore initialized for verification tests");
+
+        // Test 1: Correct object passes verification
+        const std::string valid_payload = "integrity verified payload chunk 12345";
+        const std::string valid_hash = mc::sha256_data(valid_payload.data(), valid_payload.size());
+        auto put_res = store.put_object(valid_payload.data(), valid_payload.size(), valid_hash);
+        check(put_res.is_ok(), "Test 1: Store valid chunk for verification");
+
+        auto st_valid = store.verify_object(valid_hash, valid_payload.size());
+        check(st_valid.is_available_and_valid() &&
+              st_valid.availability == mc::cas::ObjectAvailability::AvailableValid &&
+              st_valid.size == valid_payload.size() &&
+              st_valid.actual_hash == valid_hash &&
+              st_valid.error.empty(),
+              "Test 1: Correct object passes verification with AvailableValid status and exact hash");
+
+        // Test 2: Missing object returns missing
+        const std::string missing_hash(64, 'f');
+        auto st_missing = store.verify_object(missing_hash, 100);
+        check(!st_missing.is_available_and_valid() &&
+              st_missing.availability == mc::cas::ObjectAvailability::Missing,
+              "Test 2: Missing object returns Missing availability status");
+
+        // Test 3: Same-size corrupted object fails verification
+        const std::string victim_payload = "same size corruption victim payload 999";
+        const std::string victim_hash = mc::sha256_data(victim_payload.data(), victim_payload.size());
+        auto vres = store.put_object(victim_payload.data(), victim_payload.size(), victim_hash);
+        check(vres.is_ok(), "Test 3: Store victim chunk for corruption test");
+
+        const fs::path victim_path = store.object_path(victim_hash);
+        // Overwrite in place with same-size corrupted bytes
+        std::string corrupted_payload = victim_payload;
+        corrupted_payload[0] ^= '\x55';
+        {
+            std::ofstream out(victim_path, std::ios::binary | std::ios::trunc);
+            out.write(corrupted_payload.data(), static_cast<std::streamsize>(corrupted_payload.size()));
+        }
+        auto st_corrupt = store.verify_object(victim_hash, victim_payload.size());
+        check(!st_corrupt.is_available_and_valid() &&
+              st_corrupt.availability == mc::cas::ObjectAvailability::Corrupt &&
+              st_corrupt.actual_hash == mc::sha256_data(corrupted_payload.data(), corrupted_payload.size()),
+              "Test 3: Same-size corrupted object fails verification and reports Corrupt status");
+
+        // Test 11: Invalid hash input is rejected
+        auto st_invalid1 = store.verify_object("not-a-valid-hex-hash");
+        auto st_invalid2 = store.verify_object(std::string(64, 'Z'));
+        auto st_invalid3 = store.verify_object("../../etc/passwd");
+        check(st_invalid1.availability == mc::cas::ObjectAvailability::InvalidHash &&
+              st_invalid2.availability == mc::cas::ObjectAvailability::InvalidHash &&
+              st_invalid3.availability == mc::cas::ObjectAvailability::InvalidHash,
+              "Test 11: Invalid hash format is strictly rejected with InvalidHash status");
+
+        // Test 12: Object size mismatch detected
+        auto st_size_mismatch = store.verify_object(valid_hash, valid_payload.size() + 50);
+        check(!st_size_mismatch.is_available_and_valid() &&
+              st_size_mismatch.availability == mc::cas::ObjectAvailability::Corrupt,
+              "Test 12: Object size mismatch is detected and flagged as Corrupt");
+    }
+
+    // =========================================================================
+    // SECTION 10: Atomic In-Place Object Repair Without Deletion Gap
+    // =========================================================================
+    {
+        const fs::path repair_root = test_dir / "cas_repair_store";
+        fs::create_directories(repair_root, ec);
+        mc::cas::ObjectStoreConfig cfg;
+        cfg.root_path = repair_root;
+        mc::cas::ObjectStore store(cfg);
+        std::string init_err;
+        check(store.initialize(init_err), "Stage 2 Repair: ObjectStore initialized for repair tests");
+
+        // Test 4: Wrong hash payload is rejected
+        const std::string test_data = "correct payload data bytes";
+        const std::string bogus_hash(64, 'e');
+        auto bad_put = store.put_object(test_data.data(), test_data.size(), bogus_hash);
+        check(bad_put.status == mc::cas::PutResultStatus::HashMismatch,
+              "Test 4: Wrong hash payload is rejected by put_object with HashMismatch");
+
+        // Test 5: Corrupted object repaired safely
+        const std::string repair_data = "data to be repaired after corruption";
+        const std::string target_hash = mc::sha256_data(repair_data.data(), repair_data.size());
+        const fs::path target_path = store.object_path(target_hash);
+        fs::create_directories(target_path.parent_path(), ec);
+        {
+            // Seed a corrupted file at target path
+            std::ofstream out(target_path, std::ios::binary | std::ios::trunc);
+            out << "corrupted bytes";
+        }
+        check(store.verify_object(target_hash, repair_data.size()).availability == mc::cas::ObjectAvailability::Corrupt,
+              "Test 5: Target object verified as Corrupt prior to repair");
+
+        auto repair_res = store.repair_object(repair_data.data(), repair_data.size(), target_hash);
+        check(repair_res.is_ok(), "Test 5: repair_object succeeds on corrupted target");
+        auto st_repaired = store.verify_object(target_hash, repair_data.size());
+        check(st_repaired.is_available_and_valid(),
+              "Test 5: Corrupted object repaired safely and verified as AvailableValid");
+
+        // Test 6: Failed repair does not destroy valid data
+        const std::string pristine_data = "pristine verified object content";
+        const std::string pristine_hash = mc::sha256_data(pristine_data.data(), pristine_data.size());
+        auto put_pristine = store.put_object(pristine_data.data(), pristine_data.size(), pristine_hash);
+        check(put_pristine.is_ok(), "Test 6: Seed pristine object");
+
+        const std::string malicious_data = "malicious altered content attempt";
+        auto failed_repair = store.repair_object(malicious_data.data(), malicious_data.size(), pristine_hash);
+        check(failed_repair.status == mc::cas::PutResultStatus::HashMismatch,
+              "Test 6: Malicious repair payload rejected with HashMismatch");
+
+        // Crucial guarantee: the pristine object on disk remains intact and verified
+        auto st_pristine = store.verify_object(pristine_hash, pristine_data.size());
+        std::vector<std::uint8_t> read_bytes;
+        store.get_object(pristine_hash, read_bytes);
+        std::string read_str(read_bytes.begin(), read_bytes.end());
+        check(st_pristine.is_available_and_valid() && read_str == pristine_data,
+              "Test 6: Failed repair does NOT destroy or overwrite valid object data on disk");
+
+        // Test 7: Concurrent duplicate repair is safe
+        const std::string race_data = "concurrent race repair test payload";
+        const std::string race_hash = mc::sha256_data(race_data.data(), race_data.size());
+        const fs::path race_path = store.object_path(race_hash);
+        fs::create_directories(race_path.parent_path(), ec);
+        {
+            std::ofstream out(race_path, std::ios::binary | std::ios::trunc);
+            out << "damaged initial content";
+        }
+
+        std::atomic<int> success_count{0};
+        std::thread t1([&]() {
+            auto r = store.repair_object(race_data.data(), race_data.size(), race_hash);
+            if (r.is_ok()) success_count++;
+        });
+        std::thread t2([&]() {
+            auto r = store.repair_object(race_data.data(), race_data.size(), race_hash);
+            if (r.is_ok()) success_count++;
+        });
+        t1.join();
+        t2.join();
+        check(success_count == 2, "Test 7: Concurrent repair from multiple threads succeeds safely");
+        check(store.verify_object(race_hash, race_data.size()).is_available_and_valid(),
+              "Test 7: Object verified as AvailableValid after concurrent repair");
+    }
+
+    // =========================================================================
+    // SECTION 11: Multi-Thread & Cross-Process Verification and Barrier Safety
+    // =========================================================================
+    {
+        const fs::path conc_root = test_dir / "cas_concurrency_store";
+        fs::create_directories(conc_root, ec);
+        mc::cas::ObjectStoreConfig cfg;
+        cfg.root_path = conc_root;
+        mc::cas::ObjectStore store(cfg);
+        std::string init_err;
+        check(store.initialize(init_err), "Stage 2 Concurrency: ObjectStore initialized");
+
+        const std::string shared_payload = "multi-threaded read verification payload";
+        const std::string shared_hash = mc::sha256_data(shared_payload.data(), shared_payload.size());
+        store.put_object(shared_payload.data(), shared_payload.size(), shared_hash);
+
+        // Test 8: Concurrent verification is safe
+        std::atomic<int> valid_verifications{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; ++i) {
+            threads.emplace_back([&]() {
+                for (int j = 0; j < 25; ++j) {
+                    auto st = store.verify_object(shared_hash, shared_payload.size());
+                    if (st.is_available_and_valid()) {
+                        valid_verifications++;
+                    }
+                }
+            });
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+        check(valid_verifications == 100,
+              "Test 8: 100 concurrent object verifications across 4 threads all succeeded safely");
+
+        // Test 10: Cross-process / multi-store verification and repair behaves correctly
+        mc::cas::ObjectStore store2(cfg);
+        check(store2.initialize(init_err), "Test 10: Secondary ObjectStore initialized on same root");
+        auto st_cross = store2.verify_object(shared_hash, shared_payload.size());
+        check(st_cross.is_available_and_valid(),
+              "Test 10: Secondary store verifies object written by primary store");
+
+        // Test 9: GC cannot delete actively protected object (InterprocessCasBarrier shared vs exclusive)
+        const fs::path barrier_file = conc_root / ".cas_barrier.lock";
+        mc::cas::InterprocessCasBarrier barrier(barrier_file);
+        {
+            std::optional<mc::cas::CasSharedBarrierGuard> shared_guard;
+            shared_guard.emplace(barrier);
+
+            std::atomic<bool> exclusive_acquired{false};
+            std::thread excl_thread([&]() {
+                barrier.lock_exclusive();
+                exclusive_acquired.store(true);
+                barrier.unlock_exclusive();
+            });
+
+            // Verify exclusive lock cannot be acquired while shared reader guard is active
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            check(!exclusive_acquired.load(),
+                  "Test 9: Interprocess CAS Barrier blocks exclusive GC acquisition while shared reader guard is active");
+
+            // Release shared barrier guard
+            shared_guard.reset();
+            excl_thread.join();
+            check(exclusive_acquired.load(),
+                  "Test 9: Interprocess CAS Barrier allows exclusive GC acquisition after shared guard is released");
+        }
+    }
+
+    // =========================================================================
+    // SECTION 12: Protocol Edge Cases, Windows Reserved Names & Integer Overflows
+    // =========================================================================
+    {
+        // 12.1 Windows Reserved Names Rejection
+        std::string path_err;
+        check(!validate_peer_path("CON", path_err), "Stage 2 Edge: CON rejected");
+        check(!validate_peer_path("con.txt", path_err), "Stage 2 Edge: con.txt rejected");
+        check(!validate_peer_path("PRN", path_err), "Stage 2 Edge: PRN rejected");
+        check(!validate_peer_path("aux.cpp", path_err), "Stage 2 Edge: aux.cpp rejected");
+        check(!validate_peer_path("docs/NUL.bin", path_err), "Stage 2 Edge: NUL.bin rejected");
+        check(!validate_peer_path("COM1", path_err), "Stage 2 Edge: COM1 rejected");
+        check(!validate_peer_path("com9.log", path_err), "Stage 2 Edge: com9.log rejected");
+        check(!validate_peer_path("LPT1", path_err), "Stage 2 Edge: LPT1 rejected");
+        check(!validate_peer_path("src/lpt5.data", path_err), "Stage 2 Edge: lpt5.data rejected");
+
+        // 12.2 Trailing Spaces, Dots and Consecutive Slashes
+        check(!validate_peer_path("notes.txt ", path_err), "Stage 2 Edge: Trailing space rejected");
+        check(!validate_peer_path("folder/notes.", path_err), "Stage 2 Edge: Trailing dot rejected");
+        check(!validate_peer_path("a//b.txt", path_err), "Stage 2 Edge: Consecutive slashes rejected");
+        check(!validate_peer_path("folder/", path_err), "Stage 2 Edge: Trailing slash rejected");
+
+        // 12.3 Manifest Integer Overflow Rejection
+        mc::cas::FileManifest overflow_manifest;
+        overflow_manifest.set_version(1);
+        overflow_manifest.add_chunk(mc::cas::ChunkInfo{0, 10000, std::string(64, 'a')});
+        overflow_manifest.add_chunk(mc::cas::ChunkInfo{10000, 10000, std::string(64, 'b')});
+        // Craft chunk with offset near UINT64_MAX to trigger overflow detection
+        overflow_manifest.add_chunk(mc::cas::ChunkInfo{std::numeric_limits<std::uint64_t>::max() - 1000ULL, 8192, std::string(64, 'c')});
+        overflow_manifest.set_file_sha256(std::string(64, '0'));
+        std::string manifest_err;
+        check(!validate_peer_manifest(overflow_manifest, manifest_err),
+              "Stage 2 Edge: Manifest with integer overflow offset rejected");
+
+        // 12.4 SessionChunkAuthorizer Path-Scoped Hardening
+        SessionChunkAuthorizer authorizer("sess-abc-123");
+        check(authorizer.session_id() == "sess-abc-123", "Stage 2 Edge: Authorizer session ID bound");
+
+        mc::cas::FileManifest auth_manifest;
+        auth_manifest.set_version(1);
+        const std::string h_allowed(64, 'e');
+        auth_manifest.add_chunk(mc::cas::ChunkInfo{0, 4096, h_allowed});
+        auth_manifest.set_file_sha256(std::string(64, '1'));
+        authorizer.authorize_manifest("authorized/file.txt", auth_manifest);
+
+        check(authorizer.is_path_authorized("authorized/file.txt"),
+              "Stage 2 Edge: Authorized path recognized");
+        check(!authorizer.is_path_authorized("unauthorized/file.txt"),
+              "Stage 2 Edge: Unauthorized path recognized");
+
+        ChunkRequestMessage auth_req;
+        auth_req.relative_path = "authorized/file.txt";
+        auth_req.requested_hashes = {h_allowed};
+        std::string req_err;
+        check(authorizer.validate_chunk_request(auth_req, req_err),
+              "Stage 2 Edge: ChunkRequest with authorized path and hash accepted");
+
+        ChunkRequestMessage unauth_path_req;
+        unauth_path_req.relative_path = "unauthorized/file.txt";
+        unauth_path_req.requested_hashes = {h_allowed};
+        check(!authorizer.validate_chunk_request(unauth_path_req, req_err),
+              "Stage 2 Edge: ChunkRequest with unauthorized path rejected even with valid hash");
+
+        // 12.5 MissingChunksResult with Deduplication, Metrics and Corrupt Identification
+        const fs::path comp_root = test_dir / "cas_compute_store";
+        fs::create_directories(comp_root, ec);
+        mc::cas::ObjectStoreConfig comp_cfg;
+        comp_cfg.root_path = comp_root;
+        mc::cas::ObjectStore comp_store(comp_cfg);
+        std::string comp_init_err;
+        comp_store.initialize(comp_init_err);
+
+        // Put chunk 1 (valid)
+        const std::string chunk1_data(4096, 'A');
+        const std::string chunk1_hash = mc::sha256_data(chunk1_data.data(), chunk1_data.size());
+        comp_store.put_object(chunk1_data.data(), chunk1_data.size(), chunk1_hash);
+
+        // Put chunk 2 (corrupted on disk)
+        const std::string chunk2_data(4096, 'B');
+        const std::string chunk2_hash = mc::sha256_data(chunk2_data.data(), chunk2_data.size());
+        comp_store.put_object(chunk2_data.data(), chunk2_data.size(), chunk2_hash);
+        const fs::path c2_path = comp_store.object_path(chunk2_hash);
+        {
+            std::ofstream out(c2_path, std::ios::binary | std::ios::trunc);
+            out << "corrupt data for chunk 2";
+        }
+
+        // Chunk 3 is completely missing
+        const std::string chunk3_data(4096, 'C');
+        const std::string chunk3_hash = mc::sha256_data(chunk3_data.data(), chunk3_data.size());
+
+        // Manifest has chunk1, chunk2, chunk3, and duplicate chunk1 (repeated block)
+        mc::cas::FileManifest complex_manifest;
+        complex_manifest.set_version(1);
+        complex_manifest.add_chunk(mc::cas::ChunkInfo{0, 4096, chunk1_hash});
+        complex_manifest.add_chunk(mc::cas::ChunkInfo{4096, 4096, chunk2_hash});
+        complex_manifest.add_chunk(mc::cas::ChunkInfo{8192, 4096, chunk3_hash});
+        complex_manifest.add_chunk(mc::cas::ChunkInfo{12288, 4096, chunk1_hash}); // Duplicate block!
+        complex_manifest.set_file_sha256(std::string(64, '2'));
+
+        MissingChunksResult mc_res;
+        std::string mc_err;
+        check(compute_missing_chunks(complex_manifest, comp_store, mc_res, mc_err),
+              "Stage 2 Edge: compute_missing_chunks succeeds on complex manifest");
+        check(mc_res.total_chunks == 4, "Stage 2 Edge: total_chunks counts all 4 manifest chunk entries");
+        check(mc_res.valid_hashes.size() == 1 && mc_res.valid_hashes[0] == chunk1_hash,
+              "Stage 2 Edge: valid_hashes contains unique valid chunk 1");
+        check(mc_res.corrupt_hashes.size() == 1 && mc_res.corrupt_hashes[0] == chunk2_hash,
+              "Stage 2 Edge: corrupt_hashes accurately identifies corrupted chunk 2 for repair");
+        check(mc_res.missing_hashes.size() == 2 &&
+              mc_res.missing_hashes[0] == chunk2_hash &&
+              mc_res.missing_hashes[1] == chunk3_hash,
+              "Stage 2 Edge: missing_hashes contains chunk 2 (for repair) and chunk 3 (missing), with chunk 1 deduplicated");
+        check(mc_res.local_reused_bytes == 8192,
+              "Stage 2 Edge: local_reused_bytes accounts for both occurrences of chunk 1 (2 * 4096 = 8192)");
+        check(mc_res.missing_bytes == 8192,
+              "Stage 2 Edge: missing_bytes accounts for chunk 2 and chunk 3 (4096 + 4096 = 8192)");
     }
 }
 

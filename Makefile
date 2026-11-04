@@ -22,7 +22,7 @@ all: $(TARGET)
 
 $(TARGET): $(SOURCES) $(HEADERS)
 	@mkdir -p build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -s -UMERKLECHAIN_TESTING $(SOURCES) -o $@ $(LDLIBS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -UMERKLECHAIN_TESTING $(SOURCES) -o $@ $(LDLIBS)
 
 build/%.o: src/%.cpp $(HEADERS)
 	@mkdir -p build

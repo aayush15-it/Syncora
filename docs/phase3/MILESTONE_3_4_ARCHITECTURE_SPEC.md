@@ -454,3 +454,39 @@ This document represents the frozen architecture specification for Milestone 3.4
 1. **Preservation of Existing Releases**: Release tags `v0.2.0-phase2`, `v0.3.0-m3.2`, `v0.3.2-cas-integration`, and `v0.3.0-m3.3` remain completely frozen and unmodified.
 2. **Implementation Gate**: No production C++ or test code shall be modified until this revised specification has been reviewed and committed.
 3. **Commit SHA Verification**: The specification commit SHA must be reported and verified against a clean working tree.
+
+---
+
+## 12. Stage 1 & Stage 2 Implementation Addendum: Integrity-Aware Availability & Hardening
+
+### 12.1 Integrity-Aware Object Availability
+Stage 2 missing chunk computation previously relied on filesystem existence checks (`has_object()`), leaving the receiver vulnerable to assuming corrupted, zero-byte, or bit-rotted chunks were valid and reusable.
+
+The engine has been hardened with a 5-state availability model:
+- `ObjectAvailability::AvailableValid`: Object exists, byte count matches expected size, and computed SHA-256 matches exact claimed chunk hash.
+- `ObjectAvailability::Missing`: Object does not exist physically in CAS storage.
+- `ObjectAvailability::Corrupt`: Object file exists but byte size is mismatched or cryptographic SHA-256 differs from claimed chunk hash.
+- `ObjectAvailability::InvalidHash`: Hash string is malformed (non-hex characters, uppercase, length $\ne 64$, directory traversal attempt).
+- `ObjectAvailability::IoError`: Filesystem error (permissions, disk failure, transient sharing violation). Fails closed immediately.
+
+### 12.2 Atomic In-Place Object Repair Semantics
+To eliminate the window of vulnerability where a corrupted chunk was deleted before writing its replacement:
+1. Upfront deletion of destination files (`fs::remove(dest_path)`) is strictly eliminated.
+2. Incoming repair chunks are staged to uniquely registered temporary files (`obj_tmp_<pid>_<ms>_<ns>_<rand>.tmp`) inside `.tmp/`.
+3. Staged files are cryptographically verified in `.tmp/` before promotion.
+4. Promotion uses atomic filesystem replacement (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` on Windows; `rename` on POSIX) via `atomic_replace_file()`.
+5. If staging or verification fails, the existing file is left untouched. Failed repair attempts cannot destroy or corrupt valid data.
+
+### 12.3 Strict Concurrency & Lock Hierarchy
+All CAS operations observe the strict multi-level lock hierarchy:
+$$\text{OperationGuard} \longrightarrow \text{InterprocessCasBarrier (Shared)} \longrightarrow \text{workspace\_mutex\_} \longrightarrow \text{db\_mutex\_}$$
+- Normal CAS operations (peer chunk serving, chunk ingestion, verification, repair, and reconstruction) acquire `CasSharedBarrierGuard`.
+- Background Garbage Collection (`run_gc()`) acquires `CasExclusiveBarrierGuard`.
+- Multiple reader and repair threads can execute concurrently under the shared barrier while completely excluding concurrent GC sweeps.
+
+### 12.4 Manifest & Protocol Hardening
+- **Windows Reserved Device Names**: Paths containing reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, with or without file extensions) are strictly rejected by `validate_peer_path()`.
+- **Segment Sanitization**: Trailing dots, trailing spaces, consecutive slashes (`//`), and trailing slashes are rejected.
+- **64-bit Integer Overflow**: Manifest chunk offsets and total file sizes are checked against integer overflow during FastCDC accumulation.
+- **Path-Scoped Session Authorization**: `SessionChunkAuthorizer` binds authorized relative paths and chunk hashes to active session identifiers, preventing cross-path and unadvertised CAS chunk probing.
+

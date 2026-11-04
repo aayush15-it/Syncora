@@ -23,6 +23,25 @@ enum class CasFaultPointForTesting {
 void set_cas_fault_point_for_testing(CasFaultPointForTesting point);
 CasFaultPointForTesting get_cas_fault_point_for_testing();
 
+enum class ObjectAvailability {
+    AvailableValid,
+    Missing,
+    Corrupt,
+    InvalidHash,
+    IoError
+};
+
+struct ObjectStatus {
+    ObjectAvailability availability{ObjectAvailability::Missing};
+    std::uintmax_t size{0};
+    std::string actual_hash;
+    std::string error;
+
+    bool is_available_and_valid() const noexcept {
+        return availability == ObjectAvailability::AvailableValid;
+    }
+};
+
 struct ObjectStoreConfig {
     fs::path root_path;
     bool verify_on_write{true};
@@ -61,6 +80,14 @@ public:
 
     // Check if an object exists in store and is a valid regular file
     bool has_object(const ChunkHash& hash) const;
+
+    // Cryptographically verifies stored object integrity and returns 5-state ObjectStatus.
+    // If expected_size > 0, checks file size first before hashing.
+    ObjectStatus verify_object(const ChunkHash& hash, std::uintmax_t expected_size = 0) const;
+
+    // Repairs or stores an object atomically without any deletion gap.
+    // Writes to a unique temp file, verifies integrity, and atomically moves/replaces destination.
+    PutResult repair_object(const void* data, std::size_t size, const std::string& expected_hash = "");
 
     // Retrieve object bytes. If verify_on_read is set, validates SHA-256 before returning.
     bool get_object(const ChunkHash& hash, std::vector<std::uint8_t>& out_data) const;
