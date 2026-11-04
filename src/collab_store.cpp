@@ -563,6 +563,24 @@ void CollabStore::init_schema() {
         );
         CREATE INDEX IF NOT EXISTS idx_manifest_chunks_hash ON version_manifest_chunks(chunk_hash);
         CREATE INDEX IF NOT EXISTS idx_manifest_chunks_man ON version_manifest_chunks(manifest_id);
+
+        -- Milestone 3.3: Content-Addressed Storage (CAS) Garbage Collection Journal
+        CREATE TABLE IF NOT EXISTS cas_gc_log (
+            gc_id TEXT PRIMARY KEY,
+            started_at_ms INTEGER NOT NULL,
+            finished_at_ms INTEGER NOT NULL DEFAULT 0,
+            dry_run INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            scanned_count INTEGER NOT NULL DEFAULT 0,
+            referenced_count INTEGER NOT NULL DEFAULT 0,
+            candidate_count INTEGER NOT NULL DEFAULT 0,
+            deleted_count INTEGER NOT NULL DEFAULT 0,
+            reclaimed_bytes INTEGER NOT NULL DEFAULT 0,
+            drift_reconciled_count INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_cas_gc_log_time ON cas_gc_log(started_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_cas_gc_log_state ON cas_gc_log(state);
     )";
     execute_sql(schema);
 }
@@ -1845,11 +1863,89 @@ void CollabStore::recover_incomplete_operations() {
         auto ws_lock = get_workspace_lock(ws.id);
         scan_and_reconcile_orphaned_directories(ws.id);
     }
+
+    // Milestone 3.3: Recover any interrupted CAS garbage collection sweep
+    {
+        std::unique_lock<std::shared_mutex> cas_lock(cas_barrier_);
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+
+        // 1. Check for chunks left in PENDING_SWEEP state
+        const char* sql_pending = R"(
+            SELECT c.chunk_hash, COUNT(vmc.chunk_hash)
+            FROM cas_chunks c
+            LEFT JOIN version_manifest_chunks vmc ON c.chunk_hash = vmc.chunk_hash
+            WHERE c.storage_state = 'PENDING_SWEEP'
+            GROUP BY c.chunk_hash
+        )";
+        sqlite3_stmt* stmt = stmt_registry_.prepare(db_, sql_pending);
+        if (stmt) {
+            std::vector<std::pair<std::string, int>> pending_items;
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                std::string h = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                int ref_cnt = sqlite3_column_int(stmt, 1);
+                pending_items.emplace_back(std::move(h), ref_cnt);
+            }
+            stmt_registry_.finalize(stmt);
+
+            for (const auto& [hash, live_refs] : pending_items) {
+                if (live_refs > 0) {
+                    // Resurrect: manifest references this chunk!
+                    // Mandatory Condition: Never resurrect a catalog entry without verifying its physical CAS object.
+                    if (cas_store_->has_object(hash)) {
+                        const char* sql_res = "UPDATE cas_chunks SET storage_state = 'COMMITTED', reference_count = ? WHERE chunk_hash = ?";
+                        sqlite3_stmt* rstmt = stmt_registry_.prepare(db_, sql_res);
+                        if (rstmt) {
+                            sqlite3_bind_int64(rstmt, 1, live_refs);
+                            sqlite3_bind_text(rstmt, 2, hash.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_step(rstmt);
+                            stmt_registry_.finalize(rstmt);
+                        }
+                    } else {
+                        // Physical chunk missing! Mark as CORRUPTED_MISSING so reference integrity audit detects and flags it
+                        const char* sql_corrupt = "UPDATE cas_chunks SET storage_state = 'CORRUPTED_MISSING', reference_count = ? WHERE chunk_hash = ?";
+                        sqlite3_stmt* cstmt = stmt_registry_.prepare(db_, sql_corrupt);
+                        if (cstmt) {
+                            sqlite3_bind_int64(cstmt, 1, live_refs);
+                            sqlite3_bind_text(cstmt, 2, hash.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_step(cstmt);
+                            stmt_registry_.finalize(cstmt);
+                        }
+                    }
+                } else {
+                    // Idempotent physical unlink
+                    std::string rm_err;
+                    cas_store_->remove_object(hash, rm_err);
+
+                    // Delete catalog row
+                    const char* sql_del = "DELETE FROM cas_chunks WHERE chunk_hash = ? AND storage_state = 'PENDING_SWEEP'";
+                    sqlite3_stmt* dstmt = stmt_registry_.prepare(db_, sql_del);
+                    if (dstmt) {
+                        sqlite3_bind_text(dstmt, 1, hash.c_str(), -1, SQLITE_STATIC);
+                        sqlite3_step(dstmt);
+                        stmt_registry_.finalize(dstmt);
+                    }
+                }
+            }
+        }
+
+        // 2. Mark any unfinished cas_gc_log sessions as ABORTED_RECOVERED
+        const char* sql_log_abort = "UPDATE cas_gc_log SET state = 'ABORTED_RECOVERED', finished_at_ms = ? WHERE state IN ('INITIATED', 'PHASE1_MARKED', 'PHASE2_UNLINKING')";
+        sqlite3_stmt* lstmt = stmt_registry_.prepare(db_, sql_log_abort);
+        if (lstmt) {
+            sqlite3_bind_int64(lstmt, 1, now_ms());
+            sqlite3_step(lstmt);
+            stmt_registry_.finalize(lstmt);
+        }
+
+        // 3. Clean abandoned temp files from crashed processes
+        cas_store_->clean_temp_directory(0ULL);
+    }
 }
 
 
 bool CollabStore::accept_submission(const std::string& sub_id, const std::string& reviewer_id, const std::string& notes) {
     OperationGuard op_guard(*this);
+    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
 
     // 1. Retrieve workspace ID under db_mutex_
     std::string ws_id;
@@ -2388,6 +2484,7 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
                                                    const std::string& title,
                                                    const std::string& release_notes) {
     OperationGuard op_guard(*this);
+    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
 
     // 1. Resolve workspace ID under db_mutex_
     std::string actual_ws_id = workspace_id;
@@ -2659,7 +2756,7 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
                         const char* ref_sql = R"(
                             INSERT INTO cas_chunks (chunk_hash, chunk_size, reference_count, created_at_ms, verified_at_ms, storage_state)
                             VALUES (?, ?, 1, ?, ?, 'COMMITTED')
-                            ON CONFLICT(chunk_hash) DO UPDATE SET reference_count = reference_count + 1, verified_at_ms = ?
+                            ON CONFLICT(chunk_hash) DO UPDATE SET reference_count = reference_count + 1, verified_at_ms = ?, storage_state = 'COMMITTED'
                         )";
                         ref_stmt = stmt_registry_.prepare(db_, ref_sql);
                         if (!ref_stmt) throw std::runtime_error("failed to prepare cas_chunks upsert");
@@ -2897,6 +2994,99 @@ std::optional<CollabPublishedVersion> CollabStore::find_version_by_id(const std:
     if (!ver || ver->workspace_id != ws_id) return std::nullopt;
 
     return ver;
+}
+
+bool CollabStore::prune_version(const std::string& version_id, std::string& error_out) {
+    OperationGuard op_guard(*this);
+    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
+
+    // 1. Resolve workspace ID under db_mutex_
+    std::string ws_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ver = find_version_by_id_nolock(version_id);
+        if (!ver) {
+            error_out = "Version not found: " + version_id;
+            return false;
+        }
+        ws_id = ver->workspace_id;
+    }
+
+    // 2. Acquire workspace lock
+    auto ws_lock = get_workspace_lock(ws_id);
+
+    // 3. Find chunks referenced by this version and decrement under db_mutex_
+    std::vector<std::string> chunks_to_decrement;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ver_check = find_version_by_id_nolock(version_id);
+        if (!ver_check) {
+            error_out = "Version not found: " + version_id;
+            return false;
+        }
+
+        const char* sql_find_chunks = R"(
+            SELECT DISTINCT vmc.chunk_hash
+            FROM version_manifest_chunks vmc
+            JOIN version_manifests vm ON vmc.manifest_id = vm.manifest_id
+            WHERE vm.version_id = ?
+        )";
+        sqlite3_stmt* stmt = stmt_registry_.prepare(db_, sql_find_chunks);
+        if (stmt) {
+            sqlite3_bind_text(stmt, 1, version_id.c_str(), -1, SQLITE_STATIC);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                chunks_to_decrement.push_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+            }
+            stmt_registry_.finalize(stmt);
+        }
+
+        // 4. In atomic transaction, decrement references and delete published_version row
+        execute_sql("BEGIN IMMEDIATE;");
+        try {
+            // Decrement references in cas_chunks
+            const char* sql_dec = "UPDATE cas_chunks SET reference_count = reference_count - 1 WHERE chunk_hash = ?";
+            sqlite3_stmt* dec_stmt = stmt_registry_.prepare(db_, sql_dec);
+            if (!dec_stmt) throw std::runtime_error("failed to prepare chunk decrement: " + std::string(sqlite3_errmsg(db_)));
+            for (const auto& ch : chunks_to_decrement) {
+                sqlite3_bind_text(dec_stmt, 1, ch.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(dec_stmt) != SQLITE_DONE) {
+                    std::string err = sqlite3_errmsg(db_);
+                    stmt_registry_.finalize(dec_stmt);
+                    throw std::runtime_error("failed to decrement chunk reference for " + ch + ": " + err);
+                }
+                sqlite3_reset(dec_stmt);
+                sqlite3_clear_bindings(dec_stmt);
+            }
+            stmt_registry_.finalize(dec_stmt);
+
+            // Delete published_version (foreign keys cascade to version_manifests and version_manifest_chunks)
+            const char* sql_del = "DELETE FROM published_versions WHERE id = ?";
+            sqlite3_stmt* del_stmt = stmt_registry_.prepare(db_, sql_del);
+            if (!del_stmt) throw std::runtime_error("failed to prepare version delete: " + std::string(sqlite3_errmsg(db_)));
+            sqlite3_bind_text(del_stmt, 1, version_id.c_str(), -1, SQLITE_STATIC);
+            if (sqlite3_step(del_stmt) != SQLITE_DONE) {
+                std::string err = sqlite3_errmsg(db_);
+                stmt_registry_.finalize(del_stmt);
+                throw std::runtime_error("failed to delete version row: " + err);
+            }
+            stmt_registry_.finalize(del_stmt);
+
+            execute_sql("COMMIT;");
+        } catch (const std::exception& e) {
+            execute_sql("ROLLBACK;");
+            error_out = "Version pruning transaction failed: " + std::string(e.what());
+            return false;
+        }
+    }
+
+    // 5. Delete physical version snapshot directory on disk (outside db_mutex_)
+    std::error_code ec;
+    const fs::path ver_dir = base_storage_dir_ / "workspaces" / ws_id / "versions" / version_id;
+    if (fs::exists(ver_dir, ec)) {
+        fs::remove_all(ver_dir, ec);
+    }
+
+    return true;
 }
 
 std::vector<CollabClientUpdate> CollabStore::list_updates_for_client(const std::string& client_id) {
@@ -3266,6 +3456,7 @@ bool CollabStore::reconstruct_version(const std::string& version_id,
                                       const fs::path& destination_dir,
                                       std::string& error_out) {
     OperationGuard op_guard(*this);
+    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
 
     std::string expected_merkle_root;
     std::string ws_id;
@@ -3384,6 +3575,7 @@ bool CollabStore::reconstruct_version(const std::string& version_id,
 std::vector<cas::FileManifest> CollabStore::get_version_manifests(const std::string& version_id,
                                                                  std::string& error_out) {
     OperationGuard op_guard(*this);
+    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
     std::vector<std::vector<std::uint8_t>> blobs;
     {
         std::lock_guard<std::mutex> db_lock(db_mutex_);
@@ -3422,6 +3614,7 @@ std::vector<cas::FileManifest> CollabStore::get_version_manifests(const std::str
 
 std::size_t CollabStore::get_chunk_reference_count(const std::string& chunk_hash) {
     OperationGuard op_guard(*this);
+    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
     std::lock_guard<std::mutex> db_lock(db_mutex_);
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "SELECT reference_count FROM cas_chunks WHERE chunk_hash = ?";
@@ -3438,6 +3631,7 @@ std::size_t CollabStore::get_chunk_reference_count(const std::string& chunk_hash
 
 bool CollabStore::audit_cas_reference_integrity(std::string& error_out) {
     OperationGuard op_guard(*this);
+    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
     std::lock_guard<std::mutex> db_lock(db_mutex_);
 
     // Check for negative reference counts
@@ -3525,6 +3719,375 @@ bool CollabStore::audit_cas_reference_integrity(std::string& error_out) {
     }
 
     return true;
+}
+
+bool CollabStore::reconcile_cas_reference_counts(std::size_t& out_reconciled_count, std::string& error_out) {
+    OperationGuard op_guard(*this);
+    std::unique_lock<std::shared_mutex> cas_lock(cas_barrier_);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+
+    out_reconciled_count = 0;
+    error_out.clear();
+
+    // 1. Identify all chunks where reference_count != actual manifest occurrences or reference_count < 0
+    const char* sql_find_drift = R"(
+        SELECT c.chunk_hash, c.reference_count, COUNT(vmc.chunk_hash)
+        FROM cas_chunks c
+        LEFT JOIN version_manifest_chunks vmc ON c.chunk_hash = vmc.chunk_hash
+        GROUP BY c.chunk_hash
+        HAVING c.reference_count != COUNT(vmc.chunk_hash) OR c.reference_count < 0
+    )";
+    sqlite3_stmt* stmt = stmt_registry_.prepare(db_, sql_find_drift);
+    if (!stmt) {
+        error_out = "Failed to prepare reference drift query: " + std::string(sqlite3_errmsg(db_));
+        return false;
+    }
+
+    std::vector<std::pair<std::string, int>> drifted_chunks;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        std::string h = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        int actual_count = sqlite3_column_int(stmt, 2);
+        drifted_chunks.emplace_back(std::move(h), actual_count);
+    }
+    stmt_registry_.finalize(stmt);
+
+    if (drifted_chunks.empty()) {
+        return true; // Zero drift
+    }
+
+    // 2. Perform atomic batch update to heal all drifted reference counts
+    execute_sql("BEGIN IMMEDIATE;");
+    try {
+        const char* sql_update = "UPDATE cas_chunks SET reference_count = ?, verified_at_ms = ? WHERE chunk_hash = ?";
+        sqlite3_stmt* update_stmt = stmt_registry_.prepare(db_, sql_update);
+        if (!update_stmt) {
+            throw std::runtime_error("Failed to prepare reference update: " + std::string(sqlite3_errmsg(db_)));
+        }
+
+        const auto now_ts = now_ms();
+        for (const auto& [hash, actual_count] : drifted_chunks) {
+            sqlite3_bind_int64(update_stmt, 1, actual_count);
+            sqlite3_bind_int64(update_stmt, 2, now_ts);
+            sqlite3_bind_text(update_stmt, 3, hash.c_str(), -1, SQLITE_STATIC);
+            if (sqlite3_step(update_stmt) != SQLITE_DONE) {
+                std::string err = sqlite3_errmsg(db_);
+                stmt_registry_.finalize(update_stmt);
+                throw std::runtime_error("Failed to update drifted chunk " + hash + ": " + err);
+            }
+            sqlite3_reset(update_stmt);
+            sqlite3_clear_bindings(update_stmt);
+        }
+        stmt_registry_.finalize(update_stmt);
+        execute_sql("COMMIT;");
+        out_reconciled_count = drifted_chunks.size();
+    } catch (const std::exception& e) {
+        execute_sql("ROLLBACK;");
+        error_out = "Reconciliation aborted: " + std::string(e.what());
+        return false;
+    }
+
+    return true;
+}
+
+GcReport CollabStore::gc_dry_run(std::uint64_t grace_period_ms) {
+    GcOptions opts;
+    opts.dry_run = true;
+    opts.grace_period_ms = grace_period_ms;
+    opts.reconcile_reference_drift = false;
+    opts.sweep_physical_orphans = true;
+    return garbage_collect(opts);
+}
+
+GcReport CollabStore::garbage_collect(const GcOptions& options) {
+    OperationGuard op_guard(*this);
+    std::unique_lock<std::shared_mutex> cas_lock(cas_barrier_);
+
+    const auto start_ts = now_ms();
+    GcReport report;
+    report.dry_run = options.dry_run;
+    report.grace_period_ms = options.grace_period_ms;
+    report.started_at_ms = start_ts;
+
+    const std::string gc_id = "gc_" + generate_random_token(10);
+    const auto cutoff_ts = start_ts - static_cast<std::int64_t>(options.grace_period_ms);
+
+    // Step 0: If requested and not a dry run, heal reference count drift first
+    if (!options.dry_run && options.reconcile_reference_drift) {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const char* sql_find_drift = R"(
+            SELECT c.chunk_hash, c.reference_count, COUNT(vmc.chunk_hash)
+            FROM cas_chunks c
+            LEFT JOIN version_manifest_chunks vmc ON c.chunk_hash = vmc.chunk_hash
+            GROUP BY c.chunk_hash
+            HAVING c.reference_count != COUNT(vmc.chunk_hash) OR c.reference_count < 0
+        )";
+        sqlite3_stmt* stmt = stmt_registry_.prepare(db_, sql_find_drift);
+        if (stmt) {
+            std::vector<std::pair<std::string, int>> drifted;
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                std::string h = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                int actual = sqlite3_column_int(stmt, 2);
+                drifted.emplace_back(std::move(h), actual);
+            }
+            stmt_registry_.finalize(stmt);
+
+            if (!drifted.empty()) {
+                execute_sql("BEGIN IMMEDIATE;");
+                try {
+                    const char* sql_update = "UPDATE cas_chunks SET reference_count = ?, verified_at_ms = ? WHERE chunk_hash = ?";
+                    sqlite3_stmt* update_stmt = stmt_registry_.prepare(db_, sql_update);
+                    if (update_stmt) {
+                        for (const auto& [hash, actual_count] : drifted) {
+                            sqlite3_bind_int64(update_stmt, 1, actual_count);
+                            sqlite3_bind_int64(update_stmt, 2, start_ts);
+                            sqlite3_bind_text(update_stmt, 3, hash.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_step(update_stmt);
+                            sqlite3_reset(update_stmt);
+                            sqlite3_clear_bindings(update_stmt);
+                        }
+                        stmt_registry_.finalize(update_stmt);
+                        execute_sql("COMMIT;");
+                        report.reconciled_drift_chunks = drifted.size();
+                    } else {
+                        execute_sql("ROLLBACK;");
+                    }
+                } catch (...) {
+                    execute_sql("ROLLBACK;");
+                }
+            }
+        }
+    }
+
+    struct CandidateItem {
+        std::string hash;
+        std::uintmax_t size;
+        std::int64_t created_at_ms;
+    };
+    std::vector<CandidateItem> candidates_to_sweep;
+    std::unordered_set<std::string> catalog_hashes;
+
+    // Phase 1: Mark & Catalog Scan (under db_mutex_)
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+
+        const char* sql_scan = "SELECT chunk_hash, chunk_size, reference_count, created_at_ms, storage_state FROM cas_chunks";
+        sqlite3_stmt* stmt = stmt_registry_.prepare(db_, sql_scan);
+        if (!stmt) {
+            report.success = false;
+            report.error = "Failed to scan cas_chunks: " + std::string(sqlite3_errmsg(db_));
+            report.finished_at_ms = now_ms();
+            report.duration_ms = report.finished_at_ms - report.started_at_ms;
+            return report;
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string h = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            auto sz = static_cast<std::uintmax_t>(sqlite3_column_int64(stmt, 1));
+            int ref_cnt = sqlite3_column_int(stmt, 2);
+            auto created_ms = sqlite3_column_int64(stmt, 3);
+
+            catalog_hashes.insert(h);
+            report.total_chunks_cataloged++;
+            report.total_bytes_scanned += sz;
+
+            if (ref_cnt > 0) {
+                report.active_referenced_chunks++;
+                report.active_bytes += sz;
+            } else {
+                // Zero references
+                if (created_ms >= cutoff_ts) {
+                    report.chunks_in_grace_period_exempt++;
+                    report.skipped_grace_hashes.push_back(h);
+                } else {
+                    report.unreferenced_candidates++;
+                    report.reclaimable_bytes += sz;
+                    report.candidate_hashes.push_back(h);
+                    candidates_to_sweep.push_back({h, sz, created_ms});
+                }
+            }
+        }
+        stmt_registry_.finalize(stmt);
+
+        // If live run and candidates exist, mark them as PENDING_SWEEP in SQLite
+        if (!options.dry_run && !candidates_to_sweep.empty()) {
+            trigger_collab_fault_point(CollabFaultPoint::FailGcBeforeSweepMark, "FailGcBeforeSweepMark");
+            execute_sql("BEGIN IMMEDIATE;");
+            try {
+                const char* sql_mark = "UPDATE cas_chunks SET storage_state = 'PENDING_SWEEP' WHERE chunk_hash = ?";
+                sqlite3_stmt* mark_stmt = stmt_registry_.prepare(db_, sql_mark);
+                if (mark_stmt) {
+                    for (const auto& c : candidates_to_sweep) {
+                        sqlite3_bind_text(mark_stmt, 1, c.hash.c_str(), -1, SQLITE_STATIC);
+                        sqlite3_step(mark_stmt);
+                        sqlite3_reset(mark_stmt);
+                        sqlite3_clear_bindings(mark_stmt);
+                    }
+                    stmt_registry_.finalize(mark_stmt);
+                }
+
+                // Log initiated state in cas_gc_log
+                const char* sql_log = R"(
+                    INSERT INTO cas_gc_log (gc_id, started_at_ms, dry_run, state, scanned_count, referenced_count, candidate_count)
+                    VALUES (?, ?, 0, 'PHASE1_MARKED', ?, ?, ?)
+                )";
+                sqlite3_stmt* log_stmt = stmt_registry_.prepare(db_, sql_log);
+                if (log_stmt) {
+                    sqlite3_bind_text(log_stmt, 1, gc_id.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_int64(log_stmt, 2, start_ts);
+                    sqlite3_bind_int64(log_stmt, 3, static_cast<sqlite3_int64>(report.total_chunks_cataloged));
+                    sqlite3_bind_int64(log_stmt, 4, static_cast<sqlite3_int64>(report.active_referenced_chunks));
+                    sqlite3_bind_int64(log_stmt, 5, static_cast<sqlite3_int64>(report.unreferenced_candidates));
+                    sqlite3_step(log_stmt);
+                    stmt_registry_.finalize(log_stmt);
+                }
+                execute_sql("COMMIT;");
+            } catch (const std::exception& e) {
+                execute_sql("ROLLBACK;");
+                report.success = false;
+                report.error = "Failed to mark PENDING_SWEEP candidates: " + std::string(e.what());
+                report.finished_at_ms = now_ms();
+                report.duration_ms = report.finished_at_ms - report.started_at_ms;
+                return report;
+            }
+        }
+    }
+
+    // Phase 2: Physical Unlinking / Filesystem Sweeping (db_mutex_ RELEASED, cas_barrier_ HELD)
+    if (!options.dry_run) {
+        // Unlink candidate chunks physically
+        std::size_t unlinked_so_far = 0;
+        for (const auto& c : candidates_to_sweep) {
+            std::string rm_err;
+            if (cas_store_->remove_object(c.hash, rm_err)) {
+                report.chunks_deleted++;
+                report.reclaimed_bytes += c.size;
+                report.deleted_hashes.push_back(c.hash);
+                unlinked_so_far++;
+                if (unlinked_so_far == 1 && candidates_to_sweep.size() > 1) {
+                    trigger_collab_fault_point(CollabFaultPoint::FailGcMidUnlinking, "FailGcMidUnlinking");
+                }
+            } else {
+                report.failed_deletions++;
+            }
+        }
+
+        // Purge physical orphans if requested
+        if (options.sweep_physical_orphans) {
+            std::string list_err;
+            auto on_disk = cas_store_->list_all_objects(&list_err);
+            for (const auto& disk_hash : on_disk) {
+                if (catalog_hashes.find(disk_hash) == catalog_hashes.end()) {
+                    trigger_collab_fault_point(CollabFaultPoint::FailGcDuringOrphanScan, "FailGcDuringOrphanScan");
+                    // Not in database catalog! Check file modification time vs cutoff
+                    auto p = cas_store_->object_path(disk_hash);
+                    std::error_code ec;
+                    auto ftime = fs::last_write_time(p, ec);
+                    if (!ec) {
+                        auto sftime = std::chrono::time_point_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now() + (ftime - fs::file_time_type::clock::now()));
+                        auto mtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            sftime.time_since_epoch()).count();
+                        if (mtime_ms < cutoff_ts) {
+                            auto fsz = cas_store_->object_size(disk_hash);
+                            std::string rm_err;
+                            if (cas_store_->remove_object(disk_hash, rm_err)) {
+                                report.physical_orphans_found++;
+                                report.reclaimed_bytes += fsz;
+                                report.orphan_file_paths.push_back(disk_hash);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clean stale temporary files
+        cas_store_->clean_temp_directory(options.grace_period_ms);
+    } else {
+        // DRY RUN: Scan physical orphans without mutating anything
+        if (options.sweep_physical_orphans) {
+            std::string list_err;
+            auto on_disk = cas_store_->list_all_objects(&list_err);
+            for (const auto& disk_hash : on_disk) {
+                if (catalog_hashes.find(disk_hash) == catalog_hashes.end()) {
+                    auto p = cas_store_->object_path(disk_hash);
+                    std::error_code ec;
+                    auto ftime = fs::last_write_time(p, ec);
+                    if (!ec) {
+                        auto sftime = std::chrono::time_point_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now() + (ftime - fs::file_time_type::clock::now()));
+                        auto mtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            sftime.time_since_epoch()).count();
+                        if (mtime_ms < cutoff_ts) {
+                            auto fsz = cas_store_->object_size(disk_hash);
+                            report.physical_orphans_found++;
+                            report.reclaimable_bytes += fsz;
+                            report.orphan_file_paths.push_back(disk_hash);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 3: Catalog Cleanup & Audit Finalization (under db_mutex_)
+    if (!options.dry_run) {
+        trigger_collab_fault_point(CollabFaultPoint::FailGcBeforeSweepCommit, "FailGcBeforeSweepCommit");
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        execute_sql("BEGIN IMMEDIATE;");
+        try {
+            // Delete deleted candidates from cas_chunks
+            const char* sql_del = "DELETE FROM cas_chunks WHERE chunk_hash = ? AND storage_state = 'PENDING_SWEEP'";
+            sqlite3_stmt* del_stmt = stmt_registry_.prepare(db_, sql_del);
+            if (del_stmt) {
+                for (const auto& h : report.deleted_hashes) {
+                    sqlite3_bind_text(del_stmt, 1, h.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_step(del_stmt);
+                    sqlite3_reset(del_stmt);
+                    sqlite3_clear_bindings(del_stmt);
+                }
+                stmt_registry_.finalize(del_stmt);
+            }
+
+            // Restore any failed deletions back to COMMITTED so catalog accurately reflects disk presence
+            if (report.failed_deletions > 0) {
+                execute_sql("UPDATE cas_chunks SET storage_state = 'COMMITTED' WHERE storage_state = 'PENDING_SWEEP';");
+            }
+
+            // Update cas_gc_log entry
+            const char* sql_log_done = R"(
+                UPDATE cas_gc_log
+                SET finished_at_ms = ?, state = 'COMPLETED', deleted_count = ?, reclaimed_bytes = ?, drift_reconciled_count = ?
+                WHERE gc_id = ?
+            )";
+            sqlite3_stmt* done_stmt = stmt_registry_.prepare(db_, sql_log_done);
+            if (done_stmt) {
+                const auto finish_ts = now_ms();
+                sqlite3_bind_int64(done_stmt, 1, finish_ts);
+                sqlite3_bind_int64(done_stmt, 2, static_cast<sqlite3_int64>(report.chunks_deleted));
+                sqlite3_bind_int64(done_stmt, 3, static_cast<sqlite3_int64>(report.reclaimed_bytes));
+                sqlite3_bind_int64(done_stmt, 4, static_cast<sqlite3_int64>(report.reconciled_drift_chunks));
+                sqlite3_bind_text(done_stmt, 5, gc_id.c_str(), -1, SQLITE_STATIC);
+                sqlite3_step(done_stmt);
+                stmt_registry_.finalize(done_stmt);
+            }
+
+            execute_sql("COMMIT;");
+        } catch (const std::exception& e) {
+            execute_sql("ROLLBACK;");
+            report.success = false;
+            report.error = "Failed to commit catalog cleanup: " + std::string(e.what());
+            report.finished_at_ms = now_ms();
+            report.duration_ms = report.finished_at_ms - report.started_at_ms;
+            return report;
+        }
+    }
+
+    report.finished_at_ms = now_ms();
+    report.duration_ms = report.finished_at_ms - report.started_at_ms;
+    report.success = true;
+
+    return report;
 }
 
 } // namespace mc

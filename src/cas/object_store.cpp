@@ -9,6 +9,7 @@
 #include <array>
 #include <sstream>
 #include <thread>
+#include <csignal>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -20,6 +21,16 @@ namespace mc::cas {
 
 namespace {
 std::atomic<CasFaultPointForTesting> g_cas_fault_point{CasFaultPointForTesting::None};
+
+std::vector<std::string> split_str(const std::string& s, char delim) {
+    std::vector<std::string> tokens;
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, delim)) {
+        tokens.push_back(item);
+    }
+    return tokens;
+}
 
 bool atomic_replace_file(const fs::path& src, const fs::path& dst, std::string& err) {
 #ifdef _WIN32
@@ -77,9 +88,41 @@ bool ObjectStore::initialize(std::string& err) {
         return false;
     }
 
-    // Clean any lingering temp files from previous process runs or crashes
-    clean_temp_directory(&err);
+    // Clean any lingering temp files from previous process runs or crashes (0 age = only dead processes)
+    clean_temp_directory(0, &err);
     return true;
+}
+
+bool ObjectStore::is_process_alive(unsigned long pid) {
+    if (pid == 0) return false;
+#ifdef _WIN32
+    if (pid == ::GetCurrentProcessId()) return true;
+    HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    DWORD exit_code = 0;
+    BOOL ok = ::GetExitCodeProcess(h, &exit_code);
+    ::CloseHandle(h);
+    return (ok && exit_code == STILL_ACTIVE);
+#else
+    if (pid == static_cast<unsigned long>(::getpid())) return true;
+    if (::kill(static_cast<pid_t>(pid), 0) == 0) return true;
+    return (errno == EPERM);
+#endif
+}
+
+void ObjectStore::register_active_temp(const fs::path& p) {
+    std::lock_guard<std::mutex> lk(temp_registry_mutex_);
+    active_temp_paths_.insert(p.string());
+}
+
+void ObjectStore::unregister_active_temp(const fs::path& p) {
+    std::lock_guard<std::mutex> lk(temp_registry_mutex_);
+    active_temp_paths_.erase(p.string());
+}
+
+bool ObjectStore::is_active_temp(const fs::path& p) const {
+    std::lock_guard<std::mutex> lk(temp_registry_mutex_);
+    return active_temp_paths_.find(p.string()) != active_temp_paths_.end();
 }
 
 fs::path ObjectStore::object_path(const ChunkHash& hash) const {
@@ -91,20 +134,24 @@ fs::path ObjectStore::object_path(const ChunkHash& hash) const {
     return objects_dir_ / prefix / hash;
 }
 
-fs::path ObjectStore::generate_temp_path() const {
+fs::path ObjectStore::generate_temp_path() {
 #ifdef _WIN32
     const unsigned long pid = ::GetCurrentProcessId();
 #else
-    const auto pid = ::getpid();
+    const auto pid = static_cast<unsigned long>(::getpid());
 #endif
-    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     std::array<unsigned char, 8> rand_bytes{};
     if (RAND_bytes(rand_bytes.data(), static_cast<int>(rand_bytes.size())) != 1) {
         // Fallback to random device
         std::random_device rd;
         for (auto& b : rand_bytes) b = static_cast<unsigned char>(rd() & 0xFF);
     }
-    return tmp_dir_ / ("obj_tmp_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + mc::to_hex(rand_bytes.data(), rand_bytes.size()) + ".tmp");
+    const fs::path p = tmp_dir_ / ("obj_tmp_" + std::to_string(pid) + "_" + std::to_string(now_ms) + "_" + std::to_string(now_ns) + "_" + mc::to_hex(rand_bytes.data(), rand_bytes.size()) + ".tmp");
+    register_active_temp(p);
+    return p;
 }
 
 bool ObjectStore::has_object(const ChunkHash& hash) const {
@@ -160,15 +207,13 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
                 const std::string existing_hash = mc::sha256_file(target, &existing_bytes);
                 if (existing_hash == actual_hash && existing_bytes == size) {
                     return true;
-                } else {
-                    out_confirmed_corrupt = true;
-                    return false;
                 }
             } catch (const std::exception&) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        return true;
+        out_confirmed_corrupt = true;
+        return false;
     };
 
     bool is_corrupt = false;
@@ -183,6 +228,18 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
 
     // Write object through a unique temporary file on the same filesystem
     const fs::path tmp_path = generate_temp_path();
+    struct ActiveTempGuard {
+        ObjectStore& store;
+        fs::path p;
+        bool promoted{false};
+        ~ActiveTempGuard() {
+            store.unregister_active_temp(p);
+            if (!promoted) {
+                std::error_code rm_ec;
+                fs::remove(p, rm_ec);
+            }
+        }
+    } temp_guard{*this, tmp_path};
     {
         std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
         if (!out) {
@@ -204,7 +261,6 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
             out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
             out.flush();
             if (!out) {
-                fs::remove(tmp_path, ec);
                 return {PutResultStatus::IoError, actual_hash, size, "Failed to write object data to temp file"};
             }
         }
@@ -216,11 +272,9 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
         try {
             const std::string written_hash = mc::sha256_file(tmp_path, &read_bytes);
             if (written_hash != actual_hash || read_bytes != size) {
-                fs::remove(tmp_path, ec);
                 return {PutResultStatus::HashMismatch, actual_hash, size, "Verification on write failed for temp object"};
             }
         } catch (const std::exception& e) {
-            fs::remove(tmp_path, ec);
             return {PutResultStatus::IoError, actual_hash, size, "Verification on write failed: " + std::string(e.what())};
         }
     }
@@ -236,7 +290,6 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
     // Ensure parent shard directory exists
     fs::create_directories(dest_path.parent_path(), ec);
     if (ec) {
-        fs::remove(tmp_path, ec);
         return {PutResultStatus::IoError, actual_hash, size, "Failed to create shard directory: " + ec.message()};
     }
 
@@ -246,7 +299,6 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
         // If rename failed because another concurrent process/thread created it in the meantime, handle cleanly
         bool rename_corrupt = false;
         if (verify_existing_dest(dest_path, rename_corrupt)) {
-            fs::remove(tmp_path, ec);
             std::lock_guard<std::mutex> lock(stats_mutex_);
             ++deduplicated_puts_;
             return {PutResultStatus::AlreadyExists, actual_hash, size, ""};
@@ -257,6 +309,7 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
             for (int attempt = 0; attempt < 3; ++attempt) {
                 if (atomic_replace_file(tmp_path, dest_path, repl_err)) {
                     replaced = true;
+                    temp_guard.promoted = true;
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -268,15 +321,15 @@ PutResult ObjectStore::put_object(const void* data, std::size_t size, const std:
             }
             // Check if another concurrent worker healed it in the meantime
             if (verify_existing_dest(dest_path, rename_corrupt)) {
-                fs::remove(tmp_path, ec);
                 std::lock_guard<std::mutex> lock(stats_mutex_);
                 ++deduplicated_puts_;
                 return {PutResultStatus::AlreadyExists, actual_hash, size, ""};
             }
         }
-        fs::remove(tmp_path, ec);
         return {PutResultStatus::IoError, actual_hash, size, "Failed to move temp object to CAS store: " + ec.message()};
     }
+
+    temp_guard.promoted = true;
 
     if (g_cas_fault_point.load() == CasFaultPointForTesting::CrashAfterPromotion) {
 #ifdef MERKLECHAIN_TESTING
@@ -443,20 +496,119 @@ bool ObjectStore::reconstruct_file(const FileManifest& manifest, const fs::path&
 }
 
 std::size_t ObjectStore::clean_temp_directory(std::string* err) {
+    return clean_temp_directory(0, err);
+}
+
+std::size_t ObjectStore::clean_temp_directory(std::uint64_t max_age_ms, std::string* err) {
     std::error_code ec;
     std::size_t cleaned_count = 0;
     if (!fs::exists(tmp_dir_, ec)) return 0;
 
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
     for (const auto& entry : fs::directory_iterator(tmp_dir_, ec)) {
-        if (entry.is_regular_file(ec)) {
-            if (fs::remove(entry.path(), ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+
+        const fs::path p = entry.path();
+        if (is_active_temp(p)) {
+            continue; // Active in-memory registered temp file in this process
+        }
+
+        const std::string fname = p.filename().string();
+        bool can_remove = false;
+
+        // Check if filename encodes obj_tmp_<pid>_<timestamp_ms>_<random>.tmp
+        if (fname.rfind("obj_tmp_", 0) == 0 && fname.size() > 8) {
+            auto parts = split_str(fname, '_');
+            // Expected tokens: ["obj", "tmp", "<pid>", "<timestamp_ms>", ...]
+            if (parts.size() >= 4) {
+                try {
+                    unsigned long pid = std::stoul(parts[2]);
+                    std::int64_t file_ts_ms = std::stoll(parts[3]);
+                    const bool alive = is_process_alive(pid);
+                    if (!alive) {
+                        // Creating process has exited/crashed -> abandoned crash remnant
+                        can_remove = true;
+                    } else {
+                        // Creating process is alive. Protect if within grace window.
+                        const std::uint64_t grace = (max_age_ms > 0) ? max_age_ms : 60000;
+                        if (now_ms >= file_ts_ms && static_cast<std::uint64_t>(now_ms - file_ts_ms) >= grace) {
+                            can_remove = true;
+                        }
+                    }
+                } catch (...) {
+                    // Malformed name (e.g. obj_tmp_interrupted_12345.tmp in CAS-OBJ-07)
+                    if (max_age_ms == 0) can_remove = true;
+                }
+            } else if (max_age_ms == 0) {
+                can_remove = true;
+            }
+        } else if (max_age_ms == 0) {
+            can_remove = true;
+        }
+
+        if (!can_remove && max_age_ms > 0) {
+            auto ftime = fs::last_write_time(p, ec);
+            if (!ec) {
+                auto sftime = std::chrono::time_point_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now() + (ftime - fs::file_time_type::clock::now()));
+                auto file_age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now() - sftime).count();
+                if (file_age > 0 && static_cast<std::uint64_t>(file_age) >= max_age_ms) {
+                    can_remove = true;
+                }
+            }
+        }
+
+        if (can_remove) {
+            if (fs::remove(p, ec)) {
                 ++cleaned_count;
             } else if (err && err->empty()) {
-                *err = "Failed to remove temp file: " + entry.path().string() + " (" + ec.message() + ")";
+                *err = "Failed to remove temp file: " + p.string() + " (" + ec.message() + ")";
             }
         }
     }
     return cleaned_count;
+}
+
+bool ObjectStore::remove_object(const ChunkHash& hash, std::string& err) {
+    if (!is_valid_hex_hash(hash)) {
+        err = "Invalid chunk hash: " + hash;
+        return false;
+    }
+    const fs::path p = object_path(hash);
+    std::error_code ec;
+    if (!fs::exists(p, ec)) {
+        return true; // Idempotent: already absent
+    }
+    if (!fs::remove(p, ec)) {
+        err = "Failed to remove CAS object file " + p.string() + ": " + ec.message();
+        return false;
+    }
+    return true;
+}
+
+std::vector<ChunkHash> ObjectStore::list_all_objects(std::string* err) const {
+    std::vector<ChunkHash> objects;
+    std::error_code ec;
+    if (!fs::exists(objects_dir_, ec)) return objects;
+
+    for (const auto& shard : fs::directory_iterator(objects_dir_, ec)) {
+        if (!shard.is_directory(ec)) continue;
+        for (const auto& entry : fs::directory_iterator(shard.path(), ec)) {
+            if (entry.is_regular_file(ec)) {
+                const std::string h = entry.path().filename().string();
+                if (is_valid_hex_hash(h)) {
+                    objects.push_back(h);
+                }
+            }
+        }
+    }
+    if (ec && err && err->empty()) {
+        *err = "Directory iteration error: " + ec.message();
+    }
+    return objects;
 }
 
 StoreStats ObjectStore::compute_stats() const {

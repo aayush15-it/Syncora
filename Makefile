@@ -13,7 +13,7 @@ HEADERS := $(wildcard include/merklechain/*.hpp include/merklechain/peer/*.hpp i
 OBJECTS := $(patsubst src/%.cpp,build/%.o,$(BASE_SOURCES)) build/peer_protocol.o build/peer_config.o build/peer_auth.o build/peer_transport.o build/peer_sync.o build/peer_session.o build/peer_service.o build/peer_controller.o
 TARGET := build/merklechain.exe
 DASHBOARD_PORT ?= 47831
-TEST_SOURCES := tests/test_main.cpp tests/cas/cas_tests.cpp tests/cas/cas_collab_integration_tests.cpp tests/collab_store_tests.cpp tests/peer_transport_tests.cpp tests/peer_sync_tests.cpp tests/peer_session_tests.cpp tests/peer_service_tests.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/collab_store.cpp $(PEER_SOURCES) $(CAS_SOURCES)
+TEST_SOURCES := tests/test_main.cpp tests/cas/cas_tests.cpp tests/cas/cas_collab_integration_tests.cpp tests/cas/cas_gc_tests.cpp tests/collab_store_tests.cpp tests/peer_transport_tests.cpp tests/peer_sync_tests.cpp tests/peer_session_tests.cpp tests/peer_service_tests.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/collab_store.cpp $(PEER_SOURCES) $(CAS_SOURCES)
 BENCH_SOURCES := benchmarks/chunk_benchmark.cpp src/chunk_sync.cpp src/hash.cpp src/staging_file.cpp
 CAS_BENCH_SOURCES := benchmarks/cas_benchmark.cpp $(CAS_SOURCES) src/hash.cpp
 

@@ -65,6 +65,7 @@ void run_collab_store_phase2_recovery_tests(const fs::path& fixture_root, void (
 namespace mc::cas {
 void run_cas_tests(const mc::fs::path& fixture_root, void (*check)(bool, const char*));
 void run_cas_collab_integration_tests(const mc::fs::path& fixture_root, void (*check)(bool, const char*));
+void run_cas_gc_tests(const mc::fs::path& fixture_root, void (*check)(bool, const char*));
 }
 
 int main(int argc,char** argv){
@@ -178,6 +179,33 @@ int main(int argc,char** argv){
         }
 
         store.publish_version(ws_id, user_id, "Crash Worker Release", "Testing process termination");
+        return 0;
+    }
+    if (argc >= 5 && std::string(argv[1]) == "--gc-crash-worker") {
+        const mc::fs::path db_path = mc::fs::u8path(argv[2]);
+        const mc::fs::path storage_dir = mc::fs::u8path(argv[3]);
+        const std::string fault_str = argv[4];
+
+        mc::CollabFaultPoint fp = mc::CollabFaultPoint::None;
+        if (fault_str == "before-sweep-mark") {
+            fp = mc::CollabFaultPoint::FailGcBeforeSweepMark;
+        } else if (fault_str == "mid-unlinking") {
+            fp = mc::CollabFaultPoint::FailGcMidUnlinking;
+        } else if (fault_str == "before-sweep-commit") {
+            fp = mc::CollabFaultPoint::FailGcBeforeSweepCommit;
+        } else if (fault_str == "during-orphan-scan") {
+            fp = mc::CollabFaultPoint::FailGcDuringOrphanScan;
+        }
+
+        mc::set_collab_fault_point_for_testing(fp);
+        mc::set_collab_process_exit_on_fault_for_testing(true);
+
+        mc::CollabStore store(db_path, storage_dir);
+        mc::GcOptions opts;
+        opts.dry_run = false;
+        opts.grace_period_ms = 0;
+        opts.sweep_physical_orphans = true;
+        store.garbage_collect(opts);
         return 0;
     }
 #else
@@ -449,5 +477,6 @@ int main(int argc,char** argv){
     mc::run_collab_store_phase2_recovery_tests(base, check);
     mc::cas::run_cas_tests(base, check);
     mc::cas::run_cas_collab_integration_tests(base, check);
+    mc::cas::run_cas_gc_tests(base, check);
     mc::fs::remove_all(base,ec);std::cout<<"Test checks: "<<passes<<" passed, "<<failures<<" failed, "<<skips<<" skipped\n";return failures?1:0;
 }

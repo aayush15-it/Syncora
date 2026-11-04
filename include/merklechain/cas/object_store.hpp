@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace mc::cas {
@@ -75,8 +76,24 @@ public:
     // Writes chunk-by-chunk through a staging file and verifies whole-file SHA-256.
     bool reconstruct_file(const FileManifest& manifest, const fs::path& destination_path, std::string& err, bool verify_whole_file = true) const;
 
-    // Clean up abandoned temp files (e.g. from interrupted operations/crashes)
-    std::size_t clean_temp_directory(std::string* err = nullptr);
+    // Clean up abandoned temp files (e.g. from interrupted operations/crashes).
+    // Protects in-flight files registered in active_temp_paths_ and files younger than max_age_ms.
+    std::size_t clean_temp_directory(std::uint64_t max_age_ms = 0, std::string* err = nullptr);
+    std::size_t clean_temp_directory(std::string* err);
+
+    // Temp file ownership registration (thread-safe)
+    void register_active_temp(const fs::path& p);
+    void unregister_active_temp(const fs::path& p);
+    bool is_active_temp(const fs::path& p) const;
+
+    // Remove a single object physically from CAS store
+    bool remove_object(const ChunkHash& hash, std::string& err);
+
+    // List all chunk hashes stored physically in CAS store
+    std::vector<ChunkHash> list_all_objects(std::string* err = nullptr) const;
+
+    // Process liveness checker helper
+    static bool is_process_alive(unsigned long pid);
 
     // Compute live stats by scanning objects directory
     StoreStats compute_stats() const;
@@ -93,7 +110,10 @@ private:
     std::uint64_t deduplicated_puts_{0};
     std::uint64_t new_puts_{0};
 
-    fs::path generate_temp_path() const;
+    mutable std::mutex temp_registry_mutex_;
+    std::unordered_set<std::string> active_temp_paths_;
+
+    fs::path generate_temp_path();
 };
 
 } // namespace mc::cas

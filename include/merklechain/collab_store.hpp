@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -176,7 +177,11 @@ enum class CollabFaultPoint {
     FailAfterSnapshotPromotion,
     FailAfterStagingBaseline,
     FailAfterBaselineBackup,
-    FailDuringRecovery
+    FailDuringRecovery,
+    FailGcBeforeSweepMark,
+    FailGcMidUnlinking,
+    FailGcBeforeSweepCommit,
+    FailGcDuringOrphanScan
 };
 
 void set_collab_fault_point_for_testing(CollabFaultPoint fp);
@@ -294,6 +299,46 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Milestone 3.3: CAS Garbage Collection Options & Report
+// ---------------------------------------------------------------------------
+struct GcOptions {
+    bool dry_run{false};
+    std::uint64_t grace_period_ms{3600 * 1000}; // Default 1 hour immunity
+    bool reconcile_reference_drift{true};
+    bool sweep_physical_orphans{true};
+};
+
+struct GcReport {
+    bool success{false};
+    std::string error;
+    bool dry_run{false};
+    std::uint64_t grace_period_ms{0};
+
+    std::size_t total_chunks_cataloged{0};
+    std::size_t active_referenced_chunks{0};
+    std::size_t unreferenced_candidates{0};
+    std::size_t chunks_in_grace_period_exempt{0};
+    std::size_t physical_orphans_found{0};
+    std::size_t chunks_deleted{0};
+    std::size_t failed_deletions{0};
+    std::size_t reconciled_drift_chunks{0};
+
+    std::uintmax_t total_bytes_scanned{0};
+    std::uintmax_t active_bytes{0};
+    std::uintmax_t reclaimable_bytes{0};
+    std::uintmax_t reclaimed_bytes{0};
+
+    std::vector<std::string> candidate_hashes;
+    std::vector<std::string> deleted_hashes;
+    std::vector<std::string> skipped_grace_hashes;
+    std::vector<std::string> orphan_file_paths;
+
+    std::int64_t started_at_ms{0};
+    std::int64_t finished_at_ms{0};
+    std::int64_t duration_ms{0};
+};
+
+// ---------------------------------------------------------------------------
 // CollabStore
 // ---------------------------------------------------------------------------
 class CollabStore {
@@ -379,6 +424,7 @@ public:
                                            const std::string& release_notes);
     std::vector<CollabPublishedVersion> list_published_versions(const std::string& ws_id);
     std::optional<CollabPublishedVersion> find_version_by_id(const std::string& version_id);
+    bool prune_version(const std::string& version_id, std::string& error_out);
 
     // Client Updates
     std::vector<CollabClientUpdate> list_updates_for_client(const std::string& client_id);
@@ -421,6 +467,13 @@ public:
     std::size_t get_chunk_reference_count(const std::string& chunk_hash);
 
     bool audit_cas_reference_integrity(std::string& error_out);
+
+    // Milestone 3.3: Reference Compaction & Drift Reconciliation
+    bool reconcile_cas_reference_counts(std::size_t& out_reconciled_count, std::string& error_out);
+
+    // Milestone 3.3: CAS Garbage Collection & Sweeping Engine
+    GcReport garbage_collect(const GcOptions& options = GcOptions{});
+    GcReport gc_dry_run(std::uint64_t grace_period_ms = 3600 * 1000);
 
     // ---------------------------------------------------------------------------
     // Infrastructure accessors for testing only
@@ -493,6 +546,13 @@ private:
     bool shutting_down_{false};
     bool finalized_{false};
     int active_ops_{0};
+
+    // -----------------------------------------------------------------------
+    // Global CAS maintenance barrier (Milestone 3.3)
+    // Synchronizes CAS ingestion/reading vs CAS sweeping/reconciliation.
+    // Lock ordering: OperationGuard -> cas_barrier_ -> ws_mutex -> db_mutex_
+    // -----------------------------------------------------------------------
+    mutable std::shared_mutex cas_barrier_;
 
     // -----------------------------------------------------------------------
     // Per-workspace serialization
