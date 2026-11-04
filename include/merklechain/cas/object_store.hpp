@@ -95,6 +95,12 @@ public:
     // Process liveness checker helper
     static bool is_process_alive(unsigned long pid);
 
+    // Process liveness and PID reuse checker helper
+    static bool is_process_alive_for_file(unsigned long pid, std::int64_t file_ts_ms, bool& out_pid_reused);
+
+    // File lock detection: returns true if the file is held open by a live writer/process
+    static bool is_file_locked_by_writer(const fs::path& p);
+
     // Compute live stats by scanning objects directory
     StoreStats compute_stats() const;
 

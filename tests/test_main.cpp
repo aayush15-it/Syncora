@@ -208,6 +208,55 @@ int main(int argc,char** argv){
         store.garbage_collect(opts);
         return 0;
     }
+    if (argc >= 4 && std::string(argv[1]) == "--cas-temp-writer") {
+        const mc::fs::path p = mc::fs::u8path(argv[2]);
+        const int duration_ms = std::stoi(argv[3]);
+        mc::fs::create_directories(p.parent_path());
+        std::ofstream out(p, std::ios::binary | std::ios::out);
+        if (!out) return 105;
+        out << "active_in_flight_data_from_child_writer";
+        out.flush();
+        std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
+        return 0;
+    }
+    if (argc >= 3 && std::string(argv[1]) == "--cas-temp-abandoner") {
+        const mc::fs::path p = mc::fs::u8path(argv[2]);
+        mc::fs::create_directories(p.parent_path());
+        std::ofstream out(p, std::ios::binary | std::ios::out);
+        if (!out) return 106;
+        out << "debris_from_crashed_writer";
+        out.flush();
+        std::_Exit(93);
+    }
+    if (argc >= 7 && std::string(argv[1]) == "--collab-publisher-worker") {
+        const mc::fs::path db_path = mc::fs::u8path(argv[2]);
+        const mc::fs::path storage_dir = mc::fs::u8path(argv[3]);
+        const std::string ws_id = argv[4];
+        const std::string user_id = argv[5];
+        const int iterations = std::stoi(argv[6]);
+
+        mc::CollabStore store(db_path, storage_dir);
+        for (int i = 0; i < iterations; ++i) {
+            mc::fs::path sdir = storage_dir / ("worker_src_" + std::to_string(i));
+            mc::fs::create_directories(sdir);
+            std::ofstream out(sdir / ("pub_child_" + std::to_string(i) + ".txt"));
+            out << "Child worker payload content sequence " << i << " ts=" << std::chrono::steady_clock::now().time_since_epoch().count();
+            out.close();
+
+            auto sub = store.create_submission(user_id, ws_id, sdir);
+            if (!store.accept_submission(sub.id, user_id, "Accept sub " + std::to_string(i))) {
+                return 110;
+            }
+            auto v = store.publish_version(ws_id, user_id, "v child " + std::to_string(i), "notes");
+            if (v.id.empty()) {
+                return 111;
+            }
+            std::error_code ec;
+            mc::fs::remove_all(sdir, ec);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return 0;
+    }
 #else
     (void)argc;(void)argv;
 #endif

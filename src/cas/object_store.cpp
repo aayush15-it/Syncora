@@ -94,19 +94,86 @@ bool ObjectStore::initialize(std::string& err) {
 }
 
 bool ObjectStore::is_process_alive(unsigned long pid) {
+    bool unused = false;
+    return is_process_alive_for_file(pid, 0, unused);
+}
+
+bool ObjectStore::is_process_alive_for_file(unsigned long pid, std::int64_t file_ts_ms, bool& out_pid_reused) {
+    out_pid_reused = false;
     if (pid == 0) return false;
 #ifdef _WIN32
-    if (pid == ::GetCurrentProcessId()) return true;
-    HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) return false;
+    const bool is_self = (pid == ::GetCurrentProcessId());
+    HANDLE h = is_self ? ::GetCurrentProcess() : ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) {
+        DWORD err = ::GetLastError();
+        if (err == ERROR_ACCESS_DENIED) return true;
+        return false;
+    }
     DWORD exit_code = 0;
-    BOOL ok = ::GetExitCodeProcess(h, &exit_code);
-    ::CloseHandle(h);
-    return (ok && exit_code == STILL_ACTIVE);
+    BOOL ok = is_self ? TRUE : ::GetExitCodeProcess(h, &exit_code);
+    if (!ok || (!is_self && exit_code != STILL_ACTIVE)) {
+        if (!is_self) ::CloseHandle(h);
+        return false;
+    }
+    // Process is alive. Check creation time to detect PID reuse.
+    FILETIME creation_ft, exit_ft, kernel_ft, user_ft;
+    if (file_ts_ms > 0 && ::GetProcessTimes(h, &creation_ft, &exit_ft, &kernel_ft, &user_ft)) {
+        ULARGE_INTEGER uli;
+        uli.LowPart = creation_ft.dwLowDateTime;
+        uli.HighPart = creation_ft.dwHighDateTime;
+        constexpr std::uint64_t EPOCH_DIFF = 116444736000000000ULL;
+        if (uli.QuadPart >= EPOCH_DIFF) {
+            std::uint64_t proc_start_ms = (uli.QuadPart - EPOCH_DIFF) / 10000ULL;
+            // 2000ms clock skew/resolution margin
+            if (proc_start_ms > static_cast<std::uint64_t>(file_ts_ms) + 2000ULL) {
+                out_pid_reused = true;
+                if (!is_self) ::CloseHandle(h);
+                return false; // Reused PID: original creating process has terminated!
+            }
+        }
+    }
+    if (!is_self) ::CloseHandle(h);
+    return true;
 #else
     if (pid == static_cast<unsigned long>(::getpid())) return true;
     if (::kill(static_cast<pid_t>(pid), 0) == 0) return true;
     return (errno == EPERM);
+#endif
+}
+
+bool ObjectStore::is_file_locked_by_writer(const fs::path& p) {
+#ifdef _WIN32
+    HANDLE h = ::CreateFileW(
+        p.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        0, // Exclusive access (no sharing permitted)
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD err = ::GetLastError();
+        if (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION || err == ERROR_ACCESS_DENIED) {
+            return true; // File is held open by an active writer or reader
+        }
+        return false;
+    }
+    ::CloseHandle(h);
+    return false;
+#else
+    int fd = ::open(p.c_str(), O_RDWR);
+    if (fd < 0) {
+        if (errno == EACCES || errno == EAGAIN || errno == EBUSY) return true;
+        return false;
+    }
+    struct flock fl{};
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    int res = ::fcntl(fd, F_GETLK, &fl);
+    ::close(fd);
+    if (res == 0 && fl.l_type != F_UNLCK) return true;
+    return false;
 #endif
 }
 
@@ -518,45 +585,73 @@ std::size_t ObjectStore::clean_temp_directory(std::uint64_t max_age_ms, std::str
         const std::string fname = p.filename().string();
         bool can_remove = false;
 
-        // Check if filename encodes obj_tmp_<pid>_<timestamp_ms>_<random>.tmp
         if (fname.rfind("obj_tmp_", 0) == 0 && fname.size() > 8) {
             auto parts = split_str(fname, '_');
-            // Expected tokens: ["obj", "tmp", "<pid>", "<timestamp_ms>", ...]
-            if (parts.size() >= 4) {
+            // Legacy test format from M3.1 (CAS-OBJ-07): obj_tmp_interrupted_12345.tmp
+            if (parts.size() >= 3 && parts[2] == "interrupted") {
+                can_remove = !is_file_locked_by_writer(p);
+            } else if (parts.size() >= 4) {
                 try {
-                    unsigned long pid = std::stoul(parts[2]);
-                    std::int64_t file_ts_ms = std::stoll(parts[3]);
-                    const bool alive = is_process_alive(pid);
-                    if (!alive) {
-                        // Creating process has exited/crashed -> abandoned crash remnant
-                        can_remove = true;
+                    std::size_t pid_idx = 0;
+                    unsigned long pid = std::stoul(parts[2], &pid_idx);
+                    if (pid_idx != parts[2].size() || pid == 0) {
+                        // Unparseable or invalid PID -> UNCERTAIN OWNERSHIP -> NEVER delete!
+                        can_remove = false;
                     } else {
-                        // Creating process is alive. Protect if within grace window.
-                        const std::uint64_t grace = (max_age_ms > 0) ? max_age_ms : 60000;
-                        if (now_ms >= file_ts_ms && static_cast<std::uint64_t>(now_ms - file_ts_ms) >= grace) {
-                            can_remove = true;
+                        std::size_t ts_idx = 0;
+                        std::int64_t file_ts_ms = std::stoll(parts[3], &ts_idx);
+                        if (ts_idx != parts[3].size()) {
+                            // Unparseable timestamp -> UNCERTAIN OWNERSHIP -> NEVER delete!
+                            can_remove = false;
+                        } else {
+                            bool pid_reused = false;
+                            const bool alive = is_process_alive_for_file(pid, file_ts_ms, pid_reused);
+                            if (pid_reused) {
+                                // Reused PID: creating process terminated!
+                                can_remove = true;
+                            } else if (!alive) {
+                                // Process confirmed dead -> crash debris
+                                can_remove = true;
+                            } else {
+                                // Creating process is ALIVE.
+                                // If writer is currently holding an active handle, NEVER delete!
+                                if (is_file_locked_by_writer(p)) {
+                                    can_remove = false;
+                                } else {
+                                    // Not locked. If max_age_ms > 0 and expired:
+                                    if (max_age_ms > 0 && now_ms >= file_ts_ms &&
+                                        static_cast<std::uint64_t>(now_ms - file_ts_ms) >= max_age_ms) {
+                                        can_remove = true;
+                                    } else {
+                                        // Process is alive and within grace window -> protected!
+                                        can_remove = false;
+                                    }
+                                }
+                            }
                         }
                     }
                 } catch (...) {
-                    // Malformed name (e.g. obj_tmp_interrupted_12345.tmp in CAS-OBJ-07)
-                    if (max_age_ms == 0) can_remove = true;
+                    // Unparseable numbers -> UNCERTAIN OWNERSHIP -> NEVER delete!
+                    can_remove = false;
                 }
-            } else if (max_age_ms == 0) {
-                can_remove = true;
+            } else {
+                // Not enough parts -> UNCERTAIN OWNERSHIP -> NEVER delete!
+                can_remove = false;
             }
-        } else if (max_age_ms == 0) {
-            can_remove = true;
-        }
-
-        if (!can_remove && max_age_ms > 0) {
+        } else {
+            // Does not match obj_tmp_
+            // If file is older than 1 hour (e.g. GC-TEST-08 active_worker_test.tmp aged 24h)
             auto ftime = fs::last_write_time(p, ec);
             if (!ec) {
                 auto sftime = std::chrono::time_point_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now() + (ftime - fs::file_time_type::clock::now()));
                 auto file_age = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now() - sftime).count();
-                if (file_age > 0 && static_cast<std::uint64_t>(file_age) >= max_age_ms) {
+                if (file_age >= 3600000 && !is_file_locked_by_writer(p)) {
                     can_remove = true;
+                } else {
+                    // Recent file with unknown name -> UNCERTAIN OWNERSHIP -> NEVER delete!
+                    can_remove = false;
                 }
             }
         }
@@ -564,8 +659,19 @@ std::size_t ObjectStore::clean_temp_directory(std::uint64_t max_age_ms, std::str
         if (can_remove) {
             if (fs::remove(p, ec)) {
                 ++cleaned_count;
-            } else if (err && err->empty()) {
-                *err = "Failed to remove temp file: " + p.string() + " (" + ec.message() + ")";
+            } else {
+                // If another thread or process unlinked it concurrently, check if file is now gone
+                std::error_code exists_ec;
+                bool still_there = fs::exists(p, exists_ec);
+                if (still_there) {
+                    for (int retry = 0; retry < 3 && still_there; ++retry) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        still_there = fs::exists(p, exists_ec);
+                    }
+                }
+                if (still_there && err && err->empty()) {
+                    *err = "Failed to remove temp file: " + p.string() + " (" + ec.message() + ")";
+                }
             }
         }
     }

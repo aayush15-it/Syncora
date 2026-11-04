@@ -223,7 +223,7 @@ static bool create_sentinel_exclusive(const fs::path& sentinel_path, const std::
 #endif
 
 CollabStore::CollabStore(const fs::path& db_path, const fs::path& base_storage_dir)
-    : db_path_(db_path), base_storage_dir_(base_storage_dir) {
+    : db_path_(db_path), base_storage_dir_(base_storage_dir), cas_barrier_(base_storage_dir / "cas" / ".cas_barrier.lock") {
     fs::create_directories(db_path_.parent_path());
     fs::create_directories(base_storage_dir_);
 
@@ -234,6 +234,10 @@ CollabStore::CollabStore(const fs::path& db_path, const fs::path& base_storage_d
         db_ = nullptr;
         throw std::runtime_error("CollabStore database error: " + err);
     }
+
+    // Set 10-second busy timeout for robust multi-process and multi-connection concurrency
+    sqlite3_busy_timeout(db_, 10000);
+    execute_sql("PRAGMA busy_timeout = 10000;");
 
     // Enable WAL and foreign keys.
     // db_mutex_ not required here: single-threaded construction phase.
@@ -1866,7 +1870,7 @@ void CollabStore::recover_incomplete_operations() {
 
     // Milestone 3.3: Recover any interrupted CAS garbage collection sweep
     {
-        std::unique_lock<std::shared_mutex> cas_lock(cas_barrier_);
+        cas::CasExclusiveBarrierGuard cas_lock(cas_barrier_);
         std::lock_guard<std::mutex> db_lock(db_mutex_);
 
         // 1. Check for chunks left in PENDING_SWEEP state
@@ -1945,7 +1949,7 @@ void CollabStore::recover_incomplete_operations() {
 
 bool CollabStore::accept_submission(const std::string& sub_id, const std::string& reviewer_id, const std::string& notes) {
     OperationGuard op_guard(*this);
-    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
+    cas::CasSharedBarrierGuard cas_lock(cas_barrier_);
 
     // 1. Retrieve workspace ID under db_mutex_
     std::string ws_id;
@@ -2484,7 +2488,7 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
                                                    const std::string& title,
                                                    const std::string& release_notes) {
     OperationGuard op_guard(*this);
-    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
+    cas::CasSharedBarrierGuard cas_lock(cas_barrier_);
 
     // 1. Resolve workspace ID under db_mutex_
     std::string actual_ws_id = workspace_id;
@@ -2998,7 +3002,7 @@ std::optional<CollabPublishedVersion> CollabStore::find_version_by_id(const std:
 
 bool CollabStore::prune_version(const std::string& version_id, std::string& error_out) {
     OperationGuard op_guard(*this);
-    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
+    cas::CasSharedBarrierGuard cas_lock(cas_barrier_);
 
     // 1. Resolve workspace ID under db_mutex_
     std::string ws_id;
@@ -3456,7 +3460,7 @@ bool CollabStore::reconstruct_version(const std::string& version_id,
                                       const fs::path& destination_dir,
                                       std::string& error_out) {
     OperationGuard op_guard(*this);
-    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
+    cas::CasSharedBarrierGuard cas_lock(cas_barrier_);
 
     std::string expected_merkle_root;
     std::string ws_id;
@@ -3575,7 +3579,7 @@ bool CollabStore::reconstruct_version(const std::string& version_id,
 std::vector<cas::FileManifest> CollabStore::get_version_manifests(const std::string& version_id,
                                                                  std::string& error_out) {
     OperationGuard op_guard(*this);
-    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
+    cas::CasSharedBarrierGuard cas_lock(cas_barrier_);
     std::vector<std::vector<std::uint8_t>> blobs;
     {
         std::lock_guard<std::mutex> db_lock(db_mutex_);
@@ -3614,7 +3618,7 @@ std::vector<cas::FileManifest> CollabStore::get_version_manifests(const std::str
 
 std::size_t CollabStore::get_chunk_reference_count(const std::string& chunk_hash) {
     OperationGuard op_guard(*this);
-    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
+    cas::CasSharedBarrierGuard cas_lock(cas_barrier_);
     std::lock_guard<std::mutex> db_lock(db_mutex_);
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "SELECT reference_count FROM cas_chunks WHERE chunk_hash = ?";
@@ -3631,7 +3635,7 @@ std::size_t CollabStore::get_chunk_reference_count(const std::string& chunk_hash
 
 bool CollabStore::audit_cas_reference_integrity(std::string& error_out) {
     OperationGuard op_guard(*this);
-    std::shared_lock<std::shared_mutex> cas_lock(cas_barrier_);
+    cas::CasSharedBarrierGuard cas_lock(cas_barrier_);
     std::lock_guard<std::mutex> db_lock(db_mutex_);
 
     // Check for negative reference counts
@@ -3723,7 +3727,7 @@ bool CollabStore::audit_cas_reference_integrity(std::string& error_out) {
 
 bool CollabStore::reconcile_cas_reference_counts(std::size_t& out_reconciled_count, std::string& error_out) {
     OperationGuard op_guard(*this);
-    std::unique_lock<std::shared_mutex> cas_lock(cas_barrier_);
+    cas::CasExclusiveBarrierGuard cas_lock(cas_barrier_);
     std::lock_guard<std::mutex> db_lock(db_mutex_);
 
     out_reconciled_count = 0;
@@ -3800,7 +3804,7 @@ GcReport CollabStore::gc_dry_run(std::uint64_t grace_period_ms) {
 
 GcReport CollabStore::garbage_collect(const GcOptions& options) {
     OperationGuard op_guard(*this);
-    std::unique_lock<std::shared_mutex> cas_lock(cas_barrier_);
+    cas::CasExclusiveBarrierGuard cas_lock(cas_barrier_);
 
     const auto start_ts = now_ms();
     GcReport report;

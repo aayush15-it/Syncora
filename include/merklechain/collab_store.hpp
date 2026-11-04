@@ -4,6 +4,7 @@
 #include "merklechain/hash.hpp"
 #include "merklechain/scanner.hpp"
 #include "merklechain/cas/cas_types.hpp"
+#include "merklechain/cas/interprocess_barrier.hpp"
 #include "merklechain/cas/chunker.hpp"
 #include "merklechain/cas/file_manifest.hpp"
 #include "merklechain/cas/manifest_serializer.hpp"
@@ -456,6 +457,7 @@ public:
     fs::path cas_root_dir() const { return base_storage_dir_ / "cas"; }
     cas::ObjectStore& cas_store() { return *cas_store_; }
     const cas::ObjectStore& cas_store() const { return *cas_store_; }
+    cas::InterprocessCasBarrier& cas_barrier() const { return cas_barrier_; }
 
     bool reconstruct_version(const std::string& version_id,
                              const fs::path& destination_dir,
@@ -552,7 +554,7 @@ private:
     // Synchronizes CAS ingestion/reading vs CAS sweeping/reconciliation.
     // Lock ordering: OperationGuard -> cas_barrier_ -> ws_mutex -> db_mutex_
     // -----------------------------------------------------------------------
-    mutable std::shared_mutex cas_barrier_;
+    mutable cas::InterprocessCasBarrier cas_barrier_;
 
     // -----------------------------------------------------------------------
     // Per-workspace serialization
