@@ -56,6 +56,9 @@ void run_peer_session_tests(const mc::fs::path& fixture_root,
 void run_peer_service_tests(const mc::fs::path& fixture_root,
                             void (*check)(bool, const char*),
                             void (*skip)(const char*));
+void run_peer_sync_cas_delta_tests(const mc::fs::path& fixture_root,
+                                   void (*check)(bool, const char*),
+                                   void (*skip)(const char*));
 namespace mc::peer {
 void run_peer_cas_helpers_tests(const mc::fs::path& fixture_root, void (*check)(bool, const char*));
 }
@@ -354,6 +357,7 @@ int main(int argc,char** argv){
     run_peer_session_tests(base, check);
     run_peer_service_tests(base, check, skip);
     mc::peer::run_peer_cas_helpers_tests(base, check);
+    run_peer_sync_cas_delta_tests(base, check, skip);
     const auto stage_dir=base/"staging-security";mc::fs::create_directories(stage_dir);const auto collision=stage_dir/"collision.tmp";write(collision,"owned by another process");bool collision_rejected=false;try{mc::StagingFile refused(collision);}catch(...){collision_rejected=true;}check(collision_rejected&&mc::sha256_file(collision)==mc::sha256_data("owned by another process",24),"exclusive staging creation rejects collisions without changing or deleting the existing file");
     const auto directory_collision=stage_dir/"directory.tmp";mc::fs::create_directory(directory_collision);bool directory_rejected=false;try{mc::StagingFile refused(directory_collision);}catch(...){directory_rejected=true;}check(directory_rejected&&mc::fs::is_directory(directory_collision),"failed staging creation leaves a colliding directory intact");
     const auto cleanup_path=stage_dir/"cleanup.tmp";{mc::StagingFile owned(cleanup_path);owned.write("incomplete",10);}check(!mc::fs::exists(cleanup_path),"staging owner removes its incomplete file through the retained handle");

@@ -24,6 +24,7 @@ struct PeerConfig {
     std::uint32_t io_timeout_seconds{30};
     std::uint32_t max_manifest_files{100000};
     std::uint64_t max_file_size_bytes{1ULL << 40U};
+    bool enable_cas_delta{true};
 };
 
 PeerConfig load_peer_config(const fs::path& config_path, Role expected_role);

@@ -13,16 +13,18 @@ HEADERS := $(wildcard include/merklechain/*.hpp include/merklechain/peer/*.hpp i
 OBJECTS := $(patsubst src/%.cpp,build/%.o,$(BASE_SOURCES)) build/peer_protocol.o build/peer_config.o build/peer_auth.o build/peer_transport.o build/peer_sync.o build/peer_session.o build/peer_service.o build/peer_controller.o build/peer_cas_helpers.o
 TARGET := build/merklechain.exe
 DASHBOARD_PORT ?= 47831
-TEST_SOURCES := tests/test_main.cpp tests/peer_cas_helpers_tests.cpp tests/cas/cas_tests.cpp tests/cas/cas_collab_integration_tests.cpp tests/cas/cas_gc_tests.cpp tests/collab_store_tests.cpp tests/peer_transport_tests.cpp tests/peer_sync_tests.cpp tests/peer_session_tests.cpp tests/peer_service_tests.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/collab_store.cpp $(PEER_SOURCES) $(CAS_SOURCES)
+TEST_SOURCES := tests/test_main.cpp tests/peer_cas_helpers_tests.cpp tests/peer_sync_cas_delta_tests.cpp tests/cas/cas_tests.cpp tests/cas/cas_collab_integration_tests.cpp tests/cas/cas_gc_tests.cpp tests/collab_store_tests.cpp tests/peer_transport_tests.cpp tests/peer_sync_tests.cpp tests/peer_session_tests.cpp tests/peer_service_tests.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/collab_store.cpp $(PEER_SOURCES) $(CAS_SOURCES)
 BENCH_SOURCES := benchmarks/chunk_benchmark.cpp src/chunk_sync.cpp src/hash.cpp src/staging_file.cpp
 CAS_BENCH_SOURCES := benchmarks/cas_benchmark.cpp $(CAS_SOURCES) src/hash.cpp
+CAS_NET_BENCH_SOURCES := benchmarks/cas_network_benchmark.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/collab_store.cpp $(PEER_SOURCES) $(CAS_SOURCES)
 
-.PHONY: all test benchmark dashboard-test clean run-local run-dashboard help
+.PHONY: all test benchmark cas-benchmark cas-net-benchmark dashboard-test clean run-local run-dashboard help
 all: $(TARGET)
 
 $(TARGET): $(SOURCES) $(HEADERS)
 	@mkdir -p build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -UMERKLECHAIN_TESTING $(SOURCES) -o $@ $(LDLIBS)
+	@powershell -Command "if (Test-Path Cert:\CurrentUser\My\E15002D69BDDB1581AA907A27F5B6CB629DB9DCD) { Set-AuthenticodeSignature -Certificate (Get-Item Cert:\CurrentUser\My\E15002D69BDDB1581AA907A27F5B6CB629DB9DCD) -FilePath $@ | Out-Null }"
 
 build/%.o: src/%.cpp $(HEADERS)
 	@mkdir -p build
@@ -69,6 +71,7 @@ TEST_LDLIBS := $(shell "$(PKG_CONFIG)" --libs openssl sqlite3) -lws2_32 -lshell3
 build/tests.exe: $(TEST_SOURCES) $(HEADERS)
 	@mkdir -p build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DMERKLECHAIN_TESTING $(TEST_SOURCES) -o $@ $(TEST_LDLIBS)
+	@powershell -Command "if (Test-Path Cert:\CurrentUser\My\E15002D69BDDB1581AA907A27F5B6CB629DB9DCD) { Set-AuthenticodeSignature -Certificate (Get-Item Cert:\CurrentUser\My\E15002D69BDDB1581AA907A27F5B6CB629DB9DCD) -FilePath $@ | Out-Null }"
 
 build/chunk_benchmark.exe: $(BENCH_SOURCES) $(HEADERS)
 	@mkdir -p build
@@ -78,6 +81,11 @@ build/cas_benchmark.exe: $(CAS_BENCH_SOURCES) $(HEADERS)
 	@mkdir -p build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -UMERKLECHAIN_TESTING $(CAS_BENCH_SOURCES) -o $@ $(TEST_LDLIBS)
 
+build/cas_network_benchmark.exe: $(CAS_NET_BENCH_SOURCES) $(HEADERS)
+	@mkdir -p build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -UMERKLECHAIN_TESTING $(CAS_NET_BENCH_SOURCES) -o $@ $(TEST_LDLIBS)
+	@powershell -Command "if (Test-Path Cert:\CurrentUser\My\E15002D69BDDB1581AA907A27F5B6CB629DB9DCD) { Set-AuthenticodeSignature -Certificate (Get-Item Cert:\CurrentUser\My\E15002D69BDDB1581AA907A27F5B6CB629DB9DCD) -FilePath $@ | Out-Null }"
+
 test: build/tests.exe
 	build/tests.exe
 
@@ -86,6 +94,9 @@ benchmark: build/chunk_benchmark.exe
 
 cas-benchmark: build/cas_benchmark.exe
 	build/cas_benchmark.exe
+
+cas-net-benchmark: build/cas_network_benchmark.exe
+	build/cas_network_benchmark.exe
 
 run-local: $(TARGET)
 	$(TARGET) --local

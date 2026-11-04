@@ -361,6 +361,7 @@ void stage_file_from_peer(PeerConnection& connection,
     }
 
     // Reconstruct file into staging
+    std::size_t reconstructed_bytes = 0;
     if (manifest.total_size() > 0) {
         for (const auto& chunk : manifest.chunks()) {
             std::vector<std::uint8_t> chunk_data;
@@ -371,7 +372,12 @@ void stage_file_from_peer(PeerConnection& connection,
                 throw std::runtime_error("chunk size mismatch during file reconstruction: " + chunk.hash);
             }
             staging.write(chunk_data.data(), chunk_data.size());
+            reconstructed_bytes += chunk_data.size();
         }
+    }
+    if (reconstructed_bytes != manifest.total_size()) {
+        throw std::runtime_error("reconstructed size (" + std::to_string(reconstructed_bytes) +
+                                 ") does not match manifest total size (" + std::to_string(manifest.total_size()) + ")");
     }
     staging.flush();
     ++report.files_transferred;
@@ -440,10 +446,14 @@ PeerSyncReport PeerService::run_host(const PeerConfig& config,
         PeerCapabilities host_caps;
         host_caps.identity = config.identity;
         host_caps.version = "1.0";
-        host_caps.capabilities = {kCapCasDeltaV1, kCapWholeFile};
+        if (config.enable_cas_delta) {
+            host_caps.capabilities = {kCapCasDeltaV1, kCapWholeFile};
+        } else {
+            host_caps.capabilities = {kCapWholeFile};
+        }
         connection.send_frame(Frame{kProtocolVersion, MessageType::Hello, encode_hello_payload(host_caps)});
 
-        const bool use_cas_delta = client_caps.supports_cas_delta();
+        const bool use_cas_delta = config.enable_cas_delta && client_caps.supports_cas_delta();
 
         // Step 2: Manifest Request
         const auto req_frame = connection.receive_frame();
@@ -695,7 +705,11 @@ PeerSyncReport PeerService::run_client(const PeerConfig& config,
         PeerCapabilities client_caps;
         client_caps.identity = config.identity;
         client_caps.version = "1.0";
-        client_caps.capabilities = {kCapCasDeltaV1, kCapWholeFile};
+        if (config.enable_cas_delta) {
+            client_caps.capabilities = {kCapCasDeltaV1, kCapWholeFile};
+        } else {
+            client_caps.capabilities = {kCapWholeFile};
+        }
         connection.send_frame(Frame{kProtocolVersion, MessageType::Hello, encode_hello_payload(client_caps)});
 
         const auto hello_frame = connection.receive_frame();
@@ -706,7 +720,7 @@ PeerSyncReport PeerService::run_client(const PeerConfig& config,
         const std::string host_identity = host_caps.identity;
         if (host_identity.empty()) throw std::runtime_error("empty host identity");
 
-        const bool use_cas_delta = host_caps.supports_cas_delta();
+        const bool use_cas_delta = config.enable_cas_delta && host_caps.supports_cas_delta();
 
         const std::string session_id = journal.create(config.identity, host_identity);
         report.session_id = session_id;
