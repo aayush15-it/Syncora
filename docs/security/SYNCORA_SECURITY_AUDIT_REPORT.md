@@ -134,10 +134,10 @@ Below is the consolidated vulnerability index for Milestone 3.4:
 | **SEC-02** | CAS Streaming Synchronization Untested at Claimed 100 MB Scale | **Low** | **REMEDIATED** | `tests/peer_sync_cas_delta_tests.cpp:786` | `CAS-NET-13` (100 MB, 12.5k chunks, RSS measured) |
 | **SEC-03** | Receiver Mid-Transfer Crash Recovery Verified Against Unmanaged Staging Path | **Medium** | **REMEDIATED** | `tests/peer_sync_cas_delta_tests.cpp:710` | `CAS-NET-11` (child process `_Exit(92)` + restart) |
 | **SEC-04** | Sender Interprocess GC Safety Tested Via In-Process Thread | **Low** | **REMEDIATED** | `tests/peer_sync_cas_delta_tests.cpp:962` | `CAS-NET-18` (subprocess exit code 42 contention) |
-| **SEC-05** | Silent Degradation to In-Process Mutex on OS File Lock Failure in CAS Barrier | **High** | **REMEDIATED** | `include/merklechain/cas/interprocess_barrier.hpp` | Fail-closed `InterprocessLockException` + 12 unit tests |
+| **SEC-05** | Silent Degradation to In-Process Mutex on OS File Lock Failure in CAS Barrier | **High** | **VERIFIED (LIMITATIONS)** | `include/merklechain/cas/interprocess_barrier.hpp` | Fail-closed `InterprocessLockException` + 15 unit tests |
 | **SEC-06** | Hardcoded User Authenticode Certificate Thumbprint in Build Configuration | **Informational** | **REMEDIATED** | `Makefile:17, 78` | Configurable `SIGNING_THUMBPRINT ?=` variable |
 | **SEC-07** | SQLite Chunk Registry Accumulates Entries Indefinitely Without Proactive Pruning | **Low** | **REMEDIATED** | `src/collab_store.cpp:920` | `CollabStore::compact_cas_metadata()` + `GC-TEST-21` |
-| **SEC-08** | In-Flight File Mutation During FastCDC Chunking Triggers Protocol Abort Fallback | **Low** | **REMEDIATED** | `src/peer/peer_cas_helpers.cpp:405` | Single-pass EVP streaming + mutation detection tests |
+| **SEC-08** | In-Flight File Mutation During FastCDC Chunking Triggers Protocol Abort Fallback | **Low** | **VERIFIED (LIMITATIONS)** | `src/peer/peer_cas_helpers.cpp:405` | Single-pass EVP streaming + mutation detection tests |
 
 ---
 

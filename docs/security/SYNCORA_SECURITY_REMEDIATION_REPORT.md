@@ -23,7 +23,7 @@ This report provides the exhaustive technical documentation of the architectural
 | **SEC-02** | CAS Streaming Synchronization Untested at Claimed 100 MB Scale | Low | **Remediated & Verified** | `CAS-NET-13` (100 MB file, 12,500 chunks, peak RSS monitored) |
 | **SEC-03** | Receiver Mid-Transfer Crash Recovery Verified Against Unmanaged Staging Path | Medium | **Remediated & Verified** | `CAS-NET-11` (Live subprocess terminated via `_Exit(92)` + restart) |
 | **SEC-04** | Sender Interprocess GC Safety Tested Via In-Process Thread | Low | **Remediated & Verified** | `CAS-NET-18` (Subprocess exit code 42 contention + code 0 acquisition) |
-| **SEC-05** | Silent Degradation to In-Process Mutex on OS File Lock Failure in CAS Barrier | High (Upgraded) | **Remediated & Verified** | Fail-closed `InterprocessLockException` + rollback + 12 unit tests |
+| **SEC-05** | Silent Degradation to In-Process Mutex on OS File Lock Failure in CAS Barrier | High (Upgraded) | **Verified with Documented Limitations** | Fail-closed `InterprocessLockException` + rollback + 15 unit tests |
 | **SEC-06** | Hardcoded User Authenticode Certificate Thumbprint in Build Configuration | Info | **Remediated & Verified** | Parameterized `SIGNING_THUMBPRINT ?=` in `Makefile` + isolated target |
 | **SEC-07** | SQLite Chunk Registry Accumulates Entries Indefinitely Without Proactive Pruning | Low | **Remediated & Verified** | `CollabStore::compact_cas_metadata()` + `GC-TEST-21` |
 | **SEC-08** | In-Flight File Mutation During FastCDC Chunking Triggers Protocol Abort Fallback | Low | **Remediated & Verified** | Single-pass EVP streaming chunker + size/mtime post-check + tests |

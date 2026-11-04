@@ -58,7 +58,8 @@ enum class BarrierFaultPoint {
     FailEnsureFileOpen,
     FailLockShared,
     FailLockExclusive,
-    FailUnlock
+    FailUnlock,
+    SimulateSyscallUnlockFailure
 };
 
 inline BarrierFaultPoint& barrier_fault_point_ref() noexcept {
@@ -110,9 +111,19 @@ public:
 
     /**
      * @brief Acquires a shared lock. Fails closed and throws InterprocessLockException
-     *        if the OS lock cannot be acquired.
+     *        if the OS lock cannot be acquired or if the barrier has been poisoned by
+     *        a previous unlock failure.
      */
     void lock_shared() {
+        {
+            std::lock_guard<std::mutex> lk(os_mutex_);
+            if (is_poisoned_) {
+                throw InterprocessLockException(
+                    "InterprocessCasBarrier: barrier is poisoned due to previous OS unlock failure: " + poison_reason_,
+                    BarrierLockStatus::OperatingSystemError);
+            }
+        }
+
         auto& depth = shared_depth_map()[this];
         if (depth > 0) {
             ++depth;
@@ -122,6 +133,11 @@ public:
         in_proc_mutex_.lock_shared();
         try {
             std::lock_guard<std::mutex> lk(os_mutex_);
+            if (is_poisoned_) {
+                throw InterprocessLockException(
+                    "InterprocessCasBarrier: barrier is poisoned due to previous OS unlock failure: " + poison_reason_,
+                    BarrierLockStatus::OperatingSystemError);
+            }
             if (++in_proc_shared_readers_ == 1) {
                 const auto st = acquire_os_lock(false, std::chrono::milliseconds(-1));
                 if (st != BarrierLockStatus::Acquired) {
@@ -140,8 +156,16 @@ public:
 
     /**
      * @brief Attempts to acquire a shared lock with an optional timeout.
+     *        Fails closed immediately if the barrier is poisoned.
      */
     BarrierLockStatus try_lock_shared(std::chrono::milliseconds timeout = std::chrono::milliseconds(0)) {
+        {
+            std::lock_guard<std::mutex> lk(os_mutex_);
+            if (is_poisoned_) {
+                return BarrierLockStatus::OperatingSystemError;
+            }
+        }
+
         auto& depth = shared_depth_map()[this];
         if (depth > 0) {
             ++depth;
@@ -154,6 +178,10 @@ public:
 
         try {
             std::lock_guard<std::mutex> lk(os_mutex_);
+            if (is_poisoned_) {
+                in_proc_mutex_.unlock_shared();
+                return BarrierLockStatus::OperatingSystemError;
+            }
             if (++in_proc_shared_readers_ == 1) {
                 const auto st = acquire_os_lock(false, timeout);
                 if (st != BarrierLockStatus::Acquired) {
@@ -193,12 +221,26 @@ public:
 
     /**
      * @brief Acquires an exclusive lock. Fails closed and throws InterprocessLockException
-     *        if the OS lock cannot be acquired.
+     *        if the OS lock cannot be acquired or if the barrier is poisoned.
      */
     void lock_exclusive() {
+        {
+            std::lock_guard<std::mutex> lk(os_mutex_);
+            if (is_poisoned_) {
+                throw InterprocessLockException(
+                    "InterprocessCasBarrier: barrier is poisoned due to previous OS unlock failure: " + poison_reason_,
+                    BarrierLockStatus::OperatingSystemError);
+            }
+        }
+
         in_proc_mutex_.lock();
         try {
             std::lock_guard<std::mutex> lk(os_mutex_);
+            if (is_poisoned_) {
+                throw InterprocessLockException(
+                    "InterprocessCasBarrier: barrier is poisoned due to previous OS unlock failure: " + poison_reason_,
+                    BarrierLockStatus::OperatingSystemError);
+            }
             const auto st = acquire_os_lock(true, std::chrono::milliseconds(-1));
             if (st != BarrierLockStatus::Acquired) {
                 std::string err_msg = "InterprocessCasBarrier: failed to acquire exclusive OS file lock on '" +
@@ -214,14 +256,26 @@ public:
 
     /**
      * @brief Attempts to acquire an exclusive lock with an optional timeout.
+     *        Fails closed immediately if the barrier is poisoned.
      */
     BarrierLockStatus try_lock_exclusive(std::chrono::milliseconds timeout = std::chrono::milliseconds(0)) {
+        {
+            std::lock_guard<std::mutex> lk(os_mutex_);
+            if (is_poisoned_) {
+                return BarrierLockStatus::OperatingSystemError;
+            }
+        }
+
         if (!in_proc_mutex_.try_lock()) {
             return BarrierLockStatus::Contended;
         }
 
         try {
             std::lock_guard<std::mutex> lk(os_mutex_);
+            if (is_poisoned_) {
+                in_proc_mutex_.unlock();
+                return BarrierLockStatus::OperatingSystemError;
+            }
             const auto st = acquire_os_lock(true, timeout);
             if (st != BarrierLockStatus::Acquired) {
                 in_proc_mutex_.unlock();
@@ -253,6 +307,84 @@ public:
         return os_lock_acquired_;
     }
 
+    /**
+     * @brief Returns true if an OS-level unlock syscall failed, placing the barrier
+     *        in a fail-closed state where all subsequent acquisitions are rejected.
+     */
+    bool is_poisoned() const noexcept {
+        std::lock_guard<std::mutex> lk(os_mutex_);
+        return is_poisoned_;
+    }
+
+    /**
+     * @brief Diagnostic error message explaining why the barrier became poisoned.
+     */
+    std::string poison_reason() const {
+        std::lock_guard<std::mutex> lk(os_mutex_);
+        return poison_reason_;
+    }
+
+    /**
+     * @brief Raw OS error code recorded during the unlock failure.
+     */
+    uint32_t last_unlock_error() const noexcept {
+        std::lock_guard<std::mutex> lk(os_mutex_);
+        return static_cast<uint32_t>(last_unlock_error_);
+    }
+
+    /**
+     * @brief Formats an OS-level error code into a human-readable diagnostic string.
+     */
+    static std::string format_os_error_message(
+#ifdef _WIN32
+        DWORD err
+#else
+        int err
+#endif
+    ) {
+#ifdef _WIN32
+        if (err == 0) return "no OS error recorded";
+        char buf[256];
+        DWORD len = ::FormatMessageA(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            buf, sizeof(buf), NULL);
+        if (len > 0) {
+            while (len > 0 && (buf[len - 1] == '\r' || buf[len - 1] == '\n' || buf[len - 1] == ' ')) {
+                buf[--len] = '\0';
+            }
+            return std::string(buf) + " (code " + std::to_string(err) + ")";
+        }
+        return "Windows error code " + std::to_string(err);
+#else
+        if (err == 0) return "no OS error recorded";
+        return std::string(std::strerror(err)) + " (errno " + std::to_string(err) + ")";
+#endif
+    }
+
+    /**
+     * @brief Closes the underlying OS file handle, releasing any locks retained by
+     *        the kernel handle table (e.g. after an unlock failure). Idempotent and noexcept.
+     */
+    void close_file() noexcept {
+        std::lock_guard<std::mutex> lk(os_mutex_);
+        if (os_lock_acquired_ && !is_poisoned_) {
+            release_os_lock_unlocked();
+        }
+#ifdef _WIN32
+        if (file_handle_ != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(file_handle_);
+            file_handle_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+#endif
+        os_lock_acquired_ = false;
+    }
+
 private:
     static std::unordered_map<const InterprocessCasBarrier*, int>& shared_depth_map() {
         static thread_local std::unordered_map<const InterprocessCasBarrier*, int> map;
@@ -263,35 +395,22 @@ private:
 #ifdef _WIN32
     HANDLE file_handle_{INVALID_HANDLE_VALUE};
     DWORD last_os_error_{0};
+    DWORD last_unlock_error_{0};
 #else
     int fd_{-1};
     int last_os_error_{0};
+    int last_unlock_error_{0};
 #endif
     mutable std::shared_mutex in_proc_mutex_;
     mutable std::mutex os_mutex_;
     int in_proc_shared_readers_{0};
     bool os_exclusive_held_{false};
     bool os_lock_acquired_{false};
+    bool is_poisoned_{false};
+    std::string poison_reason_{};
 
     std::string last_os_error_message() const {
-#ifdef _WIN32
-        if (last_os_error_ == 0) return "no OS error recorded";
-        char buf[256];
-        DWORD len = ::FormatMessageA(
-            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            NULL, last_os_error_, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-            buf, sizeof(buf), NULL);
-        if (len > 0) {
-            while (len > 0 && (buf[len - 1] == '\r' || buf[len - 1] == '\n' || buf[len - 1] == ' ')) {
-                buf[--len] = '\0';
-            }
-            return std::string(buf) + " (code " + std::to_string(last_os_error_) + ")";
-        }
-        return "Windows error code " + std::to_string(last_os_error_);
-#else
-        if (last_os_error_ == 0) return "no OS error recorded";
-        return std::string(std::strerror(last_os_error_)) + " (errno " + std::to_string(last_os_error_) + ")";
-#endif
+        return format_os_error_message(last_os_error_);
     }
 
     bool ensure_file_open() {
@@ -334,24 +453,6 @@ private:
         }
         last_os_error_ = 0;
         return true;
-#endif
-    }
-
-    void close_file() {
-        std::lock_guard<std::mutex> lk(os_mutex_);
-        if (os_lock_acquired_) {
-            release_os_lock_unlocked();
-        }
-#ifdef _WIN32
-        if (file_handle_ != INVALID_HANDLE_VALUE) {
-            ::CloseHandle(file_handle_);
-            file_handle_ = INVALID_HANDLE_VALUE;
-        }
-#else
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
 #endif
     }
 
@@ -464,25 +565,60 @@ private:
 
     void release_os_lock_unlocked() noexcept {
         if (!os_lock_acquired_) return;
+        if (is_poisoned_) return;
 
-        if (get_barrier_fault_point_for_testing() == BarrierFaultPoint::FailUnlock) {
-            // Simulated unlock failure
+        const auto fp = get_barrier_fault_point_for_testing();
+        if (fp == BarrierFaultPoint::FailUnlock) {
+            is_poisoned_ = true;
+            poison_reason_ = "Simulated unlock failure (BarrierFaultPoint::FailUnlock)";
+#ifdef _WIN32
+            last_unlock_error_ = ERROR_LOCK_FAILED;
+#else
+            last_unlock_error_ = EIO;
+#endif
+            // os_lock_acquired_ intentionally remains true to reflect kernel lock retention
             return;
         }
 
+        bool unlock_ok = true;
 #ifdef _WIN32
         if (file_handle_ != INVALID_HANDLE_VALUE) {
-            OVERLAPPED ov{};
-            ov.Offset = 0;
-            ov.OffsetHigh = 0;
-            ::UnlockFileEx(file_handle_, 0, 1, 0, &ov);
+            if (fp == BarrierFaultPoint::SimulateSyscallUnlockFailure) {
+                ::SetLastError(ERROR_LOCK_FAILED);
+                unlock_ok = false;
+            } else {
+                OVERLAPPED ov{};
+                ov.Offset = 0;
+                ov.OffsetHigh = 0;
+                unlock_ok = (::UnlockFileEx(file_handle_, 0, 1, 0, &ov) != FALSE);
+            }
+            if (!unlock_ok) {
+                last_unlock_error_ = ::GetLastError();
+                is_poisoned_ = true;
+                poison_reason_ = "UnlockFileEx failed: " + format_os_error_message(last_unlock_error_);
+                // os_lock_acquired_ remains true because OS kernel still holds the lock
+                return;
+            }
         }
 #else
         if (fd_ >= 0) {
-            ::flock(fd_, LOCK_UN);
+            if (fp == BarrierFaultPoint::SimulateSyscallUnlockFailure) {
+                errno = EIO;
+                unlock_ok = false;
+            } else {
+                unlock_ok = (::flock(fd_, LOCK_UN) == 0);
+            }
+            if (!unlock_ok) {
+                last_unlock_error_ = errno;
+                is_poisoned_ = true;
+                poison_reason_ = "flock(LOCK_UN) failed: " + format_os_error_message(last_unlock_error_);
+                // os_lock_acquired_ remains true because OS kernel still holds the lock
+                return;
+            }
         }
 #endif
         os_lock_acquired_ = false;
+        last_unlock_error_ = 0;
     }
 };
 

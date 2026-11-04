@@ -871,6 +871,207 @@ void run_peer_cas_helpers_tests(const fs::path& fixture_root, void (*check)(bool
             check(!barrier.is_os_lock_acquired(), "SEC-05 13.7: Destructor does not double-unlock failed guard");
             mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
         }
+
+        // 13.8 Simulated Shared Unlock Failure (Poison State & Lock Retention)
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+            barrier.lock_shared();
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.8: Shared lock acquired before injected unlock fault");
+
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::FailUnlock);
+            barrier.unlock_shared();
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+
+            check(barrier.is_poisoned(), "SEC-05 13.8: Barrier enters poisoned state upon shared unlock failure");
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.8: os_lock_acquired remains true to reflect kernel lock retention");
+            check(barrier.poison_reason().find("FailUnlock") != std::string::npos,
+                  "SEC-05 13.8: Poison reason contains diagnostic failure details");
+            barrier.close_file();
+        }
+
+        // 13.9 Simulated Syscall Unlock Failure with Captured OS Error Code
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+            barrier.lock_exclusive();
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.9: Exclusive lock acquired before syscall unlock fault");
+
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::SimulateSyscallUnlockFailure);
+            barrier.unlock_exclusive();
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+
+            check(barrier.is_poisoned(), "SEC-05 13.9: Barrier enters poisoned state upon syscall unlock failure");
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.9: os_lock_acquired remains true after syscall failure");
+            check(barrier.last_unlock_error() != 0, "SEC-05 13.9: Raw OS error code captured during unlock failure");
+            check(!barrier.poison_reason().empty(), "SEC-05 13.9: Diagnostic poison reason formatted from OS error");
+            barrier.close_file();
+        }
+
+        // 13.10 Subsequent Shared Acquisition Rejected on Poisoned Barrier
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            barrier.lock_shared();
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::FailUnlock);
+            barrier.unlock_shared();
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+            check(barrier.is_poisoned(), "SEC-05 13.10: Barrier verified poisoned");
+
+            bool threw = false;
+            try {
+                barrier.lock_shared();
+            } catch (const mc::cas::InterprocessLockException& ex) {
+                threw = true;
+                check(ex.status() == mc::cas::BarrierLockStatus::OperatingSystemError,
+                      "SEC-05 13.10: lock_shared throws InterprocessLockException with OperatingSystemError");
+                check(std::string(ex.what()).find("poisoned") != std::string::npos,
+                      "SEC-05 13.10: Exception message mentions poisoned barrier state");
+            }
+            check(threw, "SEC-05 13.10: lock_shared fails closed on poisoned barrier");
+
+            const auto try_st = barrier.try_lock_shared(std::chrono::milliseconds(10));
+            check(try_st == mc::cas::BarrierLockStatus::OperatingSystemError,
+                  "SEC-05 13.10: try_lock_shared immediately returns OperatingSystemError on poisoned barrier");
+            barrier.close_file();
+        }
+
+        // 13.11 Subsequent Exclusive Acquisition Rejected on Poisoned Barrier
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            barrier.lock_exclusive();
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::FailUnlock);
+            barrier.unlock_exclusive();
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+            check(barrier.is_poisoned(), "SEC-05 13.11: Barrier verified poisoned");
+
+            bool threw = false;
+            try {
+                barrier.lock_exclusive();
+            } catch (const mc::cas::InterprocessLockException& ex) {
+                threw = true;
+                check(ex.status() == mc::cas::BarrierLockStatus::OperatingSystemError,
+                      "SEC-05 13.11: lock_exclusive throws InterprocessLockException with OperatingSystemError");
+            }
+            check(threw, "SEC-05 13.11: lock_exclusive fails closed on poisoned barrier");
+
+            const auto try_st = barrier.try_lock_exclusive(std::chrono::milliseconds(10));
+            check(try_st == mc::cas::BarrierLockStatus::OperatingSystemError,
+                  "SEC-05 13.11: try_lock_exclusive immediately returns OperatingSystemError on poisoned barrier");
+            barrier.close_file();
+        }
+
+        // 13.12 Concurrent Local Readers with Final Reader Unlock Failure
+        {
+            mc::cas::InterprocessCasBarrier barrier(lock_file);
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+
+            std::atomic<bool> t1_acquired{false};
+            std::atomic<bool> t1_release{false};
+            std::atomic<bool> t1_done{false};
+
+            std::thread t1([&]() {
+                barrier.lock_shared();
+                t1_acquired = true;
+                while (!t1_release) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                barrier.unlock_shared();
+                t1_done = true;
+            });
+
+            while (!t1_acquired) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+
+            // Reader 2 (main thread) also acquires shared lock
+            barrier.lock_shared();
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.12: Reader 2 joins Reader 1 under shared lock");
+
+            // Reader 1 unlocks while fault point is None; reader count drops to 1, no OS unlock
+            t1_release = true;
+            t1.join();
+            check(t1_done, "SEC-05 13.12: Reader 1 exited cleanly");
+            check(!barrier.is_poisoned(), "SEC-05 13.12: Barrier not poisoned after non-final reader unlock");
+
+            // Now inject unlock fault for the final reader (Reader 2)
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::SimulateSyscallUnlockFailure);
+            barrier.unlock_shared();
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+
+            check(barrier.is_poisoned(), "SEC-05 13.12: Final reader unlock failure triggers barrier poisoning");
+            check(barrier.is_os_lock_acquired(), "SEC-05 13.12: Kernel lock remains marked acquired");
+
+            // Reader 3 on a separate thread attempts acquisition: must fail closed without deadlock
+            std::atomic<bool> t3_rejected{false};
+            std::thread t3([&]() {
+                try {
+                    barrier.lock_shared();
+                } catch (const mc::cas::InterprocessLockException&) {
+                    t3_rejected = true;
+                }
+            });
+            t3.join();
+            check(t3_rejected, "SEC-05 13.12: Subsequent reader thread fails closed without deadlocking");
+            barrier.close_file();
+        }
+
+        // 13.13 Repeated Cleanup and Destructor Execution After Failure
+        {
+            {
+                mc::cas::InterprocessCasBarrier barrier(lock_file);
+                barrier.lock_shared();
+                mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::FailUnlock);
+                barrier.unlock_shared();
+                mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+
+                // Multiple explicit close_file() calls must be idempotent and noexcept
+                barrier.close_file();
+                barrier.close_file();
+                check(!barrier.is_os_lock_acquired(), "SEC-05 13.13: close_file resets os_lock_acquired");
+            } // Destructor runs after explicit close_file: must not throw or crash
+            check(true, "SEC-05 13.13: Destructor executes cleanly on previously closed poisoned barrier");
+        }
+
+        // 13.14 Separate Barrier Contention After Failed Unlock & Release on Close
+        {
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+            auto barrier1 = std::make_unique<mc::cas::InterprocessCasBarrier>(lock_file);
+            barrier1->lock_exclusive();
+
+            // Simulate syscall failure on unlock: kernel lock NOT released
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::SimulateSyscallUnlockFailure);
+            barrier1->unlock_exclusive();
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+
+            check(barrier1->is_poisoned(), "SEC-05 13.14: barrier1 is poisoned");
+            check(barrier1->is_os_lock_acquired(), "SEC-05 13.14: barrier1 retains OS lock in kernel");
+
+            // barrier2 attempts to acquire lock: OS kernel must deny it because barrier1 still holds lock
+            mc::cas::InterprocessCasBarrier barrier2(lock_file);
+            auto st2 = barrier2.try_lock_exclusive(std::chrono::milliseconds(50));
+            check(st2 == mc::cas::BarrierLockStatus::Contended,
+                  "SEC-05 13.14: barrier2 is blocked (Contended) by kernel lock retained by barrier1");
+
+            // Destroy barrier1: CloseHandle / close(fd) causes OS kernel to release retained file locks
+            barrier1.reset();
+
+            // Now barrier2 can acquire exclusive lock
+            st2 = barrier2.try_lock_exclusive(std::chrono::milliseconds(100));
+            check(st2 == mc::cas::BarrierLockStatus::Acquired,
+                  "SEC-05 13.14: barrier2 acquires exclusive lock after barrier1 is destroyed and handle closed");
+            barrier2.unlock_exclusive();
+        }
+
+        // 13.15 POSIX / Windows Lock Diagnostic Formatting & Documentation
+        {
+            // Verify format_os_error_message diagnostics
+            const std::string no_err = mc::cas::InterprocessCasBarrier::format_os_error_message(0);
+            check(no_err == "no OS error recorded", "SEC-05 13.15: Zero error code produces correct diagnostic string");
+
+            const std::string err_desc = mc::cas::InterprocessCasBarrier::format_os_error_message(5); // ERROR_ACCESS_DENIED on Win / EIO on POSIX
+            check(!err_desc.empty() && err_desc != "no OS error recorded",
+                  "SEC-05 13.15: Non-zero OS error code formats meaningful diagnostic description");
+        }
     }
 
     // =========================================================================
