@@ -1072,6 +1072,47 @@ void run_peer_cas_helpers_tests(const fs::path& fixture_root, void (*check)(bool
             check(!err_desc.empty() && err_desc != "no OS error recorded",
                   "SEC-05 13.15: Non-zero OS error code formats meaningful diagnostic description");
         }
+
+        // 13.16 Same-File Kernel Lock Retention on Shared Unlock Failure
+        {
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+            auto barrierA = std::make_unique<mc::cas::InterprocessCasBarrier>(lock_file);
+
+            // 1. Barrier A acquires a shared OS-level lock on the CAS barrier file
+            barrierA->lock_shared();
+            check(barrierA->is_os_lock_acquired(),
+                  "SEC-05 13.16: Barrier A acquires shared OS-level lock on CAS barrier file");
+
+            // 2. Barrier A experiences a simulated unlock failure
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::SimulateSyscallUnlockFailure);
+            barrierA->unlock_shared();
+            mc::cas::set_barrier_fault_point_for_testing(mc::cas::BarrierFaultPoint::None);
+
+            // 3. Barrier A becomes poisoned
+            check(barrierA->is_poisoned(),
+                  "SEC-05 13.16: Barrier A becomes poisoned after shared unlock failure");
+
+            // 4. os_lock_acquired_ remains true to reflect kernel lock retention
+            check(barrierA->is_os_lock_acquired(),
+                  "SEC-05 13.16: Barrier A os_lock_acquired remains true (kernel lock retained)");
+
+            // 5. Barrier B uses a separate barrier instance on the SAME underlying lock file
+            mc::cas::InterprocessCasBarrier barrierB(lock_file);
+
+            // 6. Barrier B cannot acquire an exclusive OS lock while Barrier A's handle remains open
+            auto stB = barrierB.try_lock_exclusive(std::chrono::milliseconds(50));
+            check(stB == mc::cas::BarrierLockStatus::Contended,
+                  "SEC-05 13.16: Barrier B cannot acquire exclusive OS lock while Barrier A retains kernel lock");
+
+            // 7. Barrier A is destroyed and its OS handle is closed
+            barrierA.reset();
+
+            // 8. Barrier B can subsequently acquire the exclusive lock
+            stB = barrierB.try_lock_exclusive(std::chrono::milliseconds(100));
+            check(stB == mc::cas::BarrierLockStatus::Acquired,
+                  "SEC-05 13.16: Barrier B subsequently acquires exclusive lock after Barrier A handle closure");
+            barrierB.unlock_exclusive();
+        }
     }
 
     // =========================================================================
