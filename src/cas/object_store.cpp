@@ -496,9 +496,9 @@ bool ObjectStore::reconstruct_file(const FileManifest& manifest, const fs::path&
     }
 
     // MANDATORY REQUIREMENT: Working-copy files must never be hard-linked to immutable CAS objects!
-    // We write chunk data through an atomic local staging file.
+    // We write chunk data through an atomic local staging file with a compact filename to avoid Windows MAX_PATH exhaustion.
     const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-    const fs::path staging_path = destination_path.parent_path() / ("." + destination_path.filename().string() + ".reconstruct." + std::to_string(now_ns) + ".tmp");
+    const fs::path staging_path = destination_path.parent_path() / (".rf_" + std::to_string(now_ns) + ".tmp");
 
     std::ofstream out(staging_path, std::ios::binary | std::ios::trunc);
     if (!out) {

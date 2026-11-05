@@ -73,6 +73,21 @@ struct CollabWorkspace {
     std::string description;
     fs::path root_path;
     std::int64_t created_at_ms{0};
+    std::string active_branch_id; // Milestone 3.5: Persistent active branch reference
+};
+
+// ---------------------------------------------------------------------------
+// CollabBranch: Milestone 3.5 Workspace Branching Data Model
+// ---------------------------------------------------------------------------
+struct CollabBranch {
+    std::string id;
+    std::string workspace_id;
+    std::string name;
+    std::string head_version_id;
+    std::int64_t created_at_ms{0};
+    std::string created_by_user_id;
+    bool is_default{false};
+    bool is_active{false};
 };
 
 struct CollabSubmission {
@@ -182,7 +197,10 @@ enum class CollabFaultPoint {
     FailGcBeforeSweepMark,
     FailGcMidUnlinking,
     FailGcBeforeSweepCommit,
-    FailGcDuringOrphanScan
+    FailGcDuringOrphanScan,
+    FailAfterBranchSwitchStaging,
+    FailAfterBranchSwitchBackup,
+    FailAfterBranchSwitchPromotion
 };
 
 void set_collab_fault_point_for_testing(CollabFaultPoint fp);
@@ -406,6 +424,21 @@ public:
     std::vector<CollabWorkspace> list_workspaces_for_user(const std::string& user_id);
     void assign_user_to_workspace(const std::string& workspace_id, const std::string& user_id);
     bool is_user_in_workspace(const std::string& workspace_id, const std::string& user_id);
+
+    // Milestone 3.5: Workspace Branching & Management
+    CollabBranch create_branch(const std::string& workspace_id,
+                               const std::string& name,
+                               const std::string& source_version_id = "",
+                               const std::string& user_id = "");
+    std::vector<CollabBranch> list_branches(const std::string& workspace_id);
+    std::optional<CollabBranch> find_branch_by_name(const std::string& workspace_id, const std::string& name);
+    std::optional<CollabBranch> find_branch_by_id(const std::string& branch_id);
+    std::optional<CollabBranch> get_active_branch(const std::string& workspace_id);
+    bool switch_branch(const std::string& workspace_id,
+                       const std::string& branch_name,
+                       const std::string& user_id = "");
+    bool delete_branch(const std::string& workspace_id,
+                       const std::string& branch_name);
 
     // Filesystem Path Resolution within Workspace
     fs::path workspace_root(const std::string& ws_id) const;
@@ -685,8 +718,13 @@ private:
     // Recovery Subroutines -- Precondition: caller must hold workspace lock for ws_id
     void recover_accept_submission_op(const WorkspaceOperationRecord& op);
     void recover_publish_version_op(const WorkspaceOperationRecord& op);
+    void recover_switch_branch_op(const WorkspaceOperationRecord& op);
     void scan_and_reconcile_orphaned_directories(const std::string& ws_id);
     void revoke_all_user_sessions_nolock(const std::string& user_id);
+    void migrate_workspace_branches_nolock();
+    std::optional<CollabBranch> find_branch_by_name_nolock(const std::string& ws_id, const std::string& name);
+    std::optional<CollabBranch> find_branch_by_id_nolock(const std::string& branch_id);
+    std::vector<CollabBranch> list_branches_nolock(const std::string& ws_id);
     void record_event_nolock(const std::string& actor_id,
                              const std::string& actor_username,
                              const std::string& action,

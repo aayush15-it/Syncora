@@ -459,7 +459,8 @@ void CollabStore::init_schema() {
             name TEXT UNIQUE NOT NULL,
             description TEXT,
             root_path TEXT NOT NULL,
-            created_at_ms INTEGER NOT NULL
+            created_at_ms INTEGER NOT NULL,
+            active_branch_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS workspace_members (
@@ -595,8 +596,125 @@ void CollabStore::init_schema() {
         );
         CREATE INDEX IF NOT EXISTS idx_cas_gc_log_time ON cas_gc_log(started_at_ms);
         CREATE INDEX IF NOT EXISTS idx_cas_gc_log_state ON cas_gc_log(state);
+        -- Milestone 3.5: Content-Addressed Workspace Branches
+        CREATE TABLE IF NOT EXISTS workspace_branches (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            head_version_id TEXT REFERENCES published_versions(id) ON DELETE SET NULL,
+            created_at_ms INTEGER NOT NULL,
+            created_by_user_id TEXT,
+            is_default INTEGER DEFAULT 0,
+            UNIQUE(workspace_id, name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_branches_ws ON workspace_branches(workspace_id);
+        CREATE INDEX IF NOT EXISTS idx_workspace_branches_head ON workspace_branches(head_version_id);
     )";
     execute_sql(schema);
+
+    // Milestone 3.5 Migration: Ensure active_branch_id column exists on workspaces
+    bool has_active_branch = false;
+    sqlite3_stmt* info_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "PRAGMA table_info(workspaces)", -1, &info_stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(info_stmt) == SQLITE_ROW) {
+            const char* col_name = reinterpret_cast<const char*>(sqlite3_column_text(info_stmt, 1));
+            if (col_name && std::string(col_name) == "active_branch_id") {
+                has_active_branch = true;
+                break;
+            }
+        }
+        sqlite3_finalize(info_stmt);
+    }
+    if (!has_active_branch) {
+        execute_sql("ALTER TABLE workspaces ADD COLUMN active_branch_id TEXT;");
+    }
+
+    migrate_workspace_branches_nolock();
+}
+
+void CollabStore::migrate_workspace_branches_nolock() {
+    sqlite3_stmt* ws_stmt = nullptr;
+    const char* ws_sql = "SELECT id, active_branch_id FROM workspaces";
+    ws_stmt = stmt_registry_.prepare(db_, ws_sql);
+    if (!ws_stmt) return;
+
+    struct WsEntry {
+        std::string id;
+        std::string active_branch_id;
+    };
+    std::vector<WsEntry> ws_list;
+    while (sqlite3_step(ws_stmt) == SQLITE_ROW) {
+        std::string id = reinterpret_cast<const char*>(sqlite3_column_text(ws_stmt, 0));
+        const auto* act = sqlite3_column_text(ws_stmt, 1);
+        std::string act_str = act ? reinterpret_cast<const char*>(act) : "";
+        ws_list.push_back({std::move(id), std::move(act_str)});
+    }
+    stmt_registry_.finalize(ws_stmt);
+
+    for (const auto& ws : ws_list) {
+        sqlite3_stmt* br_stmt = nullptr;
+        const char* br_sql = "SELECT id, head_version_id FROM workspace_branches WHERE workspace_id = ? AND name = 'main'";
+        br_stmt = stmt_registry_.prepare(db_, br_sql);
+        std::string main_br_id;
+        std::string main_head;
+        bool main_exists = false;
+        if (br_stmt) {
+            sqlite3_bind_text(br_stmt, 1, ws.id.c_str(), -1, SQLITE_STATIC);
+            if (sqlite3_step(br_stmt) == SQLITE_ROW) {
+                main_exists = true;
+                main_br_id = reinterpret_cast<const char*>(sqlite3_column_text(br_stmt, 0));
+                const auto* h = sqlite3_column_text(br_stmt, 1);
+                if (h) main_head = reinterpret_cast<const char*>(h);
+            }
+            stmt_registry_.finalize(br_stmt);
+        }
+
+        if (!main_exists) {
+            std::string latest_ver_id;
+            sqlite3_stmt* ver_stmt = nullptr;
+            const char* ver_sql = "SELECT id FROM published_versions WHERE workspace_id = ? ORDER BY published_at_ms DESC LIMIT 1";
+            ver_stmt = stmt_registry_.prepare(db_, ver_sql);
+            if (ver_stmt) {
+                sqlite3_bind_text(ver_stmt, 1, ws.id.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(ver_stmt) == SQLITE_ROW) {
+                    latest_ver_id = reinterpret_cast<const char*>(sqlite3_column_text(ver_stmt, 0));
+                }
+                stmt_registry_.finalize(ver_stmt);
+            }
+
+            main_br_id = "br_main_" + generate_random_token(8);
+            sqlite3_stmt* ins_stmt = nullptr;
+            const char* ins_sql = R"(
+                INSERT INTO workspace_branches (id, workspace_id, name, head_version_id, created_at_ms, created_by_user_id, is_default)
+                VALUES (?, ?, 'main', ?, ?, 'system', 1)
+            )";
+            ins_stmt = stmt_registry_.prepare(db_, ins_sql);
+            if (ins_stmt) {
+                sqlite3_bind_text(ins_stmt, 1, main_br_id.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(ins_stmt, 2, ws.id.c_str(), -1, SQLITE_STATIC);
+                if (latest_ver_id.empty()) {
+                    sqlite3_bind_null(ins_stmt, 3);
+                } else {
+                    sqlite3_bind_text(ins_stmt, 3, latest_ver_id.c_str(), -1, SQLITE_STATIC);
+                }
+                sqlite3_bind_int64(ins_stmt, 4, now_ms());
+                sqlite3_step(ins_stmt);
+                stmt_registry_.finalize(ins_stmt);
+            }
+        }
+
+        if (ws.active_branch_id.empty()) {
+            sqlite3_stmt* upd_stmt = nullptr;
+            const char* upd_sql = "UPDATE workspaces SET active_branch_id = ? WHERE id = ?";
+            upd_stmt = stmt_registry_.prepare(db_, upd_sql);
+            if (upd_stmt) {
+                sqlite3_bind_text(upd_stmt, 1, main_br_id.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(upd_stmt, 2, ws.id.c_str(), -1, SQLITE_STATIC);
+                sqlite3_step(upd_stmt);
+                stmt_registry_.finalize(upd_stmt);
+            }
+        }
+    }
 }
 
 void CollabStore::seed_default_accounts_if_empty() {
@@ -953,6 +1071,7 @@ CollabWorkspace CollabStore::create_workspace(const std::string& name, const std
     ws.description = description;
     ws.root_path = base_storage_dir_ / "workspaces" / ws.id;
     ws.created_at_ms = now_ms();
+    ws.active_branch_id = "br_main_" + generate_random_token(8);
 
     fs::create_directories(ws.root_path);
     fs::create_directories(workspace_submissions_dir(ws.id));
@@ -961,7 +1080,7 @@ CollabWorkspace CollabStore::create_workspace(const std::string& name, const std
     fs::create_directories(workspace_versions_dir(ws.id));
 
     sqlite3_stmt* stmt = nullptr;
-    const char* sql = "INSERT INTO workspaces (id, name, description, root_path, created_at_ms) VALUES (?, ?, ?, ?, ?)";
+    const char* sql = "INSERT INTO workspaces (id, name, description, root_path, created_at_ms, active_branch_id) VALUES (?, ?, ?, ?, ?, ?)";
     stmt = stmt_registry_.prepare(db_, sql); if (!stmt) {
         throw std::runtime_error("failed to prepare workspace insert");
     }
@@ -972,6 +1091,7 @@ CollabWorkspace CollabStore::create_workspace(const std::string& name, const std
     sqlite3_bind_text(stmt, 3, ws.description.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 4, root_str.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_int64(stmt, 5, ws.created_at_ms);
+    sqlite3_bind_text(stmt, 6, ws.active_branch_id.c_str(), -1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::string err = sqlite3_errmsg(db_);
@@ -980,6 +1100,25 @@ CollabWorkspace CollabStore::create_workspace(const std::string& name, const std
     }
     stmt_registry_.finalize(stmt);
 
+    // Milestone 3.5: Initialize default main branch for newly created workspace
+    sqlite3_stmt* br_stmt = nullptr;
+    const char* br_sql = R"(
+        INSERT INTO workspace_branches (id, workspace_id, name, head_version_id, created_at_ms, created_by_user_id, is_default)
+        VALUES (?, ?, 'main', NULL, ?, 'system', 1)
+    )";
+    br_stmt = stmt_registry_.prepare(db_, br_sql);
+    if (br_stmt) {
+        sqlite3_bind_text(br_stmt, 1, ws.active_branch_id.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(br_stmt, 2, ws.id.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(br_stmt, 3, ws.created_at_ms);
+        if (sqlite3_step(br_stmt) != SQLITE_DONE) {
+            std::string err = sqlite3_errmsg(db_);
+            stmt_registry_.finalize(br_stmt);
+            throw std::runtime_error("failed to create default branch: " + err);
+        }
+        stmt_registry_.finalize(br_stmt);
+    }
+
     return ws;
 }
 
@@ -987,7 +1126,7 @@ CollabWorkspace CollabStore::create_workspace(const std::string& name, const std
 std::vector<CollabWorkspace> CollabStore::list_workspaces_nolock() {
     std::vector<CollabWorkspace> workspaces;
     sqlite3_stmt* stmt = nullptr;
-    const char* sql = "SELECT id, name, description, root_path, created_at_ms FROM workspaces ORDER BY created_at_ms ASC";
+    const char* sql = "SELECT id, name, description, root_path, created_at_ms, active_branch_id FROM workspaces ORDER BY created_at_ms ASC";
     stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return workspaces;
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -998,6 +1137,8 @@ std::vector<CollabWorkspace> CollabStore::list_workspaces_nolock() {
         ws.description = desc ? reinterpret_cast<const char*>(desc) : "";
         ws.root_path = fs::u8path(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
         ws.created_at_ms = sqlite3_column_int64(stmt, 4);
+        const auto* act = sqlite3_column_text(stmt, 5);
+        ws.active_branch_id = act ? reinterpret_cast<const char*>(act) : "";
         workspaces.push_back(ws);
     }
     stmt_registry_.finalize(stmt);
@@ -1013,7 +1154,7 @@ std::vector<CollabWorkspace> CollabStore::list_workspaces() {
 // Precondition: caller must hold db_mutex_.
 std::optional<CollabWorkspace> CollabStore::find_workspace_by_id_nolock(const std::string& ws_id) {
     sqlite3_stmt* stmt = nullptr;
-    const char* sql = "SELECT id, name, description, root_path, created_at_ms FROM workspaces WHERE id = ?";
+    const char* sql = "SELECT id, name, description, root_path, created_at_ms, active_branch_id FROM workspaces WHERE id = ?";
     stmt = stmt_registry_.prepare(db_, sql); if (!stmt) return std::nullopt;
     sqlite3_bind_text(stmt, 1, ws_id.c_str(), -1, SQLITE_STATIC);
 
@@ -1025,6 +1166,8 @@ std::optional<CollabWorkspace> CollabStore::find_workspace_by_id_nolock(const st
         ws.description = desc ? reinterpret_cast<const char*>(desc) : "";
         ws.root_path = fs::u8path(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
         ws.created_at_ms = sqlite3_column_int64(stmt, 4);
+        const auto* act = sqlite3_column_text(stmt, 5);
+        ws.active_branch_id = act ? reinterpret_cast<const char*>(act) : "";
         stmt_registry_.finalize(stmt);
         return ws;
     }
@@ -1053,7 +1196,7 @@ std::vector<CollabWorkspace> CollabStore::list_workspaces_for_user(const std::st
     std::vector<CollabWorkspace> workspaces;
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
-        SELECT w.id, w.name, w.description, w.root_path, w.created_at_ms
+        SELECT w.id, w.name, w.description, w.root_path, w.created_at_ms, w.active_branch_id
         FROM workspaces w
         JOIN workspace_members wm ON w.id = wm.workspace_id
         WHERE wm.user_id = ?
@@ -1070,6 +1213,8 @@ std::vector<CollabWorkspace> CollabStore::list_workspaces_for_user(const std::st
         ws.description = desc ? reinterpret_cast<const char*>(desc) : "";
         ws.root_path = fs::u8path(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
         ws.created_at_ms = sqlite3_column_int64(stmt, 4);
+        const auto* act = sqlite3_column_text(stmt, 5);
+        ws.active_branch_id = act ? reinterpret_cast<const char*>(act) : "";
         workspaces.push_back(ws);
     }
     stmt_registry_.finalize(stmt);
@@ -1110,6 +1255,515 @@ bool CollabStore::is_user_in_workspace(const std::string& workspace_id, const st
     const bool found = (sqlite3_step(stmt) == SQLITE_ROW);
     stmt_registry_.finalize(stmt);
     return found;
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 3.5: Workspace Branching & Management
+// ---------------------------------------------------------------------------
+static bool is_valid_branch_name(const std::string& name) {
+    if (name.empty() || name.size() > 128) return false;
+    if (name == "." || name == ".." || name.front() == '/' || name.back() == '/' || name.front() == '-' || name.back() == '.') return false;
+    if (name.find("//") != std::string::npos || name.find("..") != std::string::npos) return false;
+    if (name == "HEAD" || name == "head") return false;
+
+    std::string seg;
+    std::stringstream ss(name);
+    while (std::getline(ss, seg, '/')) {
+        if (seg.empty() || seg == "." || seg == "..") return false;
+        if (seg.front() == '.' || seg.back() == '.') return false;
+    }
+
+    for (char c : name) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '/' || c == '_' || c == '-' || c == '.') continue;
+        return false;
+    }
+    return true;
+}
+
+std::optional<CollabBranch> CollabStore::find_branch_by_name_nolock(const std::string& ws_id, const std::string& name) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"(
+        SELECT b.id, b.workspace_id, b.name, b.head_version_id, b.created_at_ms,
+               b.created_by_user_id, b.is_default,
+               CASE WHEN w.active_branch_id = b.id THEN 1 ELSE 0 END as is_active
+        FROM workspace_branches b
+        JOIN workspaces w ON b.workspace_id = w.id
+        WHERE b.workspace_id = ? AND b.name = ?
+    )";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) return std::nullopt;
+    sqlite3_bind_text(stmt, 1, ws_id.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, name.c_str(), -1, SQLITE_STATIC);
+
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        CollabBranch b;
+        b.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        b.workspace_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        b.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        const auto* h = sqlite3_column_text(stmt, 3);
+        if (h) b.head_version_id = reinterpret_cast<const char*>(h);
+        b.created_at_ms = sqlite3_column_int64(stmt, 4);
+        const auto* u = sqlite3_column_text(stmt, 5);
+        if (u) b.created_by_user_id = reinterpret_cast<const char*>(u);
+        b.is_default = (sqlite3_column_int(stmt, 6) != 0);
+        b.is_active = (sqlite3_column_int(stmt, 7) != 0);
+        stmt_registry_.finalize(stmt);
+        return b;
+    }
+    stmt_registry_.finalize(stmt);
+    return std::nullopt;
+}
+
+std::optional<CollabBranch> CollabStore::find_branch_by_id_nolock(const std::string& branch_id) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"(
+        SELECT b.id, b.workspace_id, b.name, b.head_version_id, b.created_at_ms,
+               b.created_by_user_id, b.is_default,
+               CASE WHEN w.active_branch_id = b.id THEN 1 ELSE 0 END as is_active
+        FROM workspace_branches b
+        JOIN workspaces w ON b.workspace_id = w.id
+        WHERE b.id = ?
+    )";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) return std::nullopt;
+    sqlite3_bind_text(stmt, 1, branch_id.c_str(), -1, SQLITE_STATIC);
+
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        CollabBranch b;
+        b.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        b.workspace_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        b.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        const auto* h = sqlite3_column_text(stmt, 3);
+        if (h) b.head_version_id = reinterpret_cast<const char*>(h);
+        b.created_at_ms = sqlite3_column_int64(stmt, 4);
+        const auto* u = sqlite3_column_text(stmt, 5);
+        if (u) b.created_by_user_id = reinterpret_cast<const char*>(u);
+        b.is_default = (sqlite3_column_int(stmt, 6) != 0);
+        b.is_active = (sqlite3_column_int(stmt, 7) != 0);
+        stmt_registry_.finalize(stmt);
+        return b;
+    }
+    stmt_registry_.finalize(stmt);
+    return std::nullopt;
+}
+
+std::vector<CollabBranch> CollabStore::list_branches_nolock(const std::string& ws_id) {
+    std::vector<CollabBranch> branches;
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"(
+        SELECT b.id, b.workspace_id, b.name, b.head_version_id, b.created_at_ms,
+               b.created_by_user_id, b.is_default,
+               CASE WHEN w.active_branch_id = b.id THEN 1 ELSE 0 END as is_active
+        FROM workspace_branches b
+        JOIN workspaces w ON b.workspace_id = w.id
+        WHERE b.workspace_id = ?
+        ORDER BY b.is_default DESC, b.name ASC
+    )";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) return branches;
+    sqlite3_bind_text(stmt, 1, ws_id.c_str(), -1, SQLITE_STATIC);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        CollabBranch b;
+        b.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        b.workspace_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        b.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        const auto* h = sqlite3_column_text(stmt, 3);
+        if (h) b.head_version_id = reinterpret_cast<const char*>(h);
+        b.created_at_ms = sqlite3_column_int64(stmt, 4);
+        const auto* u = sqlite3_column_text(stmt, 5);
+        if (u) b.created_by_user_id = reinterpret_cast<const char*>(u);
+        b.is_default = (sqlite3_column_int(stmt, 6) != 0);
+        b.is_active = (sqlite3_column_int(stmt, 7) != 0);
+        branches.push_back(std::move(b));
+    }
+    stmt_registry_.finalize(stmt);
+    return branches;
+}
+
+CollabBranch CollabStore::create_branch(const std::string& workspace_id,
+                                        const std::string& name,
+                                        const std::string& source_version_id,
+                                        const std::string& user_id) {
+    OperationGuard op_guard(*this);
+
+    if (!is_valid_branch_name(name)) {
+        throw std::runtime_error("invalid branch name: '" + name + "'");
+    }
+
+    // 1. Resolve workspace ID under db_mutex_
+    std::string actual_ws_id = workspace_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(workspace_id);
+        if (!ws) throw std::runtime_error("workspace not found: " + workspace_id);
+        actual_ws_id = ws->id;
+    }
+
+    // 2. Acquire workspace lock
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+
+    // 3. Validate uniqueness and version reference under db_mutex_
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    auto existing = find_branch_by_name_nolock(actual_ws_id, name);
+    if (existing) {
+        throw std::runtime_error("branch already exists: '" + name + "' in workspace: " + actual_ws_id);
+    }
+
+    std::string target_head_id = source_version_id;
+    if (target_head_id.empty()) {
+        // Default to current active branch head version
+        auto active_br = find_branch_by_name_nolock(actual_ws_id, "main");
+        auto ws = find_workspace_by_id_nolock(actual_ws_id);
+        if (ws && !ws->active_branch_id.empty()) {
+            auto cur_active = find_branch_by_id_nolock(ws->active_branch_id);
+            if (cur_active) target_head_id = cur_active->head_version_id;
+        } else if (active_br) {
+            target_head_id = active_br->head_version_id;
+        }
+    } else {
+        auto ver = find_version_by_id_nolock(target_head_id);
+        if (!ver) throw std::runtime_error("source version not found: " + target_head_id);
+        if (ver->workspace_id != actual_ws_id) {
+            throw std::runtime_error("source version belongs to a different workspace");
+        }
+    }
+
+    CollabBranch br;
+    br.id = "br_" + generate_random_token(10);
+    br.workspace_id = actual_ws_id;
+    br.name = name;
+    br.head_version_id = target_head_id;
+    br.created_at_ms = now_ms();
+    br.created_by_user_id = user_id.empty() ? "system" : user_id;
+    br.is_default = false;
+    br.is_active = false;
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"(
+        INSERT INTO workspace_branches (id, workspace_id, name, head_version_id, created_at_ms, created_by_user_id, is_default)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+    )";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) throw std::runtime_error("failed to prepare branch insert statement");
+    sqlite3_bind_text(stmt, 1, br.id.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, br.workspace_id.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, br.name.c_str(), -1, SQLITE_STATIC);
+    if (br.head_version_id.empty()) sqlite3_bind_null(stmt, 4);
+    else sqlite3_bind_text(stmt, 4, br.head_version_id.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 5, br.created_at_ms);
+    sqlite3_bind_text(stmt, 6, br.created_by_user_id.c_str(), -1, SQLITE_STATIC);
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        std::string err = sqlite3_errmsg(db_);
+        stmt_registry_.finalize(stmt);
+        throw std::runtime_error("failed to create branch: " + err);
+    }
+    stmt_registry_.finalize(stmt);
+
+    const auto user_opt = user_id.empty() ? std::nullopt : find_user_by_id_nolock(user_id);
+    record_event_nolock(user_id.empty() ? "system" : user_id,
+                        user_opt ? user_opt->username : "host",
+                        "BRANCH_CREATED",
+                        "branch:" + br.id,
+                        "success",
+                        "Created branch " + name + " in workspace " + actual_ws_id);
+
+    return br;
+}
+
+std::vector<CollabBranch> CollabStore::list_branches(const std::string& workspace_id) {
+    OperationGuard op_guard(*this);
+    std::string actual_ws_id = workspace_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(workspace_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    return list_branches_nolock(actual_ws_id);
+}
+
+std::optional<CollabBranch> CollabStore::find_branch_by_name(const std::string& workspace_id, const std::string& name) {
+    OperationGuard op_guard(*this);
+    std::string actual_ws_id = workspace_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(workspace_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    return find_branch_by_name_nolock(actual_ws_id, name);
+}
+
+std::optional<CollabBranch> CollabStore::find_branch_by_id(const std::string& branch_id) {
+    OperationGuard op_guard(*this);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    return find_branch_by_id_nolock(branch_id);
+}
+
+std::optional<CollabBranch> CollabStore::get_active_branch(const std::string& workspace_id) {
+    OperationGuard op_guard(*this);
+    std::string actual_ws_id = workspace_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(workspace_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    auto list = list_branches_nolock(actual_ws_id);
+    for (const auto& b : list) {
+        if (b.is_active) return b;
+    }
+    if (!list.empty()) return list.front();
+    return std::nullopt;
+}
+
+bool CollabStore::delete_branch(const std::string& workspace_id,
+                                const std::string& branch_name) {
+    OperationGuard op_guard(*this);
+
+    // 1. Resolve workspace ID under db_mutex_
+    std::string actual_ws_id = workspace_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(workspace_id);
+        if (!ws) throw std::runtime_error("workspace not found: " + workspace_id);
+        actual_ws_id = ws->id;
+    }
+
+    // 2. Acquire workspace lock
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+
+    // 3. Check constraints and delete under db_mutex_
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
+    auto br = find_branch_by_name_nolock(actual_ws_id, branch_name);
+    if (!br) br = find_branch_by_id_nolock(branch_name);
+    if (!br || br->workspace_id != actual_ws_id) return false;
+
+    if (br->is_default) {
+        throw std::runtime_error("cannot delete default branch '" + branch_name + "'");
+    }
+
+    auto ws = find_workspace_by_id_nolock(actual_ws_id);
+    if (ws && ws->active_branch_id == br->id) {
+        throw std::runtime_error("cannot delete currently active branch '" + branch_name + "'");
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "DELETE FROM workspace_branches WHERE id = ?";
+    stmt = stmt_registry_.prepare(db_, sql);
+    if (!stmt) throw std::runtime_error("failed to prepare branch delete statement");
+    sqlite3_bind_text(stmt, 1, br->id.c_str(), -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        std::string err = sqlite3_errmsg(db_);
+        stmt_registry_.finalize(stmt);
+        throw std::runtime_error("failed to delete branch: " + err);
+    }
+    stmt_registry_.finalize(stmt);
+
+    record_event_nolock("system", "host", "BRANCH_DELETED", "branch:" + br->id, "success",
+                        "Deleted branch " + branch_name + " in workspace " + actual_ws_id);
+    return true;
+}
+
+bool CollabStore::switch_branch(const std::string& workspace_id,
+                                const std::string& branch_name,
+                                const std::string& user_id) {
+    OperationGuard op_guard(*this);
+    cas::CasSharedBarrierGuard cas_lock(cas_barrier_);
+
+    // 1. Resolve workspace ID under db_mutex_
+    std::string actual_ws_id = workspace_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(workspace_id);
+        if (!ws) throw std::runtime_error("workspace not found: " + workspace_id);
+        actual_ws_id = ws->id;
+    }
+
+    // 2. Acquire workspace lock to serialize modifications
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+
+    // 3. Lookup target branch and current active branch under db_mutex_
+    CollabBranch target_branch;
+    std::string current_active_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        auto b_opt = find_branch_by_name_nolock(actual_ws_id, branch_name);
+        if (!b_opt) b_opt = find_branch_by_id_nolock(branch_name);
+        if (!b_opt || b_opt->workspace_id != actual_ws_id) throw std::runtime_error("branch not found: " + branch_name);
+        target_branch = *b_opt;
+
+        auto ws = find_workspace_by_id_nolock(actual_ws_id);
+        if (ws) current_active_id = ws->active_branch_id;
+    }
+
+    // If already on this branch, nothing to do
+    if (current_active_id == target_branch.id) {
+        return true;
+    }
+
+    const auto ws_root_dir = workspace_root(actual_ws_id);
+    const auto work_dir = workspace_working_copy_dir(actual_ws_id);
+    const auto base_dir = workspace_baseline_dir(actual_ws_id);
+
+    const std::string op_id = "sw_" + generate_random_token(6);
+    const auto staging_work = ws_root_dir / (".staging_work_" + op_id);
+    const auto staging_base = ws_root_dir / (".staging_base_" + op_id);
+    const auto backup_work  = ws_root_dir / (".backup_work_" + op_id);
+    const auto backup_base  = ws_root_dir / (".backup_base_" + op_id);
+
+    assert_path_absent(staging_work);
+    assert_path_absent(staging_base);
+    assert_path_absent(backup_work);
+    assert_path_absent(backup_base);
+
+    // 4. Record intent in journal
+    WorkspaceOperationRecord op_rec;
+    op_rec.op_id = op_id;
+    op_rec.workspace_id = actual_ws_id;
+    op_rec.operation_type = "SWITCH_BRANCH";
+    op_rec.target_id = target_branch.id;
+    op_rec.state = "PENDING";
+    op_rec.intent_step = "STAGE_WORK";
+    op_rec.expected_base_hash = "";
+    op_rec.expected_work_hash = "";
+    op_rec.replacement_hash = target_branch.head_version_id;
+    op_rec.created_at_ms = now_ms();
+    op_rec.updated_at_ms = op_rec.created_at_ms;
+
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        insert_operation_intent_nolock(op_rec);
+    }
+
+    try {
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterIntent, "FailAfterIntent");
+
+        // 5. Stage files for target branch head version
+        fs::create_directories(staging_work);
+        fs::create_directories(staging_base);
+
+        if (!target_branch.head_version_id.empty()) {
+            std::string recon_err;
+            if (!reconstruct_version(target_branch.head_version_id, staging_work, recon_err)) {
+                throw std::runtime_error("failed reconstructing target branch head: " + recon_err);
+            }
+            copy_directory_recursive(staging_work, staging_base);
+        }
+
+        if (!create_sentinel_file(staging_work, op_id, actual_ws_id, "SWITCH_BRANCH", "staging_work")) {
+            throw std::runtime_error("failed creating staging_work sentinel");
+        }
+        if (!create_sentinel_file(staging_base, op_id, actual_ws_id, "SWITCH_BRANCH", "staging_base")) {
+            throw std::runtime_error("failed creating staging_base sentinel");
+        }
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterBranchSwitchStaging, "FailAfterBranchSwitchStaging");
+
+        // 6. Backup current working_copy and baseline
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "STAGED", "BACKUP_DIRECTORIES");
+        }
+
+        if (fs::exists(work_dir)) {
+            safe_rename_directory(work_dir, backup_work);
+            if (!create_sentinel_file(backup_work, op_id, actual_ws_id, "SWITCH_BRANCH", "backup_work")) {
+                throw std::runtime_error("failed creating backup_work sentinel");
+            }
+        } else {
+            fs::create_directories(backup_work);
+            create_sentinel_file(backup_work, op_id, actual_ws_id, "SWITCH_BRANCH", "backup_work");
+        }
+
+        if (fs::exists(base_dir)) {
+            safe_rename_directory(base_dir, backup_base);
+            if (!create_sentinel_file(backup_base, op_id, actual_ws_id, "SWITCH_BRANCH", "backup_base")) {
+                throw std::runtime_error("failed creating backup_base sentinel");
+            }
+        } else {
+            fs::create_directories(backup_base);
+            create_sentinel_file(backup_base, op_id, actual_ws_id, "SWITCH_BRANCH", "backup_base");
+        }
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterBranchSwitchBackup, "FailAfterBranchSwitchBackup");
+
+        // 7. Promote staged directories to working_copy and baseline
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "PROMOTING", "PROMOTE_DIRECTORIES");
+        }
+
+        fs::remove(staging_work / ".syncora_op_sentinel");
+        safe_rename_directory(staging_work, work_dir);
+
+        fs::remove(staging_base / ".syncora_op_sentinel");
+        safe_rename_directory(staging_base, base_dir);
+
+        trigger_collab_fault_point(CollabFaultPoint::FailAfterBranchSwitchPromotion, "FailAfterBranchSwitchPromotion");
+
+        // 8. Commit database update under db_mutex_
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            execute_sql("BEGIN IMMEDIATE;");
+            try {
+                sqlite3_stmt* upd_stmt = nullptr;
+                const char* upd_sql = "UPDATE workspaces SET active_branch_id = ? WHERE id = ?";
+                upd_stmt = stmt_registry_.prepare(db_, upd_sql);
+                if (!upd_stmt) throw std::runtime_error("failed to prepare workspace active branch update");
+                sqlite3_bind_text(upd_stmt, 1, target_branch.id.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(upd_stmt, 2, actual_ws_id.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(upd_stmt) != SQLITE_DONE) {
+                    std::string err = sqlite3_errmsg(db_);
+                    stmt_registry_.finalize(upd_stmt);
+                    throw std::runtime_error("failed to update active branch in DB: " + err);
+                }
+                stmt_registry_.finalize(upd_stmt);
+
+                update_operation_intent_nolock(op_id, "COMMITTED", "CLEANUP");
+
+                const auto user_opt = user_id.empty() ? std::nullopt : find_user_by_id_nolock(user_id);
+                record_event_nolock(user_id.empty() ? "system" : user_id,
+                                    user_opt ? user_opt->username : "host",
+                                    "BRANCH_SWITCHED",
+                                    "branch:" + target_branch.id,
+                                    "success",
+                                    "Switched workspace " + actual_ws_id + " to branch " + branch_name);
+
+                execute_sql("COMMIT;");
+            } catch (...) {
+                execute_sql("ROLLBACK;");
+                throw;
+            }
+        }
+
+        // 9. Clean up backup directories
+        if (fs::exists(backup_work)) {
+            auto sres = validate_sentinel_file(backup_work, op_id, actual_ws_id, "backup_work");
+            if (sres.valid) fs::remove_all(backup_work);
+            else quarantine_directory(backup_work, actual_ws_id, "invalid backup_work sentinel");
+        }
+        if (fs::exists(backup_base)) {
+            auto sres = validate_sentinel_file(backup_base, op_id, actual_ws_id, "backup_base");
+            if (sres.valid) fs::remove_all(backup_base);
+            else quarantine_directory(backup_base, actual_ws_id, "invalid backup_base sentinel");
+        }
+
+        {
+            std::lock_guard<std::mutex> db_lock(db_mutex_);
+            update_operation_intent_nolock(op_id, "COMMITTED", "COMPLETED");
+        }
+
+        return true;
+    } catch (...) {
+        recover_switch_branch_op(op_rec);
+        throw;
+    }
 }
 
 fs::path CollabStore::workspace_root(const std::string& ws_id) const {
@@ -1856,6 +2510,95 @@ void CollabStore::scan_and_reconcile_orphaned_directories(const std::string& ws_
     }
 }
 
+void CollabStore::recover_switch_branch_op(const WorkspaceOperationRecord& op) {
+    const auto ws_root_dir = workspace_root(op.workspace_id);
+    const auto base_dir = workspace_baseline_dir(op.workspace_id);
+    const auto work_dir = workspace_working_copy_dir(op.workspace_id);
+    const auto staging_base = ws_root_dir / (".staging_base_" + op.op_id);
+    const auto staging_work = ws_root_dir / (".staging_work_" + op.op_id);
+    const auto backup_base  = ws_root_dir / (".backup_base_" + op.op_id);
+    const auto backup_work  = ws_root_dir / (".backup_work_" + op.op_id);
+
+    bool is_committed = false;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        auto cur = find_workspace_operation_nolock(op.op_id);
+        if (cur && cur->state == "COMMITTED") is_committed = true;
+    }
+
+    if (is_committed) {
+        // Forward recovery: branch switch already committed in SQLite
+        if (fs::exists(backup_base)) {
+            auto sres = validate_sentinel_file(backup_base, op.op_id, op.workspace_id, "backup_base");
+            if (sres.valid) fs::remove_all(backup_base);
+            else quarantine_directory(backup_base, op.workspace_id, "corrupt backup_base sentinel");
+        }
+        if (fs::exists(backup_work)) {
+            auto sres = validate_sentinel_file(backup_work, op.op_id, op.workspace_id, "backup_work");
+            if (sres.valid) fs::remove_all(backup_work);
+            else quarantine_directory(backup_work, op.workspace_id, "corrupt backup_work sentinel");
+        }
+        if (fs::exists(staging_base)) fs::remove_all(staging_base);
+        if (fs::exists(staging_work)) fs::remove_all(staging_work);
+        fs::remove(work_dir / ".syncora_op_sentinel");
+        fs::remove(base_dir / ".syncora_op_sentinel");
+
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        update_operation_intent_nolock(op.op_id, "COMMITTED", "COMPLETED");
+        record_event_nolock("SYSTEM", "recovery", "BRANCH_SWITCH_RECOVERY_FORWARD_COMPLETED",
+                            "workspace:" + op.workspace_id, "success",
+                            "Completed post-commit branch switch cleanup for op " + op.op_id);
+        return;
+    }
+
+    // Rollback uncommitted branch switch
+    trigger_collab_fault_point(CollabFaultPoint::FailDuringRecovery, "FailDuringRecovery");
+
+    if (fs::exists(backup_work)) {
+        auto sres = validate_sentinel_file(backup_work, op.op_id, op.workspace_id, "backup_work");
+        if (sres.valid) {
+            fs::remove(backup_work / ".syncora_op_sentinel");
+            if (fs::exists(work_dir)) fs::remove_all(work_dir);
+            safe_rename_directory(backup_work, work_dir);
+        } else {
+            quarantine_directory(backup_work, op.workspace_id, sres.error);
+        }
+    }
+
+    if (fs::exists(backup_base)) {
+        auto sres = validate_sentinel_file(backup_base, op.op_id, op.workspace_id, "backup_base");
+        if (sres.valid) {
+            fs::remove(backup_base / ".syncora_op_sentinel");
+            if (fs::exists(base_dir)) fs::remove_all(base_dir);
+            safe_rename_directory(backup_base, base_dir);
+        } else {
+            quarantine_directory(backup_base, op.workspace_id, sres.error);
+        }
+    }
+
+    if (fs::exists(staging_work)) {
+        auto sres = validate_sentinel_file(staging_work, op.op_id, op.workspace_id, "staging_work");
+        if (sres.valid) fs::remove_all(staging_work);
+        else quarantine_directory(staging_work, op.workspace_id, sres.error);
+    }
+    if (fs::exists(staging_base)) {
+        auto sres = validate_sentinel_file(staging_base, op.op_id, op.workspace_id, "staging_base");
+        if (sres.valid) fs::remove_all(staging_base);
+        else quarantine_directory(staging_base, op.workspace_id, sres.error);
+    }
+
+    fs::remove(work_dir / ".syncora_op_sentinel");
+    fs::remove(base_dir / ".syncora_op_sentinel");
+
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        update_operation_intent_nolock(op.op_id, "FAILED", "ROLLED_BACK");
+        record_event_nolock("SYSTEM", "recovery", "BRANCH_SWITCH_RECOVERY_ROLLBACK_COMPLETED",
+                            "workspace:" + op.workspace_id, "success",
+                            "Rolled back uncommitted branch switch op " + op.op_id);
+    }
+}
+
 void CollabStore::recover_incomplete_operations() {
     std::vector<WorkspaceOperationRecord> ops;
     {
@@ -1869,6 +2612,8 @@ void CollabStore::recover_incomplete_operations() {
             recover_accept_submission_op(op);
         } else if (op.operation_type == "PUBLISH_VERSION") {
             recover_publish_version_op(op);
+        } else if (op.operation_type == "SWITCH_BRANCH") {
+            recover_switch_branch_op(op);
         }
     }
 
@@ -2528,19 +3273,57 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
         throw std::runtime_error("cannot publish: working copy scan incomplete");
     }
 
-    // Determine parent version under db_mutex_
+    // Determine active branch and parent version under db_mutex_
+    std::string active_br_id;
     std::string parent_id;
     {
         std::lock_guard<std::mutex> db_lock(db_mutex_);
         sqlite3_stmt* stmt = nullptr;
-        const char* sql = "SELECT id FROM published_versions WHERE workspace_id = ? ORDER BY published_at_ms DESC LIMIT 1";
+        const char* sql = R"(
+            SELECT b.id, b.head_version_id
+            FROM workspace_branches b
+            JOIN workspaces w ON w.active_branch_id = b.id
+            WHERE w.id = ?
+        )";
         stmt = stmt_registry_.prepare(db_, sql);
         if (stmt) {
             sqlite3_bind_text(stmt, 1, actual_ws_id.c_str(), -1, SQLITE_STATIC);
             if (sqlite3_step(stmt) == SQLITE_ROW) {
-                parent_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                active_br_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                const auto* h = sqlite3_column_text(stmt, 1);
+                if (h) parent_id = reinterpret_cast<const char*>(h);
             }
             stmt_registry_.finalize(stmt);
+        }
+
+        // Fallback to default branch if active branch was not resolved
+        if (active_br_id.empty()) {
+            sqlite3_stmt* def_stmt = nullptr;
+            const char* def_sql = "SELECT id, head_version_id FROM workspace_branches WHERE workspace_id = ? AND is_default = 1";
+            def_stmt = stmt_registry_.prepare(db_, def_sql);
+            if (def_stmt) {
+                sqlite3_bind_text(def_stmt, 1, actual_ws_id.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(def_stmt) == SQLITE_ROW) {
+                    active_br_id = reinterpret_cast<const char*>(sqlite3_column_text(def_stmt, 0));
+                    const auto* h = sqlite3_column_text(def_stmt, 1);
+                    if (h) parent_id = reinterpret_cast<const char*>(h);
+                }
+                stmt_registry_.finalize(def_stmt);
+            }
+        }
+
+        // Legacy fallback: if still no branch found, use latest published version
+        if (parent_id.empty()) {
+            sqlite3_stmt* legacy_stmt = nullptr;
+            const char* legacy_sql = "SELECT id FROM published_versions WHERE workspace_id = ? ORDER BY published_at_ms DESC LIMIT 1";
+            legacy_stmt = stmt_registry_.prepare(db_, legacy_sql);
+            if (legacy_stmt) {
+                sqlite3_bind_text(legacy_stmt, 1, actual_ws_id.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(legacy_stmt) == SQLITE_ROW) {
+                    parent_id = reinterpret_cast<const char*>(sqlite3_column_text(legacy_stmt, 0));
+                }
+                stmt_registry_.finalize(legacy_stmt);
+            }
         }
     }
 
@@ -2850,6 +3633,23 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
 
                 // Clean sentinel from committed final_ver
                 fs::remove(final_ver / ".syncora_op_sentinel");
+
+                // Milestone 3.5: Advance active branch head pointer
+                if (!active_br_id.empty()) {
+                    sqlite3_stmt* br_upd_stmt = nullptr;
+                    const char* br_upd_sql = "UPDATE workspace_branches SET head_version_id = ? WHERE id = ?";
+                    br_upd_stmt = stmt_registry_.prepare(db_, br_upd_sql);
+                    if (br_upd_stmt) {
+                        sqlite3_bind_text(br_upd_stmt, 1, ver.id.c_str(), -1, SQLITE_STATIC);
+                        sqlite3_bind_text(br_upd_stmt, 2, active_br_id.c_str(), -1, SQLITE_STATIC);
+                        if (sqlite3_step(br_upd_stmt) != SQLITE_DONE) {
+                            std::string err = sqlite3_errmsg(db_);
+                            stmt_registry_.finalize(br_upd_stmt);
+                            throw std::runtime_error("failed to advance active branch head: " + err);
+                        }
+                        stmt_registry_.finalize(br_upd_stmt);
+                    }
+                }
 
                 update_operation_intent_nolock(op_id, "COMMITTED", "CLEANUP");
 
@@ -3532,9 +4332,8 @@ bool CollabStore::reconstruct_version(const std::string& version_id,
     }
 
     // Reconstruct via temporary staging directory (WITHOUT holding db_mutex_)
-    const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto staging_parent = destination_dir.has_parent_path() ? destination_dir.parent_path() : fs::current_path();
-    const fs::path staging_dir = staging_parent / (".reconstruct_" + version_id + "_" + std::to_string(now_ns) + "_" + generate_random_token(6) + ".tmp");
+    const fs::path staging_dir = staging_parent / (".rec_" + generate_random_token(8));
 
     std::error_code ec;
     fs::create_directories(staging_dir, ec);
