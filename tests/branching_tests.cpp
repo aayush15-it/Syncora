@@ -525,6 +525,71 @@ void run_branching_tests(const fs::path& fixture_root,
         check(read_count.load() > 0, "Concurrent branch queries succeeded while switches occurred");
         check(store.get_active_branch(ws.id)->id == main_b->id, "Final active branch is main");
     }
+
+    // =========================================================================
+    // 7. Dirty Working Copy Branch Switch & Force Override Tests
+    // =========================================================================
+    {
+        const auto suite_dir = test_root / "dirty_switch_suite";
+        fs::create_directories(suite_dir, ec);
+        const auto db_path = suite_dir / "collab.sqlite3";
+        const auto storage_dir = suite_dir / "storage";
+
+        CollabStore store(db_path, storage_dir);
+        const auto host = store.find_user_by_username("host");
+        const auto ws = store.create_workspace("Dirty-Test-WS", "Workspace for dirty switch tests");
+
+        // Create initial file and publish version 1 on main
+        store.write_working_copy_file_content(ws.id, "file1.txt", "Original Version 1 Content");
+        const auto v1 = store.publish_version(ws.id, host->id, "v1.0", "Release 1");
+
+        // Create feature branch
+        const auto feat_b = store.create_branch(ws.id, "feature/dirty-test", v1.id, host->id);
+
+        // Verify clean working copy
+        check(!store.has_uncommitted_changes(ws.id), "Initially working copy has no uncommitted changes");
+
+        // Mutate working copy (add uncommitted change)
+        store.write_working_copy_file_content(ws.id, "file1.txt", "Uncommitted modification to file1");
+        check(store.has_uncommitted_changes(ws.id), "Uncommitted changes detected after modifying file1.txt");
+
+        // Attempting to switch branch without force must fail and throw runtime_error
+        bool dirty_switch_threw = false;
+        try {
+            store.switch_branch(ws.id, feat_b.name, host->id, false);
+        } catch (const std::exception& e) {
+            dirty_switch_threw = true;
+            std::string msg = e.what();
+            check(msg.find("uncommitted changes") != std::string::npos, "Exception explicitly mentions uncommitted changes");
+        }
+        check(dirty_switch_threw, "switch_branch rejected dirty switch without force");
+
+        // Active branch remains unchanged
+        const auto act_b = store.get_active_branch(ws.id);
+        check(act_b.has_value() && act_b->name == "main", "Active branch remains main after rejected switch");
+
+        // Uncommitted edits are intact
+        const auto cur_content = store.read_working_copy_file_content(ws.id, "file1.txt");
+        check(cur_content == "Uncommitted modification to file1", "Uncommitted changes preserved after rejected switch");
+
+        // Now perform switch with force = true
+        bool force_switch_ok = false;
+        try {
+            force_switch_ok = store.switch_branch(ws.id, feat_b.name, host->id, true);
+        } catch (...) {
+            force_switch_ok = false;
+        }
+        check(force_switch_ok, "switch_branch with force=true successfully switched branch");
+
+        // Active branch is now feature/dirty-test
+        const auto act_b2 = store.get_active_branch(ws.id);
+        check(act_b2.has_value() && act_b2->name == feat_b.name, "Active branch is now feature/dirty-test");
+
+        // Working copy was restored to feature branch head version (v1)
+        const auto feat_content = store.read_working_copy_file_content(ws.id, "file1.txt");
+        check(feat_content == "Original Version 1 Content", "Working copy materialized from target branch head after forced switch");
+        check(!store.has_uncommitted_changes(ws.id), "Working copy is clean after branch switch");
+    }
 }
 
 } // namespace mc

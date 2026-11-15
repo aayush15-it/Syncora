@@ -90,6 +90,19 @@ struct CollabBranch {
     bool is_active{false};
 };
 
+struct CollabEvent {
+    std::string id;
+    std::string event_type;    // "branch_created", "branch_switched", "branch_deleted",
+                               // "version_published", "submission_created", "submission_reviewed", "connected", "ping"
+    std::string workspace_id;
+    std::string branch_id;
+    std::string version_id;
+    std::int64_t timestamp_ms{0};
+    std::string payload_json;
+};
+
+using CollabEventListener = std::function<void(const CollabEvent&)>;
+
 struct CollabSubmission {
     std::string id;
     std::string client_id;
@@ -436,9 +449,15 @@ public:
     std::optional<CollabBranch> get_active_branch(const std::string& workspace_id);
     bool switch_branch(const std::string& workspace_id,
                        const std::string& branch_name,
-                       const std::string& user_id = "");
+                       const std::string& user_id = "",
+                       bool force = false);
     bool delete_branch(const std::string& workspace_id,
                        const std::string& branch_name);
+    bool has_uncommitted_changes(const std::string& workspace_id);
+
+    // Milestone 3.5 Stage 2: Event Listener for Server-Sent Events (SSE)
+    void set_event_listener(CollabEventListener listener);
+    void notify_event(const CollabEvent& event);
 
     // Filesystem Path Resolution within Workspace
     fs::path workspace_root(const std::string& ws_id) const;
@@ -725,12 +744,16 @@ private:
     std::optional<CollabBranch> find_branch_by_name_nolock(const std::string& ws_id, const std::string& name);
     std::optional<CollabBranch> find_branch_by_id_nolock(const std::string& branch_id);
     std::vector<CollabBranch> list_branches_nolock(const std::string& ws_id);
+    bool has_uncommitted_changes_nolock(const std::string& actual_ws_id);
     void record_event_nolock(const std::string& actor_id,
                              const std::string& actor_username,
                              const std::string& action,
                              const std::string& resource,
                              const std::string& outcome,
                              const std::string& detail = "");
+
+    CollabEventListener event_listener_;
+    mutable std::mutex event_listener_mutex_;
 };
 
 template <typename F>

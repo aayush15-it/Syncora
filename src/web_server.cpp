@@ -15,6 +15,7 @@
 #include "merklechain/peer/peer_config.hpp"
 #include "merklechain/peer/peer_controller.hpp"
 #include "merklechain/collab_store.hpp"
+#include "merklechain/collab_broadcaster.hpp"
 
 #include <sqlite3.h>
 #include <algorithm>
@@ -346,12 +347,19 @@ struct PendingPlan {
     std::chrono::steady_clock::time_point created;
 };
 struct RestoreGrant { fs::path destination; std::string version_id; std::chrono::steady_clock::time_point created; };
-struct ServerState {
+} // namespace
+
+struct WebServer::ServerState {
     std::string csrf{random_token()};
     std::optional<PendingPlan> plan;
     std::unordered_map<std::string,RestoreGrant> restore_grants;
     std::unique_ptr<CollabStore> collab;
+    std::shared_ptr<EventBroadcaster> broadcaster;
+    std::mutex mutex;
 };
+
+namespace {
+using ServerState = WebServer::ServerState;
 
 const std::string& require_string(const JsonObjectParser& json,const std::string& key) {
     const auto found=json.strings.find(key);if(found==json.strings.end())throw std::runtime_error("missing string field: "+key);return found->second;
@@ -1023,6 +1031,7 @@ std::vector<std::string> split_path_parts(const std::string& path) {
 }
 
 CollabStore& get_collab(ServerState& state) {
+    std::lock_guard<std::mutex> lock(state.mutex);
     if (!state.collab) {
         fs::path collab_dir = fs::current_path() / ".merklechain";
         std::error_code ec;
@@ -1030,6 +1039,11 @@ CollabStore& get_collab(ServerState& state) {
         fs::path collab_workspaces = fs::current_path() / "collab_workspaces";
         fs::create_directories(collab_workspaces, ec);
         state.collab = std::make_unique<CollabStore>(collab_dir / "collab.sqlite3", collab_workspaces);
+        if (state.broadcaster) {
+            state.collab->set_event_listener([bc = state.broadcaster](const CollabEvent& ev) {
+                if (bc) bc->broadcast(ev);
+            });
+        }
     }
     return *state.collab;
 }
@@ -1158,6 +1172,20 @@ std::string serialize_collab_diff(const CollabFileDiff& d) {
     return ss.str();
 }
 
+std::string serialize_collab_branch(const CollabBranch& b) {
+    std::ostringstream ss;
+    ss << "{\"id\":" << quote(b.id)
+       << ",\"workspace_id\":" << quote(b.workspace_id)
+       << ",\"name\":" << quote(b.name)
+       << ",\"head_version_id\":" << (b.head_version_id.empty() ? "null" : quote(b.head_version_id))
+       << ",\"created_at_ms\":" << b.created_at_ms
+       << ",\"created_by_user_id\":" << (b.created_by_user_id.empty() ? "null" : quote(b.created_by_user_id))
+       << ",\"is_default\":" << (b.is_default ? "true" : "false")
+       << ",\"is_active\":" << (b.is_active ? "true" : "false")
+       << "}";
+    return ss.str();
+}
+
 struct AuthContext {
     bool authenticated{false};
     CollabUser user;
@@ -1241,6 +1269,91 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
         }
 
         const std::string& domain = parts[1];
+
+        // ------------------ COLLAB ------------------
+        if (domain == "collab") {
+            if (parts.size() >= 3 && parts[2] == "branches") {
+                std::string sub_action = parts.size() >= 4 ? parts[3] : "";
+                std::string ws_id = url.query.count("workspace_id") ? url.query.at("workspace_id") : (pbody ? optional_string(*pbody, "workspace_id", "ws-default") : "ws-default");
+                if (ws_id.empty()) ws_id = "ws-default";
+
+                if (request.method == "GET") {
+                    if (!auth.authenticated) return {401, "application/json; charset=utf-8", json_error("Authentication required")};
+                    if (auth.user.role != "host" && !store.is_user_in_workspace(ws_id, auth.user.id)) {
+                        return {403, "application/json; charset=utf-8", json_error("Forbidden: You are not a member of this workspace")};
+                    }
+
+                    if (sub_action == "active") {
+                        auto act = store.get_active_branch(ws_id);
+                        if (!act) return {404, "application/json; charset=utf-8", json_error("no active branch found")};
+                        return {200, "application/json; charset=utf-8", "{\"success\":true,\"workspace_id\":" + quote(ws_id) + ",\"active_branch\":" + serialize_collab_branch(*act) + "}"};
+                    }
+
+                    auto branches = store.list_branches(ws_id);
+                    auto act = store.get_active_branch(ws_id);
+                    std::string out = "{\"success\":true,\"workspace_id\":" + quote(ws_id);
+                    if (act) {
+                        out += ",\"active_branch\":" + serialize_collab_branch(*act);
+                    } else {
+                        out += ",\"active_branch\":null";
+                    }
+                    out += ",\"branches\":[";
+                    for (std::size_t i = 0; i < branches.size(); ++i) {
+                        if (i) out += ',';
+                        out += serialize_collab_branch(branches[i]);
+                    }
+                    out += "]}";
+                    return {200, "application/json; charset=utf-8", out};
+                }
+
+                if (request.method == "POST") {
+                    if (!auth.authenticated) return {401, "application/json; charset=utf-8", json_error("Authentication required")};
+                    if (auth.user.role != "host") return {403, "application/json; charset=utf-8", json_error("Forbidden: Host role required")};
+                    if (!pbody) throw std::runtime_error("request body required");
+
+                    if (sub_action == "create" || sub_action.empty()) {
+                        std::string name = require_string(*pbody, "name");
+                        std::string src_ver = optional_string(*pbody, "source_version_id", "");
+                        auto br = store.create_branch(ws_id, name, src_ver, auth.user.id);
+                        return {200, "application/json; charset=utf-8", "{\"success\":true,\"message\":\"Branch created successfully\",\"branch\":" + serialize_collab_branch(br) + "}"};
+                    }
+
+                    if (sub_action == "switch") {
+                        std::string name = require_string(*pbody, "name");
+                        bool force = pbody->booleans.count("force") ? pbody->booleans.at("force") : false;
+
+                        if (!force && store.has_uncommitted_changes(ws_id)) {
+                            return {409, "application/json; charset=utf-8", "{\"success\":false,\"dirty\":true,\"error\":\"cannot switch branch: working copy has uncommitted changes\"}"};
+                        }
+
+                        store.switch_branch(ws_id, name, auth.user.id, force);
+                        auto act = store.get_active_branch(ws_id);
+                        std::string out = "{\"success\":true,\"message\":\"Switched to branch " + name + "\"";
+                        if (act) out += ",\"active_branch\":" + serialize_collab_branch(*act);
+                        out += "}";
+                        return {200, "application/json; charset=utf-8", out};
+                    }
+
+                    if (sub_action == "delete") {
+                        std::string name = require_string(*pbody, "name");
+                        bool ok = store.delete_branch(ws_id, name);
+                        if (!ok) return {404, "application/json; charset=utf-8", json_error("branch not found")};
+                        return {200, "application/json; charset=utf-8", "{\"success\":true,\"message\":\"Branch deleted successfully\"}"};
+                    }
+                }
+
+                if (request.method == "DELETE") {
+                    if (!auth.authenticated) return {401, "application/json; charset=utf-8", json_error("Authentication required")};
+                    if (auth.user.role != "host") return {403, "application/json; charset=utf-8", json_error("Forbidden: Host role required")};
+
+                    std::string name = url.query.count("name") ? url.query.at("name") : (pbody ? optional_string(*pbody, "name") : "");
+                    if (name.empty()) throw std::runtime_error("missing branch name");
+                    bool ok = store.delete_branch(ws_id, name);
+                    if (!ok) return {404, "application/json; charset=utf-8", json_error("branch not found")};
+                    return {200, "application/json; charset=utf-8", "{\"success\":true,\"message\":\"Branch deleted successfully\"}"};
+                }
+            }
+        }
 
         // ------------------ AUTH ------------------
         if (domain == "auth") {
@@ -1338,7 +1451,7 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                 // Workspace-specific actions
                 std::string ws_id;
                 std::string action;
-                if (parts[3] == "files" || parts[3] == "changes" || parts[3] == "diff" || parts[3] == "publish" || parts[3] == "versions") {
+                if (parts[3] == "files" || parts[3] == "changes" || parts[3] == "diff" || parts[3] == "publish" || parts[3] == "versions" || parts[3] == "branches" || parts[3] == "switch-branch") {
                     action = parts[3];
                     ws_id = url.query.count("workspace_id") ? url.query.at("workspace_id") : (pbody ? optional_string(*pbody, "workspace_id", "ws-default") : "ws-default");
                 } else {
@@ -1435,6 +1548,52 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                         out += serialize_collab_version(vers[i]);
                     }
                     out += "]}";
+                    return {200, "application/json; charset=utf-8", out};
+                }
+
+                if (action == "branches") {
+                    if (request.method == "GET") {
+                        auto branches = store.list_branches(ws_id);
+                        auto act = store.get_active_branch(ws_id);
+                        std::string out = "{\"success\":true,\"workspace_id\":" + quote(ws_id);
+                        if (act) out += ",\"active_branch\":" + serialize_collab_branch(*act);
+                        else out += ",\"active_branch\":null";
+                        out += ",\"branches\":[";
+                        for (std::size_t i = 0; i < branches.size(); ++i) {
+                            if (i) out += ',';
+                            out += serialize_collab_branch(branches[i]);
+                        }
+                        out += "]}";
+                        return {200, "application/json; charset=utf-8", out};
+                    }
+                    if (request.method == "POST" && pbody) {
+                        std::string name = require_string(*pbody, "name");
+                        std::string src_ver = optional_string(*pbody, "source_version_id", "");
+                        auto br = store.create_branch(ws_id, name, src_ver, auth.user.id);
+                        return {200, "application/json; charset=utf-8", "{\"success\":true,\"branch\":" + serialize_collab_branch(br) + "}"};
+                    }
+                    if (request.method == "DELETE") {
+                        std::string name = url.query.count("name") ? url.query.at("name") : (pbody ? optional_string(*pbody, "name") : "");
+                        if (name.empty()) throw std::runtime_error("missing branch name");
+                        bool ok = store.delete_branch(ws_id, name);
+                        if (!ok) return {404, "application/json; charset=utf-8", json_error("branch not found")};
+                        return {200, "application/json; charset=utf-8", "{\"success\":true,\"message\":\"Branch deleted successfully\"}"};
+                    }
+                }
+
+                if (action == "switch-branch" && request.method == "POST" && pbody) {
+                    std::string name = require_string(*pbody, "name");
+                    bool force = pbody->booleans.count("force") ? pbody->booleans.at("force") : false;
+
+                    if (!force && store.has_uncommitted_changes(ws_id)) {
+                        return {409, "application/json; charset=utf-8", "{\"success\":false,\"dirty\":true,\"error\":\"cannot switch branch: working copy has uncommitted changes\"}"};
+                    }
+
+                    store.switch_branch(ws_id, name, auth.user.id, force);
+                    auto act = store.get_active_branch(ws_id);
+                    std::string out = "{\"success\":true,\"message\":\"Switched to branch " + name + "\"";
+                    if (act) out += ",\"active_branch\":" + serialize_collab_branch(*act);
+                    out += "}";
                     return {200, "application/json; charset=utf-8", out};
                 }
             }
@@ -1922,7 +2081,8 @@ HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t 
     ParsedUrl url = parse_url(request.target);
     if (url.path.rfind("/api/auth/", 0) == 0 ||
         url.path.rfind("/api/host/", 0) == 0 ||
-        url.path.rfind("/api/client/", 0) == 0) {
+        url.path.rfind("/api/client/", 0) == 0 ||
+        url.path.rfind("/api/collab/", 0) == 0) {
         return handle_collab_api(request, state, port, url);
     }
 
@@ -1963,8 +2123,8 @@ std::string read_asset(const std::string& target) {
 void send_response(SOCKET socket,const HttpResponse& response) {
     HttpResponse bounded=response;
     if(bounded.body.size()>kMaxResponseBytes)bounded={413,"application/json; charset=utf-8",json_error("response exceeds the dashboard size limit")};
-    const char* reason=bounded.status==200?"OK":bounded.status==400?"Bad Request":bounded.status==403?"Forbidden":
-        bounded.status==404?"Not Found":bounded.status==405?"Method Not Allowed":bounded.status==413?"Payload Too Large":"Error";
+    const char* reason=bounded.status==200?"OK":bounded.status==400?"Bad Request":bounded.status==401?"Unauthorized":bounded.status==403?"Forbidden":
+        bounded.status==404?"Not Found":bounded.status==405?"Method Not Allowed":bounded.status==409?"Conflict":bounded.status==413?"Payload Too Large":"Error";
     std::string headers="HTTP/1.1 "+std::to_string(bounded.status)+" "+reason+"\r\nContent-Type: "+bounded.type+
         "\r\nContent-Length: "+std::to_string(bounded.body.size())+
         "\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n";
@@ -1989,24 +2149,209 @@ HttpResponse handle_request(const Request& request,ServerState& state,std::uint1
 }
 
 void run_web_server(std::uint16_t port) {
-    WSADATA data{};if(WSAStartup(MAKEWORD(2,2),&data)!=0)throw std::runtime_error("Winsock initialization failed");
-    struct WinsockCleanup { ~WinsockCleanup(){WSACleanup();} } cleanup;
-    Socket listener(socket(AF_INET,SOCK_STREAM,IPPROTO_TCP));if(listener.value==INVALID_SOCKET)throw std::runtime_error("cannot create dashboard socket");
-    BOOL exclusive=TRUE;if(setsockopt(listener.value,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,reinterpret_cast<const char*>(&exclusive),sizeof(exclusive))==SOCKET_ERROR)throw std::runtime_error("cannot set exclusive loopback listener mode");
-    sockaddr_in address{};address.sin_family=AF_INET;address.sin_port=htons(port);address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
-    if(bind(listener.value,reinterpret_cast<sockaddr*>(&address),sizeof(address))==SOCKET_ERROR)throw std::runtime_error("cannot bind dashboard to 127.0.0.1; Winsock error "+std::to_string(WSAGetLastError()));
-    if(listen(listener.value,SOMAXCONN)==SOCKET_ERROR)throw std::runtime_error("cannot listen for local dashboard requests");
-    ServerState state;
-    std::cout<<"MerkleChain dashboard: http://127.0.0.1:"<<port<<"/\nPress Ctrl+C to stop. Network Mode remains disabled.\n";
-    for(;;) {
-        Socket client(accept(listener.value,nullptr,nullptr));if(client.value==INVALID_SOCKET)throw std::runtime_error("dashboard accept failed");
-        DWORD timeout=15000;setsockopt(client.value,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<const char*>(&timeout),sizeof(timeout));
+    WebServer server(port, 4);
+    server.start();
+    std::cout << "MerkleChain dashboard: http://127.0.0.1:" << port << "/\nPress Ctrl+C to stop. Network Mode remains disabled.\n";
+    server.wait();
+}
+
+WebServer::WebServer(std::uint16_t port, std::size_t num_workers)
+    : port_(port), num_workers_(num_workers),
+      broadcaster_(std::make_shared<EventBroadcaster>()),
+      state_(std::make_unique<ServerState>()) {
+    state_->broadcaster = broadcaster_;
+}
+
+WebServer::~WebServer() {
+    stop();
+}
+
+void WebServer::start() {
+    if (running_.load()) return;
+
+    WSADATA data{};
+    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+        throw std::runtime_error("Winsock initialization failed");
+    }
+
+    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) {
+        throw std::runtime_error("cannot create dashboard socket");
+    }
+
+    BOOL exclusive = TRUE;
+    setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port_);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        closesocket(listener);
+        throw std::runtime_error("cannot bind dashboard to 127.0.0.1; Winsock error " + std::to_string(err));
+    }
+
+    if (listen(listener, SOMAXCONN) == SOCKET_ERROR) {
+        closesocket(listener);
+        throw std::runtime_error("cannot listen for local dashboard requests");
+    }
+
+    listener_socket_ = static_cast<std::uintptr_t>(listener);
+    running_.store(true);
+    stop_requested_.store(false);
+
+    broadcaster_->start();
+
+    workers_.reserve(num_workers_);
+    for (std::size_t i = 0; i < num_workers_; ++i) {
+        workers_.emplace_back(&WebServer::worker_loop, this);
+    }
+
+    accept_thread_ = std::thread(&WebServer::accept_loop, this);
+}
+
+void WebServer::stop() {
+    bool expected = true;
+    if (!running_.compare_exchange_strong(expected, false)) {
+        return;
+    }
+    stop_requested_.store(true);
+
+    if (listener_socket_ != static_cast<std::uintptr_t>(~0ULL)) {
+        SOCKET lsock = static_cast<SOCKET>(listener_socket_);
+        listener_socket_ = static_cast<std::uintptr_t>(~0ULL);
+        closesocket(lsock);
+    }
+
+    queue_cv_.notify_all();
+
+    if (accept_thread_.joinable()) {
+        accept_thread_.join();
+    }
+
+    for (auto& w : workers_) {
+        if (w.joinable()) {
+            w.join();
+        }
+    }
+    workers_.clear();
+
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        while (!socket_queue_.empty()) {
+            SOCKET s = static_cast<SOCKET>(socket_queue_.front());
+            socket_queue_.pop();
+            if (s != INVALID_SOCKET) {
+                closesocket(s);
+            }
+        }
+    }
+
+    if (broadcaster_) {
+        broadcaster_->stop();
+    }
+
+    WSACleanup();
+}
+
+void WebServer::wait() {
+    while (running_.load() && !stop_requested_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    stop();
+}
+
+void WebServer::accept_loop() {
+    while (running_.load()) {
+        SOCKET listener = static_cast<SOCKET>(listener_socket_);
+        if (listener == INVALID_SOCKET) break;
+
+        SOCKET client = accept(listener, nullptr, nullptr);
+        if (client == INVALID_SOCKET) {
+            if (!running_.load()) break;
+            continue;
+        }
+
+        DWORD timeout = 15000;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            socket_queue_.push(static_cast<std::uintptr_t>(client));
+        }
+        queue_cv_.notify_one();
+    }
+}
+
+void WebServer::worker_loop() {
+    while (running_.load()) {
+        std::uintptr_t client_handle = static_cast<std::uintptr_t>(~0ULL);
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            queue_cv_.wait(lock, [this]() {
+                return !running_.load() || !socket_queue_.empty();
+            });
+
+            if (!running_.load() && socket_queue_.empty()) break;
+            if (!socket_queue_.empty()) {
+                client_handle = socket_queue_.front();
+                socket_queue_.pop();
+            }
+        }
+
+        if (client_handle == static_cast<std::uintptr_t>(~0ULL)) continue;
+        SOCKET client = static_cast<SOCKET>(client_handle);
+
         try {
-            const auto raw=receive_request(client.value);const auto request=parse_request(raw);
-            const auto response=handle_request(request,state,port);send_response(client.value,response);
-        } catch(const std::exception& error) {
-            const std::string message=error.what();const int status=message.find("size limit")!=std::string::npos?413:400;
-            try {send_response(client.value,{status,"application/json; charset=utf-8",json_error(message)});}catch(...){}
+            const auto raw = receive_request(client);
+            const auto request = parse_request(raw);
+
+            ParsedUrl url = parse_url(request.target);
+            if (request.method == "GET" &&
+                (url.path == "/api/collab/events" || url.path == "/api/events/stream")) {
+
+                AuthContext auth = resolve_collab_auth(request, nullptr, *state_, url);
+                if (!auth.authenticated) {
+                    send_response(client, {401, "application/json; charset=utf-8", json_error("Authentication required")});
+                    closesocket(client);
+                    continue;
+                }
+
+                // Send SSE handshake headers
+                std::string sse_headers =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/event-stream; charset=utf-8\r\n"
+                    "Cache-Control: no-cache\r\n"
+                    "Connection: keep-alive\r\n"
+                    "X-Accel-Buffering: no\r\n"
+                    "Access-Control-Allow-Origin: *\r\n\r\n";
+
+                send(client, sse_headers.data(), static_cast<int>(sse_headers.size()), 0);
+
+                // Initial connected event frame
+                std::string init_frame = "event: connected\ndata: {\"status\":\"connected\",\"user\":" +
+                                         serialize_collab_user(auth.user) + "}\n\n";
+                send(client, init_frame.data(), static_cast<int>(init_frame.size()), 0);
+
+                // Transfer ownership of client socket to broadcaster
+                broadcaster_->add_client(client_handle);
+                continue;
+            }
+
+            const auto response = handle_request(request, *state_, port_);
+            send_response(client, response);
+            closesocket(client);
+        } catch (const std::exception& error) {
+            const std::string message = error.what();
+            const int status = message.find("size limit") != std::string::npos ? 413 : 400;
+            try {
+                send_response(client, {status, "application/json; charset=utf-8", json_error(message)});
+            } catch (...) {}
+            closesocket(client);
+        } catch (...) {
+            closesocket(client);
         }
     }
 }

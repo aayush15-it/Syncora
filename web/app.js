@@ -273,6 +273,15 @@ function view(name, pushHash = true) {
     if (name === "scheduler") renderScheduler();
     if (name === "chunks") renderChunks();
     // Host view loaders
+    if (name.startsWith("host-") || name.startsWith("client-")) {
+      const tb = $("topbar-branch-controls");
+      if (tb) tb.style.display = "inline-flex";
+      loadWorkspaceBranches();
+    } else {
+      const tb = $("topbar-branch-controls");
+      if (tb) tb.style.display = "none";
+    }
+
     if (name === "host-overview") loadHostOverview();
     if (name === "host-clients") loadHostClients();
     if (name === "host-submissions") loadHostSubmissions();
@@ -2119,6 +2128,7 @@ async function init() {
   try {
     const status = await api("/api/status");
     state.csrf = status.csrf;
+    initCollabSSE();
     if (status.peer) {
       updatePeerUI(status.peer);
     }
@@ -2145,6 +2155,12 @@ let hostSelectedFile = null;
 let hostWorkspaceFilesCache = [];
 let clientUpdatesCache = [];
 
+let currentBranchesCache = [];
+let currentActiveBranch = null;
+let pendingSwitchBranchName = null;
+let collabEventSource = null;
+let collabPollingInterval = null;
+
 async function collabFetch(path, method = "GET", body = null) {
   const token = localStorage.getItem("mc_session_token");
   const headers = {};
@@ -2162,9 +2178,204 @@ async function collabFetch(path, method = "GET", body = null) {
     throw new Error(`HTTP ${res.status}: Invalid server JSON response`);
   }
   if (!res.ok || data.error) {
-    throw new Error(data.error || `HTTP ${res.status}`);
+    const err = new Error(data.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
   }
   return data;
+}
+
+// ----------------- BRANCHING CONTROLLER -----------------
+async function loadWorkspaceBranches(workspaceId = "ws-default") {
+  try {
+    const data = await collabFetch(`/api/collab/branches?workspace_id=${encodeURIComponent(workspaceId)}`);
+    currentBranchesCache = data.branches || [];
+    currentActiveBranch = data.active_branch || null;
+
+    const activeName = currentActiveBranch ? currentActiveBranch.name : "main";
+    put($("active-branch-name"), activeName);
+    put($("host-workspace-branch-name"), activeName);
+
+    // Update branch select dropdowns
+    const dropdowns = [ $("branch-select-dropdown"), $("host-workspace-branch-select") ];
+    dropdowns.forEach(dd => {
+      if (!dd) return;
+      dd.innerHTML = "";
+      currentBranchesCache.forEach(b => {
+        const opt = document.createElement("option");
+        opt.value = b.name;
+        opt.textContent = b.name + (b.is_default ? " (default)" : "") + (b.is_active ? " ★" : "");
+        if (b.is_active) opt.selected = true;
+        dd.appendChild(opt);
+      });
+    });
+
+    // Populate source version options for Create Branch Modal
+    const verSelect = $("select-create-branch-source");
+    if (verSelect) {
+      verSelect.innerHTML = `<option value="">Current Active Branch Head (${activeName})</option>`;
+      try {
+        const vData = await collabFetch(`/api/host/workspaces/versions?workspace_id=${encodeURIComponent(workspaceId)}`);
+        (vData.versions || []).forEach(v => {
+          const opt = document.createElement("option");
+          opt.value = v.id;
+          opt.textContent = `${v.title || v.id} (${(v.merkle_root || "").substring(0, 8)}…)`;
+          verSelect.appendChild(opt);
+        });
+      } catch (e) {}
+    }
+  } catch (err) {
+    console.error("Failed to load workspace branches:", err);
+  }
+}
+
+async function switchWorkspaceBranch(branchName, force = false) {
+  if (!branchName) return;
+  if (!force && currentActiveBranch && currentActiveBranch.name === branchName) return;
+
+  try {
+    const res = await collabFetch("/api/collab/branches/switch", "POST", {
+      workspace_id: "ws-default",
+      name: branchName,
+      force: force
+    });
+    showToast(res.message || `Switched to branch ${branchName}`);
+    pendingSwitchBranchName = null;
+    await loadWorkspaceBranches();
+    await loadHostWorkspaceFiles();
+    await loadHostOverview();
+  } catch (err) {
+    if (err.status === 409 || err.data?.dirty) {
+      pendingSwitchBranchName = branchName;
+      const modal = $("modal-dirty-switch");
+      if (modal && typeof modal.showModal === "function") {
+        modal.showModal();
+      } else {
+        if (confirm("Working copy has uncommitted changes. Force switch anyway?")) {
+          await switchWorkspaceBranch(branchName, true);
+        }
+      }
+    } else {
+      showToast(err.message || "Failed to switch branch", "error");
+    }
+  }
+}
+
+async function createWorkspaceBranch(name, sourceVersionId = "") {
+  const errP = $("error-create-branch");
+  if (errP) { errP.style.display = "none"; errP.textContent = ""; }
+  try {
+    const res = await collabFetch("/api/collab/branches/create", "POST", {
+      workspace_id: "ws-default",
+      name: name,
+      source_version_id: sourceVersionId
+    });
+    showToast(`Branch created: ${name}`);
+    const modal = $("modal-create-branch");
+    if (modal) modal.close();
+    $("input-create-branch-name").value = "";
+    await loadWorkspaceBranches();
+  } catch (err) {
+    if (errP) {
+      errP.textContent = err.message;
+      errP.style.display = "block";
+    } else {
+      showToast(err.message, "error");
+    }
+  }
+}
+
+async function deleteWorkspaceBranch(name) {
+  const errP = $("error-delete-branch");
+  if (errP) { errP.style.display = "none"; errP.textContent = ""; }
+  try {
+    await collabFetch("/api/collab/branches/delete", "POST", {
+      workspace_id: "ws-default",
+      name: name
+    });
+    showToast(`Deleted branch ${name}`);
+    const modal = $("modal-delete-branch");
+    if (modal) modal.close();
+    await loadWorkspaceBranches();
+  } catch (err) {
+    if (errP) {
+      errP.textContent = err.message;
+      errP.style.display = "block";
+    } else {
+      showToast(err.message, "error");
+    }
+  }
+}
+
+// ----------------- SERVER-SENT EVENTS (SSE) -----------------
+function initCollabSSE() {
+  if (collabEventSource) {
+    collabEventSource.close();
+    collabEventSource = null;
+  }
+  if (typeof window.EventSource === "undefined") {
+    startCollabPollingFallback();
+    return;
+  }
+
+  const token = localStorage.getItem("mc_session_token");
+  const sseUrl = token
+    ? `/api/collab/events?session_token=${encodeURIComponent(token)}`
+    : `/api/collab/events?csrf=${encodeURIComponent(state.csrf || "")}`;
+
+  try {
+    collabEventSource = new EventSource(sseUrl);
+
+    collabEventSource.addEventListener("connected", (e) => {
+      console.log("[SSE] Connected to real-time events stream");
+    });
+
+    collabEventSource.addEventListener("branch_created", (e) => {
+      loadWorkspaceBranches();
+    });
+
+    collabEventSource.addEventListener("branch_switched", (e) => {
+      loadWorkspaceBranches();
+      loadHostWorkspaceFiles();
+      loadHostOverview();
+    });
+
+    collabEventSource.addEventListener("branch_deleted", (e) => {
+      loadWorkspaceBranches();
+    });
+
+    collabEventSource.addEventListener("version_published", (e) => {
+      loadWorkspaceBranches();
+      loadHostVersions();
+      loadHostOverview();
+    });
+
+    collabEventSource.addEventListener("submission_created", (e) => {
+      loadHostSubmissions();
+      loadHostOverview();
+    });
+
+    collabEventSource.addEventListener("submission_reviewed", (e) => {
+      loadHostSubmissions();
+      loadHostOverview();
+    });
+
+    collabEventSource.onerror = (err) => {
+      console.warn("[SSE] Stream disconnected, falling back to polling");
+      startCollabPollingFallback();
+    };
+  } catch (e) {
+    startCollabPollingFallback();
+  }
+}
+
+function startCollabPollingFallback() {
+  if (collabPollingInterval) return;
+  collabPollingInterval = setInterval(() => {
+    loadWorkspaceBranches();
+    loadHostOverview();
+  }, 10000);
 }
 
 // ----------------- HOST OVERVIEW -----------------
@@ -2898,6 +3109,76 @@ window.addEventListener("DOMContentLoaded", () => {
   };
   $("btn-client-logout-top")?.addEventListener("click", doLogout);
   $("btn-client-logout-page")?.addEventListener("click", doLogout);
+
+  // Branching UI actions
+  const onBranchDropdownChange = (e) => {
+    switchWorkspaceBranch(e.target.value, false);
+  };
+  $("branch-select-dropdown")?.addEventListener("change", onBranchDropdownChange);
+  $("host-workspace-branch-select")?.addEventListener("change", onBranchDropdownChange);
+
+  const openCreateBranchModal = () => {
+    const err = $("error-create-branch");
+    if (err) err.style.display = "none";
+    const modal = $("modal-create-branch");
+    if (modal && typeof modal.showModal === "function") modal.showModal();
+  };
+  $("btn-branch-new")?.addEventListener("click", openCreateBranchModal);
+  $("btn-host-new-branch")?.addEventListener("click", openCreateBranchModal);
+
+  const closeCreateBranchModal = () => {
+    const modal = $("modal-create-branch");
+    if (modal) modal.close();
+  };
+  $("btn-close-create-branch")?.addEventListener("click", closeCreateBranchModal);
+  $("btn-cancel-create-branch")?.addEventListener("click", closeCreateBranchModal);
+
+  $("form-create-branch")?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const name = $("input-create-branch-name")?.value?.trim();
+    const srcVer = $("select-create-branch-source")?.value || "";
+    if (name) createWorkspaceBranch(name, srcVer);
+  });
+
+  const openDeleteBranchModal = () => {
+    const active = currentActiveBranch ? currentActiveBranch.name : "main";
+    put($("delete-branch-target-name"), active);
+    const err = $("error-delete-branch");
+    if (err) err.style.display = "none";
+    const modal = $("modal-delete-branch");
+    if (modal && typeof modal.showModal === "function") modal.showModal();
+  };
+  $("btn-branch-delete")?.addEventListener("click", openDeleteBranchModal);
+  $("btn-host-delete-branch")?.addEventListener("click", openDeleteBranchModal);
+
+  const closeDeleteBranchModal = () => {
+    const modal = $("modal-delete-branch");
+    if (modal) modal.close();
+  };
+  $("btn-close-delete-branch")?.addEventListener("click", closeDeleteBranchModal);
+  $("btn-cancel-delete-branch")?.addEventListener("click", closeDeleteBranchModal);
+
+  $("btn-confirm-delete-branch")?.addEventListener("click", () => {
+    const active = currentActiveBranch ? currentActiveBranch.name : "main";
+    deleteWorkspaceBranch(active);
+  });
+
+  const closeDirtySwitchModal = () => {
+    const modal = $("modal-dirty-switch");
+    if (modal) modal.close();
+    pendingSwitchBranchName = null;
+    loadWorkspaceBranches();
+  };
+  $("btn-close-dirty-switch")?.addEventListener("click", closeDirtySwitchModal);
+  $("btn-cancel-dirty-switch")?.addEventListener("click", closeDirtySwitchModal);
+
+  $("btn-confirm-dirty-force")?.addEventListener("click", () => {
+    const modal = $("modal-dirty-switch");
+    if (modal) modal.close();
+    if (pendingSwitchBranchName) {
+      switchWorkspaceBranch(pendingSwitchBranchName, true);
+    }
+  });
 
   // Settings Dashboard actions
   $("btn-save-settings")?.addEventListener("click", saveSettingsConfig);

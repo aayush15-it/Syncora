@@ -119,6 +119,22 @@
         <strong id="breadcrumb-current">Overview</strong>
       </div>
       <div class="top-right">
+        <div id="topbar-branch-controls" class="topbar-actions-group" style="display:none; align-items:center; gap:6px;">
+          <span class="branch-pill" id="active-branch-pill" title="Current active branch">
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" style="vertical-align: middle; margin-right: 3px;">
+              <circle cx="4" cy="4" r="2"/>
+              <circle cx="4" cy="12" r="2"/>
+              <circle cx="12" cy="6" r="2"/>
+              <path d="M4 6v4m0-2c2 0 4-1 6-3"/>
+            </svg>
+            <span id="active-branch-name">main</span>
+          </span>
+          <select id="branch-select-dropdown" class="branch-dropdown" title="Select Branch to Switch">
+            <option value="main">main</option>
+          </select>
+          <button class="btn neutral btn-xs" id="btn-branch-new" title="Create new branch">+ Branch</button>
+          <button class="btn danger btn-xs" id="btn-branch-delete" title="Delete current branch">✕</button>
+        </div>
         <div id="topbar-peer-controls" class="topbar-actions-group">
           <button class="btn neutral btn-xs" id="btn-topbar-pairing" data-go="pairing">Device Setup</button>
           <button class="btn forest-btn btn-xs" id="btn-topbar-conn" data-go="connection">Connection Panel →</button>
@@ -1914,6 +1930,22 @@
           <p>Browse and edit working copy files. Edits never touch the original client submission.</p>
         </div>
         <div class="header-actions">
+          <div class="branch-selector-bar" id="host-workspace-branch-bar">
+            <span class="branch-pill" id="host-workspace-branch-pill">
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" style="vertical-align: middle; margin-right: 3px;">
+                <circle cx="4" cy="4" r="2"/>
+                <circle cx="4" cy="12" r="2"/>
+                <circle cx="12" cy="6" r="2"/>
+                <path d="M4 6v4m0-2c2 0 4-1 6-3"/>
+              </svg>
+              <span id="host-workspace-branch-name">main</span>
+            </span>
+            <select id="host-workspace-branch-select" class="branch-dropdown" title="Select Branch to Switch">
+              <option value="main">main</option>
+            </select>
+            <button class="btn neutral btn-xs" id="btn-host-new-branch">+ Branch</button>
+            <button class="btn danger btn-xs" id="btn-host-delete-branch" title="Delete current branch">✕</button>
+          </div>
           <button class="btn neutral" id="btn-host-refresh-files">Refresh Files</button>
           <button class="btn forest-btn" data-go="host-review">Review Changes &rarr;</button>
         </div>
@@ -2453,6 +2485,60 @@
         <button class="btn danger" type="submit" id="restore-submit">Restore version</button>
       </div>
       <p id="restore-error" class="error" role="alert"></p>
+    </form>
+  </dialog>
+
+  <!-- CREATE BRANCH MODAL -->
+  <dialog id="modal-create-branch" class="branch-dialog">
+    <form id="form-create-branch" onsubmit="return false;">
+      <button class="dialog-close" type="button" id="btn-close-create-branch" aria-label="Close">&times;</button>
+      <div class="kicker">WORKSPACE BRANCHING</div>
+      <h2>Create New Branch</h2>
+      <p>Create a zero-copy branch referencing an immutable version head.</p>
+      <div>
+        <label for="input-create-branch-name" style="display:block; font-size:0.85rem; margin-bottom:4px;">Branch Name</label>
+        <input type="text" id="input-create-branch-name" placeholder="e.g. feature/auth, hotfix-1" required style="width:100%;">
+      </div>
+      <div>
+        <label for="select-create-branch-source" style="display:block; font-size:0.85rem; margin-bottom:4px;">Source Version</label>
+        <select id="select-create-branch-source" style="width:100%;" class="branch-dropdown">
+          <option value="">Current Active Branch Head</option>
+        </select>
+      </div>
+      <div class="dialog-actions">
+        <button class="btn neutral" type="button" id="btn-cancel-create-branch">Cancel</button>
+        <button class="btn forest-btn" type="submit" id="btn-submit-create-branch">Create Branch</button>
+      </div>
+      <p id="error-create-branch" class="error" role="alert" style="display:none;"></p>
+    </form>
+  </dialog>
+
+  <!-- DIRTY BRANCH SWITCH MODAL -->
+  <dialog id="modal-dirty-switch" class="branch-dialog">
+    <form id="form-dirty-switch" onsubmit="return false;">
+      <button class="dialog-close" type="button" id="btn-close-dirty-switch" aria-label="Close">&times;</button>
+      <div class="kicker" style="color:#f85149;">CONFLICT WARNING</div>
+      <h2>Uncommitted Changes in Working Copy</h2>
+      <p>The working copy has uncommitted modifications. Switching branches will overwrite or discard these changes unless forced.</p>
+      <div class="dialog-actions">
+        <button class="btn neutral" type="button" id="btn-cancel-dirty-switch">Cancel</button>
+        <button class="btn danger" type="button" id="btn-confirm-dirty-force">Force Switch</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- DELETE BRANCH MODAL -->
+  <dialog id="modal-delete-branch" class="branch-dialog">
+    <form id="form-delete-branch" onsubmit="return false;">
+      <button class="dialog-close" type="button" id="btn-close-delete-branch" aria-label="Close">&times;</button>
+      <div class="kicker" style="color:#f85149;">CONFIRM DELETION</div>
+      <h2>Delete Workspace Branch?</h2>
+      <p>Are you sure you want to delete branch <strong id="delete-branch-target-name">&mdash;</strong>? CAS chunk objects will remain preserved.</p>
+      <div class="dialog-actions">
+        <button class="btn neutral" type="button" id="btn-cancel-delete-branch">Cancel</button>
+        <button class="btn danger" type="button" id="btn-confirm-delete-branch">Delete Branch</button>
+      </div>
+      <p id="error-delete-branch" class="error" role="alert" style="display:none;"></p>
     </form>
   </dialog>
 

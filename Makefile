@@ -7,7 +7,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -O2
 LDLIBS := $(shell "$(PKG_CONFIG)" --libs openssl sqlite3) -lws2_32 -lshell32 -luuid -lpsapi
 PEER_SOURCES := src/peer/peer_protocol.cpp src/peer/peer_config.cpp src/peer/peer_auth.cpp src/peer/peer_transport.cpp src/peer/peer_sync.cpp src/peer/peer_session.cpp src/peer/peer_service.cpp src/peer/peer_controller.cpp src/peer/peer_cas_helpers.cpp
 CAS_SOURCES := src/cas/chunker.cpp src/cas/file_manifest.cpp src/cas/manifest_serializer.cpp src/cas/object_store.cpp src/cas/object_verifier.cpp
-BASE_SOURCES := src/main.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/folder_picker.cpp src/collab_store.cpp src/web_server.cpp
+BASE_SOURCES := src/main.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/folder_picker.cpp src/collab_store.cpp src/collab_broadcaster.cpp src/web_server.cpp
 SOURCES := $(BASE_SOURCES) $(PEER_SOURCES) $(CAS_SOURCES)
 HEADERS := $(wildcard include/merklechain/*.hpp include/merklechain/peer/*.hpp include/merklechain/cas/*.hpp)
 OBJECTS := $(patsubst src/%.cpp,build/%.o,$(BASE_SOURCES)) build/peer_protocol.o build/peer_config.o build/peer_auth.o build/peer_transport.o build/peer_sync.o build/peer_session.o build/peer_service.o build/peer_controller.o build/peer_cas_helpers.o
@@ -15,7 +15,7 @@ TARGET := build/merklechain.exe
 DASHBOARD_PORT ?= 47831
 # Optional Authenticode code signing thumbprint (disabled by default)
 SIGNING_THUMBPRINT ?=
-TEST_SOURCES := tests/test_main.cpp tests/branching_tests.cpp tests/peer_cas_helpers_tests.cpp tests/peer_sync_cas_delta_tests.cpp tests/cas/cas_tests.cpp tests/cas/cas_collab_integration_tests.cpp tests/cas/cas_gc_tests.cpp tests/collab_store_tests.cpp tests/peer_transport_tests.cpp tests/peer_sync_tests.cpp tests/peer_session_tests.cpp tests/peer_service_tests.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/collab_store.cpp $(PEER_SOURCES) $(CAS_SOURCES)
+TEST_SOURCES := tests/test_main.cpp tests/branching_tests.cpp tests/branching_api_and_sse_tests.cpp tests/peer_cas_helpers_tests.cpp tests/peer_sync_cas_delta_tests.cpp tests/cas/cas_tests.cpp tests/cas/cas_collab_integration_tests.cpp tests/cas/cas_gc_tests.cpp tests/collab_store_tests.cpp tests/peer_transport_tests.cpp tests/peer_sync_tests.cpp tests/peer_session_tests.cpp tests/peer_service_tests.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/folder_picker.cpp src/collab_store.cpp src/collab_broadcaster.cpp src/web_server.cpp $(PEER_SOURCES) $(CAS_SOURCES)
 BENCH_SOURCES := benchmarks/chunk_benchmark.cpp src/chunk_sync.cpp src/hash.cpp src/staging_file.cpp
 CAS_BENCH_SOURCES := benchmarks/cas_benchmark.cpp $(CAS_SOURCES) src/hash.cpp
 CAS_NET_BENCH_SOURCES := benchmarks/cas_network_benchmark.cpp src/hash.cpp src/scanner.cpp src/chunk_sync.cpp src/sync.cpp src/storage.cpp src/versioning.cpp src/scheduler.cpp src/staging_file.cpp src/collab_store.cpp $(PEER_SOURCES) $(CAS_SOURCES)

@@ -71,6 +71,7 @@ void run_collab_store_lifecycle_tests(const fs::path& fixture_root, void (*check
 void run_collab_store_workspace_locking_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
 void run_collab_store_phase2_recovery_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
 void run_branching_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
+void run_branching_api_and_sse_tests(const fs::path& fixture_root, void (*check)(bool, const char*));
 }
 namespace mc::cas {
 void run_cas_tests(const mc::fs::path& fixture_root, void (*check)(bool, const char*));
@@ -570,5 +571,6 @@ int main(int argc,char** argv){
     mc::cas::run_cas_collab_integration_tests(base, check);
     mc::cas::run_cas_gc_tests(base, check);
     mc::run_branching_tests(base, check);
+    mc::run_branching_api_and_sse_tests(base, check);
     mc::fs::remove_all(base,ec);std::cout<<"Test checks: "<<passes<<" passed, "<<failures<<" failed, "<<skips<<" skipped\n";return failures?1:0;
 }

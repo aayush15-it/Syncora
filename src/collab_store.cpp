@@ -60,6 +60,28 @@ std::string join_strings(const std::vector<std::string>& list, char delimiter = 
     return res;
 }
 
+std::string quote_json(const std::string& str) {
+    std::string out = "\"";
+    for (char c : str) {
+        if (c == '"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\b') out += "\\b";
+        else if (c == '\f') out += "\\f";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else if (static_cast<unsigned char>(c) < 0x20) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+            out += buf;
+        } else {
+            out += c;
+        }
+    }
+    out += "\"";
+    return out;
+}
+
 std::vector<std::string> split_strings(const std::string& str, char delimiter = ',') {
     std::vector<std::string> items;
     std::stringstream ss(str);
@@ -429,6 +451,26 @@ bool CollabStore::verify_password(const std::string& password, const std::string
     }
 
     return CRYPTO_memcmp(computed_key.data(), expected_key.data(), expected_key.size()) == 0;
+}
+
+void CollabStore::set_event_listener(CollabEventListener listener) {
+    std::lock_guard<std::mutex> lock(event_listener_mutex_);
+    event_listener_ = std::move(listener);
+}
+
+void CollabStore::notify_event(const CollabEvent& event) {
+    CollabEventListener listener;
+    {
+        std::lock_guard<std::mutex> lock(event_listener_mutex_);
+        listener = event_listener_;
+    }
+    if (listener) {
+        try {
+            listener(event);
+        } catch (...) {
+            // Swallow listener exceptions to avoid interrupting core storage operations
+        }
+    }
 }
 
 void CollabStore::init_schema() {
@@ -1469,6 +1511,19 @@ CollabBranch CollabStore::create_branch(const std::string& workspace_id,
                         "success",
                         "Created branch " + name + " in workspace " + actual_ws_id);
 
+    CollabEvent ev;
+    ev.id = "ev_" + generate_random_token(8);
+    ev.event_type = "branch_created";
+    ev.workspace_id = actual_ws_id;
+    ev.branch_id = br.id;
+    ev.version_id = br.head_version_id;
+    ev.timestamp_ms = br.created_at_ms;
+    ev.payload_json = "{\"workspace_id\":" + quote_json(actual_ws_id) +
+                      ",\"branch_id\":" + quote_json(br.id) +
+                      ",\"branch_name\":" + quote_json(br.name) +
+                      ",\"head_version_id\":" + quote_json(br.head_version_id) + "}";
+    notify_event(ev);
+
     return br;
 }
 
@@ -1567,12 +1622,59 @@ bool CollabStore::delete_branch(const std::string& workspace_id,
 
     record_event_nolock("system", "host", "BRANCH_DELETED", "branch:" + br->id, "success",
                         "Deleted branch " + branch_name + " in workspace " + actual_ws_id);
+
+    CollabEvent ev;
+    ev.id = "ev_" + generate_random_token(8);
+    ev.event_type = "branch_deleted";
+    ev.workspace_id = actual_ws_id;
+    ev.branch_id = br->id;
+    ev.version_id = br->head_version_id;
+    ev.timestamp_ms = now_ms();
+    ev.payload_json = "{\"workspace_id\":" + quote_json(actual_ws_id) +
+                      ",\"branch_id\":" + quote_json(br->id) +
+                      ",\"branch_name\":" + quote_json(br->name) + "}";
+    notify_event(ev);
+
     return true;
+}
+
+bool CollabStore::has_uncommitted_changes_nolock(const std::string& actual_ws_id) {
+    const auto base_dir = workspace_baseline_dir(actual_ws_id);
+    const auto work_dir = workspace_working_copy_dir(actual_ws_id);
+
+    const bool base_exists = fs::exists(base_dir);
+    const bool work_exists = fs::exists(work_dir);
+
+    if (!base_exists && !work_exists) return false;
+
+    const auto base_manifest = base_exists ? scan_folder(base_dir) : FileManifest{};
+    const auto work_manifest = work_exists ? scan_folder(work_dir) : FileManifest{};
+
+    if (base_manifest.files.size() != work_manifest.files.size()) {
+        return true;
+    }
+    if (base_manifest.merkle_root != work_manifest.merkle_root) {
+        return true;
+    }
+    return false;
+}
+
+bool CollabStore::has_uncommitted_changes(const std::string& workspace_id) {
+    OperationGuard op_guard(*this);
+    std::string actual_ws_id = workspace_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        const auto ws = find_workspace_by_id_nolock(workspace_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+    return has_uncommitted_changes_nolock(actual_ws_id);
 }
 
 bool CollabStore::switch_branch(const std::string& workspace_id,
                                 const std::string& branch_name,
-                                const std::string& user_id) {
+                                const std::string& user_id,
+                                bool force) {
     OperationGuard op_guard(*this);
     cas::CasSharedBarrierGuard cas_lock(cas_barrier_);
 
@@ -1605,6 +1707,11 @@ bool CollabStore::switch_branch(const std::string& workspace_id,
     // If already on this branch, nothing to do
     if (current_active_id == target_branch.id) {
         return true;
+    }
+
+    // Check for dirty working copy before staging operations
+    if (!force && has_uncommitted_changes_nolock(actual_ws_id)) {
+        throw std::runtime_error("cannot switch branch: working copy has uncommitted changes");
     }
 
     const auto ws_root_dir = workspace_root(actual_ws_id);
@@ -1759,6 +1866,19 @@ bool CollabStore::switch_branch(const std::string& workspace_id,
             update_operation_intent_nolock(op_id, "COMMITTED", "COMPLETED");
         }
 
+        CollabEvent ev;
+        ev.id = "ev_" + generate_random_token(8);
+        ev.event_type = "branch_switched";
+        ev.workspace_id = actual_ws_id;
+        ev.branch_id = target_branch.id;
+        ev.version_id = target_branch.head_version_id;
+        ev.timestamp_ms = now_ms();
+        ev.payload_json = "{\"workspace_id\":" + quote_json(actual_ws_id) +
+                          ",\"branch_id\":" + quote_json(target_branch.id) +
+                          ",\"branch_name\":" + quote_json(target_branch.name) +
+                          ",\"head_version_id\":" + quote_json(target_branch.head_version_id) + "}";
+        notify_event(ev);
+
         return true;
     } catch (...) {
         recover_switch_branch_op(op_rec);
@@ -1868,6 +1988,21 @@ CollabSubmission CollabStore::create_submission(const std::string& client_id,
     record_event(client_id, user ? user->username : "unknown", "SUBMISSION_CREATED",
                  "submission:" + sub.id, "success",
                  "Submitted " + std::to_string(sub.file_count) + " files (root: " + sub.merkle_root.substr(0, 12) + "...)");
+
+    CollabEvent ev;
+    ev.id = "ev_" + generate_random_token(8);
+    ev.event_type = "submission_created";
+    ev.workspace_id = actual_ws_id;
+    ev.branch_id = "";
+    ev.version_id = "";
+    ev.timestamp_ms = sub.submitted_at_ms;
+    ev.payload_json = "{\"workspace_id\":" + quote_json(actual_ws_id) +
+                      ",\"submission_id\":" + quote_json(sub.id) +
+                      ",\"client_id\":" + quote_json(sub.client_id) +
+                      ",\"file_count\":" + std::to_string(sub.file_count) +
+                      ",\"total_size\":" + std::to_string(sub.total_size) +
+                      ",\"merkle_root\":" + quote_json(sub.merkle_root) + "}";
+    notify_event(ev);
 
     return sub;
 }
@@ -2955,6 +3090,18 @@ bool CollabStore::accept_submission(const std::string& sub_id, const std::string
             update_operation_intent_nolock(op_id, "COMMITTED", "COMPLETED");
         }
 
+        CollabEvent ev;
+        ev.id = "ev_" + generate_random_token(8);
+        ev.event_type = "submission_reviewed";
+        ev.workspace_id = ws_id;
+        ev.branch_id = "";
+        ev.version_id = "";
+        ev.timestamp_ms = now_ms();
+        ev.payload_json = "{\"workspace_id\":" + quote_json(ws_id) +
+                          ",\"submission_id\":" + quote_json(sub_id) +
+                          ",\"status\":\"accepted\",\"reviewer_id\":" + quote_json(reviewer_id) + "}";
+        notify_event(ev);
+
         return true;
     } catch (...) {
         recover_accept_submission_op(op_rec);
@@ -2998,6 +3145,20 @@ bool CollabStore::reject_submission(const std::string& sub_id, const std::string
     const auto reviewer = find_user_by_id(reviewer_id);
     record_event(reviewer_id, reviewer ? reviewer->username : "host", "SUBMISSION_REJECTED",
                  "submission:" + sub_id, "success", "Notes: " + notes);
+
+    if (ok) {
+        CollabEvent ev;
+        ev.id = "ev_" + generate_random_token(8);
+        ev.event_type = "submission_reviewed";
+        ev.workspace_id = ws_id;
+        ev.branch_id = "";
+        ev.version_id = "";
+        ev.timestamp_ms = t;
+        ev.payload_json = "{\"workspace_id\":" + quote_json(ws_id) +
+                          ",\"submission_id\":" + quote_json(sub_id) +
+                          ",\"status\":\"rejected\",\"reviewer_id\":" + quote_json(reviewer_id) + "}";
+        notify_event(ev);
+    }
 
     return ok;
 }
@@ -3677,6 +3838,19 @@ CollabPublishedVersion CollabStore::publish_version(const std::string& workspace
             std::lock_guard<std::mutex> db_lock(db_mutex_);
             update_operation_intent_nolock(op_id, "COMMITTED", "COMPLETED");
         }
+
+        CollabEvent ev;
+        ev.id = "ev_" + generate_random_token(8);
+        ev.event_type = "version_published";
+        ev.workspace_id = actual_ws_id;
+        ev.branch_id = active_br_id;
+        ev.version_id = ver.id;
+        ev.timestamp_ms = ver.published_at_ms;
+        ev.payload_json = "{\"workspace_id\":" + quote_json(actual_ws_id) +
+                          ",\"version_id\":" + quote_json(ver.id) +
+                          ",\"title\":" + quote_json(ver.title) +
+                          ",\"merkle_root\":" + quote_json(ver.merkle_root) + "}";
+        notify_event(ev);
 
         return ver;
     } catch (...) {

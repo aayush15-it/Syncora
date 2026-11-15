@@ -1,3 +1,5 @@
+
+
 # MerkleChain
 
 MerkleChain is a Windows C++17 local-folder synchronization prototype. Its Local Mode scans and hashes two existing folders, builds deterministic Merkle roots, previews an A-to-B plan, requires explicit approval, stages and verifies copies, backs up replaced destination content, and writes activity to SQLite. Files found only in B are preserved during normal synchronization; there is no implicit deletion.
