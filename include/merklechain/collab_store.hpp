@@ -475,6 +475,10 @@ public:
     CollabSubmission create_submission(const std::string& client_id,
                                        const std::string& workspace_id,
                                        const fs::path& source_folder);
+    CollabSubmission create_submission_from_files(const std::string& client_id,
+                                                 const std::string& workspace_id,
+                                                 const std::vector<std::pair<std::string, std::string>>& files,
+                                                 const std::string& notes = "");
     std::optional<CollabSubmission> find_submission_by_id(const std::string& sub_id);
     std::vector<CollabSubmission> list_submissions(const std::string& workspace_id = "");
     std::vector<CollabSubmission> list_submissions_for_client(const std::string& client_id);

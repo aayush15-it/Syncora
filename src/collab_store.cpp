@@ -2131,6 +2131,124 @@ CollabSubmission CollabStore::create_submission(const std::string& client_id,
     return sub;
 }
 
+CollabSubmission CollabStore::create_submission_from_files(const std::string& client_id,
+                                                           const std::string& workspace_id,
+                                                           const std::vector<std::pair<std::string, std::string>>& files,
+                                                           const std::string& notes) {
+    OperationGuard op_guard(*this);
+
+    if (files.empty()) {
+        throw std::runtime_error("cannot create submission with zero files");
+    }
+
+    std::string actual_ws_id = workspace_id;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        auto ws = find_workspace_by_id_nolock(workspace_id);
+        if (ws) actual_ws_id = ws->id;
+    }
+
+    if (!is_user_in_workspace(actual_ws_id, client_id)) {
+        throw std::runtime_error("client does not have access to this workspace");
+    }
+
+    auto ws_lock = get_workspace_lock(actual_ws_id);
+
+    CollabSubmission sub;
+    sub.id = "sub_" + generate_random_token(10);
+    sub.client_id = client_id;
+    sub.workspace_id = actual_ws_id;
+    sub.status = "pending";
+    sub.review_notes = notes;
+    sub.submitted_at_ms = now_ms();
+    sub.reviewed_at_ms = 0;
+
+    const auto target_dir = workspace_submissions_dir(actual_ws_id) / sub.id;
+    std::error_code ec;
+    fs::create_directories(target_dir, ec);
+
+    for (const auto& [rel_path, content] : files) {
+        fs::path p = fs::u8path(rel_path);
+        if (p.is_absolute() || p.native().find(L"..") != std::wstring::npos) {
+            p = p.filename();
+        }
+        fs::path dest = target_dir / p;
+        fs::create_directories(dest.parent_path(), ec);
+        std::ofstream out(dest, std::ios::binary);
+        if (!out) {
+            fs::remove_all(target_dir, ec);
+            throw std::runtime_error("failed to write uploaded file: " + rel_path);
+        }
+        out.write(content.data(), content.size());
+        out.close();
+    }
+
+    const auto staged_manifest = scan_folder(target_dir);
+    if (!staged_manifest.complete) {
+        fs::remove_all(target_dir, ec);
+        throw std::runtime_error("submission scanning failed upon staging");
+    }
+
+    sub.file_count = staged_manifest.files.size();
+    sub.total_size = 0;
+    for (const auto& f : staged_manifest.files) sub.total_size += f.size;
+    sub.merkle_root = staged_manifest.merkle_root;
+
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = R"(
+            INSERT INTO submissions (id, client_id, workspace_id, file_count, total_size, merkle_root, status, review_notes, submitted_at_ms, reviewed_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        )";
+        stmt = stmt_registry_.prepare(db_, sql);
+        if (!stmt) {
+            throw std::runtime_error("failed to prepare submission record insert");
+        }
+
+        sqlite3_bind_text(stmt, 1, sub.id.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, sub.client_id.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 3, sub.workspace_id.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(sub.file_count));
+        sqlite3_bind_int64(stmt, 5, static_cast<sqlite3_int64>(sub.total_size));
+        sqlite3_bind_text(stmt, 6, sub.merkle_root.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 7, sub.status.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 8, sub.review_notes.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 9, sub.submitted_at_ms);
+        sqlite3_bind_int64(stmt, 10, sub.reviewed_at_ms);
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            std::string err = sqlite3_errmsg(db_);
+            stmt_registry_.finalize(stmt);
+            throw std::runtime_error("failed to record submission: " + err);
+        }
+        stmt_registry_.finalize(stmt);
+    }
+
+    const auto user = find_user_by_id(client_id);
+    record_event(client_id, user ? user->username : "unknown", "SUBMISSION_CREATED",
+                 "submission:" + sub.id, "success",
+                 "Submitted " + std::to_string(sub.file_count) + " uploaded files (root: " + sub.merkle_root.substr(0, 12) + "...)");
+
+    CollabEvent ev;
+    ev.id = "ev_" + generate_random_token(8);
+    ev.event_type = "submission_created";
+    ev.workspace_id = actual_ws_id;
+    ev.branch_id = "";
+    ev.version_id = "";
+    ev.timestamp_ms = sub.submitted_at_ms;
+    ev.payload_json = "{\"workspace_id\":" + quote_json(actual_ws_id) +
+                      ",\"submission_id\":" + quote_json(sub.id) +
+                      ",\"client_id\":" + quote_json(sub.client_id) +
+                      ",\"file_count\":" + std::to_string(sub.file_count) +
+                      ",\"total_size\":" + std::to_string(sub.total_size) +
+                      ",\"merkle_root\":" + quote_json(sub.merkle_root) + "}";
+    if (ws_lock.owns_lock()) ws_lock.unlock();
+    notify_event(ev);
+
+    return sub;
+}
+
 // Precondition: caller must hold db_mutex_.
 std::optional<CollabSubmission> CollabStore::find_submission_by_id_nolock(const std::string& sub_id) {
     sqlite3_stmt* stmt = nullptr;

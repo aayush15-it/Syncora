@@ -3175,22 +3175,67 @@ async function loadClientOverview() {
   }
 }
 
+let selectedClientFiles = null;
+let selectedClientFolderName = "";
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      const commaIdx = dataUrl.indexOf(",");
+      resolve(commaIdx >= 0 ? dataUrl.substring(commaIdx + 1) : dataUrl);
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
 async function submitClientFolder() {
-  const folder = $("client-source-folder").value.trim();
+  const folderVal = $("client-source-folder").value.trim();
   const notes = $("client-submission-notes").value.trim();
-  if (!folder) { toast("Select a folder first"); return; }
+  if (!folderVal) { toast("Select a folder first"); return; }
   const btn = $("btn-client-send-submission");
   btn.disabled = true;
   btn.textContent = "Scanning & Submitting...";
   try {
     const wsId = state.clientWorkspaceId || localStorage.getItem("mc_client_workspace_id") || "";
-    const res = await collabFetch("/api/client/submissions", "POST", { source_folder: folder, notes, workspace_id: wsId });
+    let res;
+    if (selectedClientFiles && selectedClientFiles.length > 0) {
+      btn.textContent = `Reading ${selectedClientFiles.length} files...`;
+      const paths = [];
+      const contents = [];
+      for (let i = 0; i < selectedClientFiles.length; ++i) {
+        const file = selectedClientFiles[i];
+        btn.textContent = `Reading ${i + 1}/${selectedClientFiles.length}...`;
+        const b64 = await readFileAsBase64(file);
+        let relPath = file.webkitRelativePath || file.name;
+        if (relPath.includes("/")) {
+          relPath = relPath.substring(relPath.indexOf("/") + 1);
+        }
+        if (!relPath) relPath = file.name;
+        paths.push(relPath);
+        contents.push(b64);
+      }
+      btn.textContent = "Uploading & hashing Merkle tree...";
+      res = await collabFetch("/api/client/upload-submission", "POST", {
+        workspace_id: wsId,
+        notes: notes || `Uploaded folder: ${selectedClientFolderName}`,
+        paths,
+        contents
+      });
+    } else {
+      res = await collabFetch("/api/client/submissions", "POST", { source_folder: folderVal, notes, workspace_id: wsId });
+    }
     const s = res.submission;
     $("client-submission-receipt").style.display = "block";
     put($("sub-receipt-id"), s.id);
     put($("sub-receipt-meta"), `${s.file_count} files (${escBytes(s.total_size)})`);
     put($("sub-receipt-root"), s.merkle_root);
     toast("Folder submitted to Host successfully!");
+    selectedClientFiles = null;
+    selectedClientFolderName = "";
+    if ($("client-browser-folder-picker")) $("client-browser-folder-picker").value = "";
   } catch (err) {
     toast(`Submission error: ${err.message}`);
   } finally {
@@ -3481,14 +3526,30 @@ window.addEventListener("DOMContentLoaded", () => {
   $("btn-refresh-host-activity")?.addEventListener("click", loadHostActivity);
 
   // Client browse folders
-  $("btn-client-browse-folder")?.addEventListener("click", async () => {
-    try {
-      const res = await api("/api/pick-folder", { slot: "submission" });
-      if (!res.cancelled && res.path) {
-        $("client-source-folder").value = res.path;
-      }
-    } catch (err) {
-      toast(`Browse error: ${err.message}`);
+  $("client-browser-folder-picker")?.addEventListener("change", (e) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    selectedClientFiles = files;
+    const firstRel = files[0].webkitRelativePath || files[0].name;
+    const folderName = firstRel.includes("/") ? firstRel.split("/")[0] : "Selected Folder";
+    selectedClientFolderName = folderName;
+    const totalBytes = files.reduce((acc, f) => acc + f.size, 0);
+    const displayStr = `📁 ${folderName} (${files.length} files, ${escBytes(totalBytes)})`;
+    if ($("client-source-folder")) {
+      $("client-source-folder").value = displayStr;
+    }
+    toast(`Selected ${files.length} files from "${folderName}"`);
+  });
+
+  $("client-source-folder")?.addEventListener("input", () => {
+    selectedClientFiles = null;
+    selectedClientFolderName = "";
+  });
+
+  $("btn-client-browse-folder")?.addEventListener("click", () => {
+    const picker = $("client-browser-folder-picker");
+    if (picker) {
+      picker.click();
     }
   });
 

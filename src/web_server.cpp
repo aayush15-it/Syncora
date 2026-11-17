@@ -44,9 +44,28 @@
 namespace mc {
 namespace {
 constexpr std::size_t kMaxHeaderBytes = 16U * 1024U;
-constexpr std::size_t kMaxBodyBytes = 1024U * 1024U;
-constexpr std::size_t kMaxResponseBytes = 8U * 1024U * 1024U;
+constexpr std::size_t kMaxBodyBytes = 64U * 1024U * 1024U;
+constexpr std::size_t kMaxResponseBytes = 64U * 1024U * 1024U;
 constexpr auto kPlanLifetime = std::chrono::minutes(10);
+
+std::string base64_decode(std::string_view in) {
+    std::string out;
+    std::vector<int> T(256, -1);
+    const std::string b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (int i = 0; i < 64; ++i) T[static_cast<unsigned char>(b64[i])] = i;
+    int val = 0, valb = -8;
+    for (unsigned char c : in) {
+        if (c == '=') break;
+        if (T[c] == -1) continue;
+        val = (val << 6) + T[c];
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<char>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
 
 struct Socket {
     SOCKET value{INVALID_SOCKET};
@@ -1821,6 +1840,32 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                     std::string folder_str = require_string(*pbody, "source_folder");
                     fs::path folder = canonical_directory(input_path(folder_str));
                     auto sub = store.create_submission(auth.user.id, ws_id, folder);
+                    return {200, "application/json; charset=utf-8", "{\"success\":true,\"submission\":" + serialize_collab_submission(sub) + "}"};
+                }
+            }
+
+            if (parts.size() >= 3 && parts[2] == "upload-submission") {
+                if (request.method == "POST" && pbody) {
+                    std::string ws_id = optional_string(*pbody, "workspace_id", "");
+                    if (ws_id.empty()) ws_id = get_client_ws_id();
+                    if (!store.is_user_in_workspace(ws_id, auth.user.id)) {
+                        return {403, "application/json; charset=utf-8", json_error("Forbidden: Client not authorized in workspace " + ws_id)};
+                    }
+                    std::string notes = optional_string(*pbody, "notes", "");
+                    if (!pbody->string_arrays.count("paths") || !pbody->string_arrays.count("contents")) {
+                        return {400, "application/json; charset=utf-8", json_error("paths and contents arrays are required")};
+                    }
+                    const auto& paths = pbody->string_arrays.at("paths");
+                    const auto& contents = pbody->string_arrays.at("contents");
+                    if (paths.size() != contents.size() || paths.empty()) {
+                        return {400, "application/json; charset=utf-8", json_error("paths and contents must have matching non-zero lengths")};
+                    }
+                    std::vector<std::pair<std::string, std::string>> files;
+                    files.reserve(paths.size());
+                    for (std::size_t i = 0; i < paths.size(); ++i) {
+                        files.emplace_back(paths[i], base64_decode(contents[i]));
+                    }
+                    auto sub = store.create_submission_from_files(auth.user.id, ws_id, files, notes);
                     return {200, "application/json; charset=utf-8", "{\"success\":true,\"submission\":" + serialize_collab_submission(sub) + "}"};
                 }
             }

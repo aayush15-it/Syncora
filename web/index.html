@@ -2308,7 +2308,9 @@
           <div class="input-browse-row">
             <input type="text" id="client-source-folder" placeholder="C:\Users\&hellip;\MyProject" required>
             <button type="button" class="btn neutral" id="btn-client-browse-folder">Browse&hellip;</button>
+            <input type="file" id="client-browser-folder-picker" webkitdirectory directory multiple style="display:none">
           </div>
+          <small class="field-help" id="client-browse-hint">Click <b>Browse&hellip;</b> to select any folder from your computer, or enter a path.</small>
         </div>
         <div class="form-row">
           <label for="client-submission-notes">Notes for Reviewer (Optional)</label>
