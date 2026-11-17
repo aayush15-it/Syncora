@@ -3082,7 +3082,7 @@ void CollabStore::recover_incomplete_operations() {
     }
 }
 
-
+//accept submission 
 bool CollabStore::accept_submission(const std::string& sub_id, const std::string& reviewer_id, const std::string& notes) {
     OperationGuard op_guard(*this);
     cas::CasSharedBarrierGuard cas_lock(cas_barrier_);
@@ -3650,7 +3650,7 @@ CollabFileDiff CollabStore::compute_file_diff(const std::string& ws_id, const st
 
     return diff;
 }
-
+//publish version 
 CollabPublishedVersion CollabStore::publish_version(const std::string& workspace_id,
                                                    const std::string& published_by_id,
                                                    const std::string& title,

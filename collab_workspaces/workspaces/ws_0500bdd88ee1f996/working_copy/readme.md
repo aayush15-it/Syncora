@@ -1,2 +1,0 @@
-# Alice Project
-First commit.
