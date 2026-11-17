@@ -86,13 +86,11 @@
     <div class="nav-group workspace-group-settings" id="nav-group-settings" style="display:none;">
       <div class="nav-label">SETTINGS &amp; SYSTEM</div>
       <a class="nav-link active" id="nav-settings-overview" href="#settings" data-view="settings"><span>⚙</span>Settings Dashboard</a>
-      <a class="nav-link" id="nav-settings-local" href="#local-overview" data-go="local-overview"><span>⌂</span>Local Workspace</a>
-      <a class="nav-link" id="nav-settings-network" href="#network-select" data-go="network-select"><span>👥</span>Network Model</a>
     </div>
 
     <div class="sidebar-bottom">
       <div class="workspace-switch-card">
-        <button type="button" class="btn-switch-workspace" id="btn-toggle-workspace" data-go="overview">
+        <button type="button" class="btn-switch-workspace" id="btn-toggle-workspace" data-go="network-select">
           Switch to Network Model <span>⇄</span>
         </button>
       </div>
@@ -790,7 +788,7 @@
 
         <div class="form-actions">
           <p id="pairing-status" class="status-msg" role="status"></p>
-          <button type="submit" id="btn-save-config" class="btn primary">Save &amp; Activate Configuration <span>→</span></button>
+          <button type="button" id="btn-save-config" class="btn primary">Save &amp; Activate Configuration <span>→</span></button>
         </div>
       </form>
     </section>
@@ -1329,20 +1327,6 @@
             </div>
             <div class="table-note">B-only files are preserved. Current Local Mode does not schedule deletion.</div>
           </article>
-          <aside id="selected-file-inspector" class="card inspector">
-            <div class="kicker">FILE DETAILS</div>
-            <h3 id="inspector-name">Select a file</h3>
-            <p class="muted" id="inspector-path">Choose a row to inspect metadata and hashes.</p>
-            <span id="inspector-operation" class="operation-chip">—</span>
-            <div class="inspector-tabs">
-              <button class="tab selected" data-inspector-tab="metadata">Metadata</button>
-              <button class="tab" data-inspector-tab="hashes">Hashes</button>
-              <button class="tab" data-inspector-tab="transfer">Transfer</button>
-            </div>
-            <div id="inspector-content" class="inspector-content">
-              <p class="empty">No file selected.</p>
-            </div>
-          </aside>
         </div>
         <article class="card approval-card">
           <div>
@@ -1428,8 +1412,42 @@
 
     <!-- LOCAL ACTIVITY VIEW -->
     <section class="view" id="view-activity" data-title="Activity &amp; Diagnostics" data-section="Local Workspace">
-      <div class="page-heading"><div><div class="kicker">SQLITE / RECORDED LOCAL OPERATIONS</div><h1>Activity &amp; Diagnostics</h1><p>Actual operation state, timestamps, verification, transfer accounting, and errors from Folder B.</p></div><button id="refresh-activity" class="btn neutral">Refresh activity</button></div>
-      <div class="activity-tools"><input id="activity-search" type="search" placeholder="Filter path, operation, or job ID…"><select id="activity-filter"><option value="ALL">All results</option><option value="FAILED">Failed</option><option value="VERIFIED">Verified</option></select></div>
+      <div class="page-heading">
+        <div>
+          <div class="kicker">SQLITE / RECORDED LOCAL OPERATIONS</div>
+          <h1>Activity &amp; Diagnostics</h1>
+          <p>Actual operation state, timestamps, verification, transfer accounting, and errors from Folder B.</p>
+        </div>
+        <button id="refresh-activity" class="btn neutral">Refresh activity</button>
+      </div>
+
+      <!-- Sync Folder Context Bar -->
+      <div class="activity-context-bar" id="activity-context-bar">
+        <div class="context-path-group">
+          <span class="context-label">Source (A):</span>
+          <span class="context-val" id="act-folder-a" title="Source Directory">—</span>
+          <span class="context-arrow">➔</span>
+          <span class="context-label">Destination (B):</span>
+          <span class="context-val" id="act-folder-b" title="Destination Directory">—</span>
+        </div>
+        <div class="context-stats-group" id="activity-stats-summary">
+          <span class="badge" id="activity-count-badge">0 operations</span>
+        </div>
+      </div>
+
+      <div class="activity-tools">
+        <input id="activity-search" type="search" placeholder="Filter path, file name, or operation…">
+        <select id="activity-filter">
+          <option value="ALL">All operations</option>
+          <option value="ADD">Add (+)</option>
+          <option value="MODIFY">Modify (Δ)</option>
+          <option value="PRESERVE">Preserve (🛡️)</option>
+          <option value="DELETE">Delete (✕)</option>
+          <option value="UNCHANGED">Unchanged (=)</option>
+          <option value="FAILED">Failed</option>
+          <option value="VERIFIED">Verified</option>
+        </select>
+      </div>
       <article class="card"><div id="activity-list" class="record-list"><p class="empty">Choose Folder B in Synchronize to load SQLite records.</p></div></article>
     </section>
 
@@ -1660,36 +1678,77 @@
       </div>
 
       <div class="gateway-grid">
-        <!-- Host Portal Card -->
+        <!-- Host Sign In Card -->
         <article class="card gateway-card host-portal-card">
-          <div class="portal-badge-tag host-tag">HOST ADMINISTRATOR</div>
+          <div class="portal-badge-tag host-tag">CENTRAL AUTHORITY</div>
           <div class="portal-icon-circle host-circle">
             <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.2">
               <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
             </svg>
           </div>
-          <h2>Host Dashboard</h2>
-          <p>Manage client credentials, inspect submitted folders, edit files in working copies, review unified diffs, publish immutable versions, and monitor security events.</p>
-          <div class="portal-meta-box">
-            <span class="meta-label">Default Workspace:</span>
-            <code>Default-Workspace (ws-default)</code>
+          <h2>Sign In as Host</h2>
+          <p>Access an existing authoritative workspace to review client submissions, inspect diffs, and publish immutable releases.</p>
+
+          <form id="host-quick-login-form" class="client-auth-form" onsubmit="return false;">
+            <div class="form-row-compact">
+              <label for="login-host-username">Host Username</label>
+              <input type="text" id="login-host-username" value="Host" placeholder="Host" required>
+            </div>
+            <div class="form-row-compact">
+              <label for="login-host-password">Host Password</label>
+              <input type="password" id="login-host-password" value="Host@123" placeholder="Password" required>
+            </div>
+            <div class="auth-hint-text" style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.75rem;">
+              Host account: <code>Host</code> / <code>Host@123</code>
+            </div>
+            <button type="button" class="btn forest-btn full-w" id="btn-enter-host">
+              Sign In as Host <span>&rarr;</span>
+            </button>
+          </form>
+          <div id="host-login-error" class="login-msg error-msg" style="display:none;"></div>
+        </article>
+
+        <!-- Host Registration Card -->
+        <article class="card gateway-card host-register-card">
+          <div class="portal-badge-tag host-tag" style="background:#e8f5e9; color:#1b5e20; border-color:#a5d6a7;">NEW WORKSPACE</div>
+          <div class="portal-icon-circle host-circle" style="background:#e8f5e9; color:#2e7d32;">
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.2">
+              <path d="M12 4v16m8-8H4"/>
+            </svg>
           </div>
-          <button class="btn forest-btn btn-lg full-w" id="btn-enter-host" data-go="host-overview">
-            Enter Host Dashboard <span>&rarr;</span>
-          </button>
+          <h2>Register New Host</h2>
+          <p>Create a new Central Authority workspace with zero baseline records, dedicated isolated storage, and full management controls.</p>
+
+          <form id="host-register-form" class="client-auth-form" onsubmit="return false;">
+            <div class="form-row-compact">
+              <label for="register-host-username">New Host Username</label>
+              <input type="text" id="register-host-username" placeholder="e.g. Host_Alice" required>
+            </div>
+            <div class="form-row-compact">
+              <label for="register-host-password">New Host Password</label>
+              <input type="password" id="register-host-password" placeholder="At least 8 characters" required>
+            </div>
+            <div class="auth-hint-text" style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.75rem;">
+              Creates an isolated Central Authority workspace from scratch.
+            </div>
+            <button type="button" class="btn forest-btn full-w" id="btn-register-host">
+              Create Host Account &amp; Start <span>&rarr;</span>
+            </button>
+          </form>
+          <div id="host-register-error" class="login-msg error-msg" style="display:none;"></div>
         </article>
 
         <!-- Client Portal Card -->
         <article class="card gateway-card client-portal-card">
-          <div class="portal-badge-tag client-tag">CLIENT COLLABORATOR</div>
+          <div class="portal-badge-tag client-tag">CONTRIBUTOR</div>
           <div class="portal-icon-circle client-circle">
             <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.2">
               <circle cx="12" cy="7" r="4"/>
               <path d="M5.5 21a6.5 6.5 0 0 1 13 0"/>
             </svg>
           </div>
-          <h2>Client Workspace</h2>
-          <p>Sign in using credentials provisioned by the Host. Submit project folders, review published versions, and receive verified updates into your local folder.</p>
+          <h2>Connect as Client</h2>
+          <p>Connect to an existing Host workspace. Check out the latest published release, work safely in an isolated local copy, and submit change proposals.</p>
           
           <form id="client-quick-login-form" class="client-auth-form" onsubmit="return false;">
             <div class="form-row-compact">
@@ -1700,8 +1759,11 @@
               <label for="login-client-password">Password</label>
               <input type="password" id="login-client-password" value="AliceClient2026!" placeholder="Password" required>
             </div>
-            <button type="submit" class="btn forest-btn full-w" id="btn-submit-client-login">
-              Sign In as Client <span>&rarr;</span>
+            <div class="auth-hint-text" style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.75rem;">
+              Default: <code>client_alice</code> / <code>AliceClient2026!</code>
+            </div>
+            <button type="button" class="btn forest-btn full-w" id="btn-submit-client-login">
+              Connect as Client <span>&rarr;</span>
             </button>
           </form>
           <div id="client-login-error" class="login-msg error-msg" style="display:none;"></div>
@@ -1730,7 +1792,7 @@
       <div class="stats-row">
         <article class="stat-card">
           <div class="kicker">CLIENT ACCOUNTS</div>
-          <b id="host-stat-clients">2</b>
+          <b id="host-stat-clients">0</b>
           <span class="muted">Provisioned users</span>
         </article>
         <article class="stat-card">
@@ -1771,36 +1833,13 @@
             <span class="badge" id="host-active-ws-badge">Default-Workspace</span>
           </div>
           <div class="kv-grid">
-            <div><span class="muted">Workspace ID:</span> <code>ws-default</code></div>
-            <div><span class="muted">Description:</span> Primary collaboration workspace</div>
+            <div><span class="muted">Workspace ID:</span> <code id="host-overview-ws-id">ws-default</code></div>
+            <div><span class="muted">Description:</span> <span id="host-overview-ws-desc">Primary collaboration workspace</span></div>
             <div><span class="muted">Working Files:</span> <b id="host-stat-working-files">0 files</b></div>
             <div><span class="muted">Working Merkle:</span> <code id="host-stat-working-root" class="hash-code-inline">&mdash;</code></div>
           </div>
         </article>
       </div>
-
-      <article class="card table-card">
-        <div class="table-head">
-          <h3>Recent Security &amp; Audit Events</h3>
-          <button class="btn neutral btn-xs" data-go="host-activity">View All Events &rarr;</button>
-        </div>
-        <div class="table-scroll">
-          <table>
-            <thead>
-              <tr>
-                <th>Timestamp</th>
-                <th>Actor</th>
-                <th>Action</th>
-                <th>Resource</th>
-                <th>Outcome</th>
-              </tr>
-            </thead>
-            <tbody id="host-overview-activity-rows">
-              <tr><td colspan="5" class="empty">Loading recent audit events&hellip;</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </article>
     </section>
 
     <!-- HOST VIEW 2: CLIENT MANAGEMENT -->
@@ -1836,7 +1875,7 @@
           <div class="form-row-2col">
             <div>
               <label>Workspace Assignment</label>
-              <input type="text" readonly value="Default-Workspace (ws-default)">
+              <input type="text" id="new-client-ws-display" readonly value="Default-Workspace (ws-default)">
             </div>
             <div>
               <label>Role</label>
@@ -1849,8 +1888,9 @@
             <label><input type="checkbox" checked disabled> View Published Versions</label>
             <label><input type="checkbox" checked disabled> Accept &amp; Receive Updates</label>
           </div>
+          <div id="new-client-error" class="login-msg error-msg" style="display:none; margin: 12px 0;"></div>
           <div class="form-actions">
-            <button type="submit" class="btn forest-btn" id="btn-save-new-client">Create Client Account</button>
+            <button type="button" class="btn forest-btn" id="btn-save-new-client">Create Client Account</button>
             <button type="button" class="btn neutral" id="btn-cancel-new-client">Cancel</button>
           </div>
         </form>
@@ -2069,11 +2109,11 @@
       </div>
 
       <div class="publish-layout card">
-        <article class="card policy-card" style="margin-bottom: 20px;">
+        <div class="policy-card" style="margin-bottom: 20px;">
           <div class="kicker">IMMUTABILITY CONTRACT</div>
           <h2>Published Versions Are Permanent</h2>
           <p>Once published, a version snapshot is permanently locked with its computed Merkle root digest. Authorized clients will be notified that an update is available to review and apply.</p>
-        </article>
+        </div>
 
         <form id="form-publish-version" class="styled-form" onsubmit="return false;">
           <div class="form-row-2col">
@@ -2083,7 +2123,7 @@
             </div>
             <div>
               <label>Target Workspace</label>
-              <input type="text" readonly value="Default-Workspace (ws-default)">
+              <input type="text" id="publish-ws-display" readonly value="Default-Workspace (ws-default)">
             </div>
           </div>
           <div class="form-row">
@@ -2091,7 +2131,7 @@
             <textarea id="publish-notes" rows="4" placeholder="Describe the changes, fixes, and improvements in this release&hellip;" required></textarea>
           </div>
           <div class="form-actions">
-            <button type="submit" class="btn forest-btn btn-lg" id="btn-submit-publish">Publish Immutable Version</button>
+            <button type="button" class="btn forest-btn btn-lg" id="btn-submit-publish">Publish Immutable Version</button>
           </div>
         </form>
 
@@ -2207,7 +2247,7 @@
       <div class="stats-row">
         <article class="stat-card">
           <div class="kicker">WORKSPACE</div>
-          <b>Default-Workspace</b>
+          <b id="client-workspace-display">Default-Workspace</b>
           <span class="muted">Assigned repository</span>
         </article>
         <article class="stat-card">
@@ -2359,11 +2399,11 @@
       </div>
 
       <article class="card styled-form form-card-contained">
-        <article class="card policy-card" style="margin-bottom: 20px;">
+        <div class="policy-card" style="margin-bottom: 20px;">
           <div class="kicker">VERIFICATION &amp; SAFETY</div>
           <h2>Safe Staging &amp; Merkle Validation</h2>
           <p>The update files are staged and independently verified against the published SHA-256 digests. Only after complete Merkle root verification is the local folder updated.</p>
-        </article>
+        </div>
 
         <div class="form-row">
           <label for="receive-update-id">Select Accepted Update</label>
@@ -2482,7 +2522,7 @@
       <input id="restore-confirmation" autocomplete="off" required>
       <div class="dialog-actions">
         <button class="btn neutral" type="button" id="restore-cancel">Cancel</button>
-        <button class="btn danger" type="submit" id="restore-submit">Restore version</button>
+        <button class="btn danger" type="button" id="restore-submit">Restore version</button>
       </div>
       <p id="restore-error" class="error" role="alert"></p>
     </form>
@@ -2507,7 +2547,7 @@
       </div>
       <div class="dialog-actions">
         <button class="btn neutral" type="button" id="btn-cancel-create-branch">Cancel</button>
-        <button class="btn forest-btn" type="submit" id="btn-submit-create-branch">Create Branch</button>
+        <button class="btn forest-btn" type="button" id="btn-submit-create-branch">Create Branch</button>
       </div>
       <p id="error-create-branch" class="error" role="alert" style="display:none;"></p>
     </form>

@@ -55,6 +55,7 @@ struct CollabUser {
     std::vector<std::string> permissions; // "submit", "view_versions", "download_updates", "accept_updates"
     std::int64_t created_at_ms{0};
     std::int64_t last_login_ms{0};
+    std::string created_by_user_id;
 };
 
 struct CollabSession {
@@ -414,10 +415,14 @@ public:
     CollabUser create_user(const std::string& username,
                            const std::string& password,
                            const std::string& role,
-                           const std::vector<std::string>& permissions);
+                           const std::vector<std::string>& permissions,
+                           const std::string& created_by_user_id = "");
     std::optional<CollabUser> find_user_by_id(const std::string& user_id);
     std::optional<CollabUser> find_user_by_username(const std::string& username);
-    std::vector<CollabUser> list_clients();
+    std::vector<CollabUser> list_clients(const std::string& workspace_id = "");
+    std::vector<CollabUser> list_clients_for_workspace(const std::string& workspace_id);
+    std::optional<CollabWorkspace> get_primary_workspace_for_user(const std::string& user_id);
+    CollabWorkspace create_host_workspace(const std::string& host_id, const std::string& host_username);
     bool set_user_status(const std::string& user_id, const std::string& status);
     bool reset_user_password(const std::string& user_id, const std::string& new_password);
     bool update_user_permissions(const std::string& user_id, const std::vector<std::string>& permissions);
@@ -513,6 +518,7 @@ public:
                       const std::string& detail = "");
     std::vector<CollabSecurityEvent> list_events(std::size_t limit = 100);
     std::vector<CollabSecurityEvent> list_events_for_actor(const std::string& actor_id, std::size_t limit = 100);
+    std::vector<CollabSecurityEvent> list_events_for_host(const std::string& host_id, std::size_t limit = 100);
 
     // Crash Recovery & Operation Journal
     void recover_incomplete_operations();
@@ -705,6 +711,7 @@ private:
     std::optional<CollabUser> find_user_by_username_nolock(const std::string& username);
     std::optional<CollabWorkspace> find_workspace_by_id_nolock(const std::string& ws_id);
     std::vector<CollabWorkspace> list_workspaces_nolock();
+    bool is_user_in_workspace_nolock(const std::string& workspace_id, const std::string& user_id);
     std::optional<CollabSubmission> find_submission_by_id_nolock(const std::string& sub_id);
     std::optional<CollabPublishedVersion> find_version_by_id_nolock(const std::string& version_id);
     std::vector<CollabPublishedVersion> list_published_versions_nolock(const std::string& ws_id);

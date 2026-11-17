@@ -105,6 +105,8 @@ std::uint16_t find_free_port() {
 void run_branching_api_and_sse_tests(const fs::path& fixture_root,
                                      void (*check)(bool, const char*)) {
     (void)fixture_root;
+    WSADATA wsa_init{};
+    WSAStartup(MAKEWORD(2, 2), &wsa_init);
 
     // =========================================================================
     // 1. EventBroadcaster Core Unit Tests
@@ -385,48 +387,51 @@ void run_branching_api_and_sse_tests(const fs::path& fixture_root,
         fs::path test_dir = fs::temp_directory_path() / ("mc_stage2_ev_" + std::to_string(GetTickCount64()));
         fs::create_directories(test_dir);
 
-        CollabStore store(test_dir / "store.db", test_dir / "workspaces", test_dir / "blobs");
+        {
+            CollabStore store(test_dir / "store.db", test_dir / "workspaces");
 
-        std::atomic<bool> listener_called{false};
-        std::atomic<bool> branch_found_in_db{false};
+            std::atomic<bool> listener_called{false};
+            std::atomic<bool> branch_found_in_db{false};
 
-        store.set_event_listener([&](const CollabEvent& ev) {
-            listener_called.store(true);
-            if (ev.event_type == "branch_created") {
-                // Immediately query the store/db inside the callback to prove the branch is already committed!
-                auto branches = store.list_branches(ev.workspace_id);
-                for (const auto& b : branches) {
-                    if (b.name == "feature/verified-commit") {
-                        branch_found_in_db.store(true);
-                        break;
+            store.set_event_listener([&](const CollabEvent& ev) {
+                listener_called.store(true);
+                if (ev.event_type == "branch_created") {
+                    // Immediately query the store/db inside the callback to prove the branch is already committed!
+                    auto branches = store.list_branches(ev.workspace_id);
+                    for (const auto& b : branches) {
+                        if (b.name == "feature/verified-commit") {
+                            branch_found_in_db.store(true);
+                            break;
+                        }
                     }
                 }
+            });
+
+            // Create branch: this should trigger event ONLY AFTER SQLite commit
+            store.create_branch("ws-default", "feature/verified-commit", "", "host");
+
+            check(listener_called.load(), "CollabEvent listener was invoked upon branch creation");
+            check(branch_found_in_db.load(), "Branch was already fully committed in database when listener fired");
+
+            // Verify that failed operation does NOT emit event
+            std::atomic<bool> unexpected_event{false};
+            store.set_event_listener([&](const CollabEvent& ev) {
+                if (ev.event_type == "branch_created" && ev.payload_json.find("duplicate") != std::string::npos) {
+                    unexpected_event.store(true);
+                }
+            });
+
+            try {
+                // Attempt duplicate branch creation - must throw and emit NO event
+                store.create_branch("ws-default", "feature/verified-commit", "", "host");
+            } catch (...) {
+                // Expected failure
             }
-        });
-
-        // Create branch: this should trigger event ONLY AFTER SQLite commit
-        store.create_branch("ws-default", "feature/verified-commit", "host");
-
-        check(listener_called.load(), "CollabEvent listener was invoked upon branch creation");
-        check(branch_found_in_db.load(), "Branch was already fully committed in database when listener fired");
-
-        // Verify that failed operation does NOT emit event
-        std::atomic<bool> unexpected_event{false};
-        store.set_event_listener([&](const CollabEvent& ev) {
-            if (ev.event_type == "branch_created" && ev.payload_json.find("duplicate") != std::string::npos) {
-                unexpected_event.store(true);
-            }
-        });
-
-        try {
-            // Attempt duplicate branch creation - must throw and emit NO event
-            store.create_branch("ws-default", "feature/verified-commit", "host");
-        } catch (...) {
-            // Expected failure
+            check(!unexpected_event.load(), "Failed operation did not emit any CollabEvent");
         }
-        check(!unexpected_event.load(), "Failed operation did not emit any CollabEvent");
 
-        fs::remove_all(test_dir);
+        std::error_code ec;
+        fs::remove_all(test_dir, ec);
     }
 }
 

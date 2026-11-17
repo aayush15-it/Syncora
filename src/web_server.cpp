@@ -1056,6 +1056,7 @@ std::string serialize_collab_user(const CollabUser& u) {
        << ",\"status\":" << quote(u.status)
        << ",\"created_at_ms\":" << u.created_at_ms
        << ",\"last_login_ms\":" << u.last_login_ms
+       << ",\"created_by_user_id\":" << quote(u.created_by_user_id)
        << ",\"permissions\":[";
     for (std::size_t i = 0; i < u.permissions.size(); ++i) {
         if (i) ss << ',';
@@ -1279,7 +1280,7 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
 
                 if (request.method == "GET") {
                     if (!auth.authenticated) return {401, "application/json; charset=utf-8", json_error("Authentication required")};
-                    if (auth.user.role != "host" && !store.is_user_in_workspace(ws_id, auth.user.id)) {
+                    if (!store.is_user_in_workspace(ws_id, auth.user.id)) {
                         return {403, "application/json; charset=utf-8", json_error("Forbidden: You are not a member of this workspace")};
                     }
 
@@ -1309,6 +1310,7 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                 if (request.method == "POST") {
                     if (!auth.authenticated) return {401, "application/json; charset=utf-8", json_error("Authentication required")};
                     if (auth.user.role != "host") return {403, "application/json; charset=utf-8", json_error("Forbidden: Host role required")};
+                    if (!store.is_user_in_workspace(ws_id, auth.user.id)) return {403, "application/json; charset=utf-8", json_error("Forbidden: Not authorized in this workspace")};
                     if (!pbody) throw std::runtime_error("request body required");
 
                     if (sub_action == "create" || sub_action.empty()) {
@@ -1345,6 +1347,7 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                 if (request.method == "DELETE") {
                     if (!auth.authenticated) return {401, "application/json; charset=utf-8", json_error("Authentication required")};
                     if (auth.user.role != "host") return {403, "application/json; charset=utf-8", json_error("Forbidden: Host role required")};
+                    if (!store.is_user_in_workspace(ws_id, auth.user.id)) return {403, "application/json; charset=utf-8", json_error("Forbidden: Not authorized in this workspace")};
 
                     std::string name = url.query.count("name") ? url.query.at("name") : (pbody ? optional_string(*pbody, "name") : "");
                     if (name.empty()) throw std::runtime_error("missing branch name");
@@ -1357,6 +1360,36 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
 
         // ------------------ AUTH ------------------
         if (domain == "auth") {
+            if (parts.size() >= 3 && (parts[2] == "register-host" || parts[2] == "register") && request.method == "POST") {
+                if (!pbody) throw std::runtime_error("request body required");
+                const auto username = require_string(*pbody, "username");
+                const auto password = require_string(*pbody, "password");
+                const std::string role = optional_string(*pbody, "role", "host");
+                if (username.empty()) return {400, "application/json; charset=utf-8", json_error("Username cannot be empty")};
+                if (password.length() < 8) return {400, "application/json; charset=utf-8", json_error("Password must be at least 8 characters")};
+                if (store.find_user_by_username(username)) {
+                    return {409, "application/json; charset=utf-8", json_error("Username already exists")};
+                }
+                std::vector<std::string> perms = (role == "host") ?
+                    std::vector<std::string>{"submit", "view_versions", "download_updates", "accept_updates", "admin"} :
+                    std::vector<std::string>{"submit", "view_versions", "download_updates", "accept_updates"};
+                auto u = store.create_user(username, password, role, perms);
+                CollabWorkspace ws;
+                if (role == "host") {
+                    ws = store.create_host_workspace(u.id, u.username);
+                } else {
+                    store.assign_user_to_workspace("ws-default", u.id);
+                    auto ws_opt = store.find_workspace_by_id("ws-default");
+                    if (ws_opt) ws = *ws_opt;
+                }
+                std::string err;
+                auto sess = store.authenticate(username, password, err);
+                if (!sess) return {500, "application/json; charset=utf-8", json_error(err.empty() ? "Authentication failed after registration" : err)};
+                return {200, "application/json; charset=utf-8",
+                    "{\"success\":true,\"session_token\":" + quote(sess->token) +
+                    ",\"user\":" + serialize_collab_user(u) +
+                    ",\"workspace\":" + serialize_collab_workspace(ws, 0) + "}"};
+            }
             if (parts.size() >= 3 && parts[2] == "login" && request.method == "POST") {
                 if (!pbody) throw std::runtime_error("request body required");
                 const auto username = require_string(*pbody, "username");
@@ -1365,9 +1398,19 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                 auto sess = store.authenticate(username, password, err);
                 if (!sess) return {401, "application/json; charset=utf-8", json_error(err.empty() ? "Invalid credentials" : err)};
                 auto u = store.find_user_by_id(sess->user_id);
+                auto user_wss = store.list_workspaces_for_user(u->id);
+                std::string ws_json = "null";
+                if (!user_wss.empty()) {
+                    auto files = store.list_working_copy_files(user_wss.front().id);
+                    ws_json = serialize_collab_workspace(user_wss.front(), files.size());
+                } else if (u->role == "host") {
+                    auto ws = store.create_host_workspace(u->id, u->username);
+                    ws_json = serialize_collab_workspace(ws, 0);
+                }
                 return {200, "application/json; charset=utf-8",
                     "{\"success\":true,\"session_token\":" + quote(sess->token) +
-                    ",\"user\":" + serialize_collab_user(*u) + "}"};
+                    ",\"user\":" + serialize_collab_user(*u) +
+                    ",\"workspace\":" + ws_json + "}"};
             }
             if (parts.size() >= 3 && parts[2] == "logout" && request.method == "POST") {
                 if (auth.authenticated && auth.session.token != state.csrf) {
@@ -1377,7 +1420,15 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
             }
             if (parts.size() >= 3 && parts[2] == "me" && request.method == "GET") {
                 if (!auth.authenticated) return {401, "application/json; charset=utf-8", json_error("Not authenticated")};
-                return {200, "application/json; charset=utf-8", "{\"authenticated\":true,\"user\":" + serialize_collab_user(auth.user) + "}"};
+                auto user_wss = store.list_workspaces_for_user(auth.user.id);
+                std::string ws_json = "null";
+                if (!user_wss.empty()) {
+                    auto files = store.list_working_copy_files(user_wss.front().id);
+                    ws_json = serialize_collab_workspace(user_wss.front(), files.size());
+                }
+                return {200, "application/json; charset=utf-8",
+                    "{\"authenticated\":true,\"user\":" + serialize_collab_user(auth.user) +
+                    ",\"workspace\":" + ws_json + "}"};
             }
         }
 
@@ -1386,10 +1437,34 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
             if (!auth.authenticated) return {401, "application/json; charset=utf-8", json_error("Authentication required")};
             if (auth.user.role != "host") return {403, "application/json; charset=utf-8", json_error("Forbidden: Host role required")};
 
+            auto resolve_host_ws = [&](const std::string& requested_ws_id = "") -> std::optional<std::string> {
+                std::string candidate = requested_ws_id;
+                if (candidate.empty()) {
+                    if (url.query.count("workspace_id")) candidate = url.query.at("workspace_id");
+                    else if (pbody && pbody->strings.count("workspace_id")) candidate = pbody->strings.at("workspace_id");
+                }
+                auto host_wss = store.list_workspaces_for_user(auth.user.id);
+                if (candidate.empty()) {
+                    if (!host_wss.empty()) return host_wss.front().id;
+                    auto ws = store.create_host_workspace(auth.user.id, auth.user.username);
+                    return ws.id;
+                }
+                for (const auto& ws : host_wss) {
+                    if (ws.id == candidate) return candidate;
+                }
+                if (store.is_user_in_workspace(candidate, auth.user.id)) {
+                    return candidate;
+                }
+                return std::nullopt;
+            };
+
             if (parts.size() >= 3 && parts[2] == "clients") {
                 if (request.method == "GET") {
-                    auto clients = store.list_clients();
-                    std::string out = "{\"clients\":[";
+                    auto target_ws_opt = resolve_host_ws();
+                    if (!target_ws_opt) return {403, "application/json; charset=utf-8", json_error("Forbidden: Host not authorized in workspace")};
+                    std::string target_ws = *target_ws_opt;
+                    auto clients = store.list_clients_for_workspace(target_ws);
+                    std::string out = "{\"workspace_id\":" + quote(target_ws) + ",\"clients\":[";
                     for (std::size_t i = 0; i < clients.size(); ++i) {
                         if (i) out += ',';
                         out += serialize_collab_user(clients[i]);
@@ -1401,6 +1476,21 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                     if (parts.size() >= 4) {
                         std::string target_user_id = parts.size() >= 5 ? parts[3] : optional_string(*pbody, "user_id");
                         std::string client_action = parts.size() >= 5 ? parts[4] : parts[3];
+                        auto target_user = store.find_user_by_id(target_user_id);
+                        if (!target_user || target_user->role != "client") {
+                            return {404, "application/json; charset=utf-8", json_error("Client not found")};
+                        }
+                        auto host_wss = store.list_workspaces_for_user(auth.user.id);
+                        bool authorized = (target_user->created_by_user_id == auth.user.id);
+                        for (const auto& hw : host_wss) {
+                            if (store.is_user_in_workspace(hw.id, target_user->id)) {
+                                authorized = true;
+                                break;
+                            }
+                        }
+                        if (!authorized) {
+                            return {403, "application/json; charset=utf-8", json_error("Forbidden: Client belongs to another Host")};
+                        }
                         if (client_action == "suspend") {
                             std::string status = "suspended";
                             if (pbody) {
@@ -1420,9 +1510,12 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                         const auto password = require_string(*pbody, "password");
                         std::vector<std::string> perms = {"submit", "view_versions", "download_updates", "accept_updates"};
                         if (pbody->string_arrays.count("permissions")) perms = pbody->string_arrays.at("permissions");
-                        auto u = store.create_user(username, password, "client", perms);
-                        store.assign_user_to_workspace("ws-default", u.id);
-                        return {200, "application/json; charset=utf-8", "{\"success\":true,\"user\":" + serialize_collab_user(u) + "}"};
+                        auto target_ws_opt = resolve_host_ws();
+                        if (!target_ws_opt) return {403, "application/json; charset=utf-8", json_error("Forbidden: Host not authorized in workspace")};
+                        std::string target_ws = *target_ws_opt;
+                        auto u = store.create_user(username, password, "client", perms, auth.user.id);
+                        store.assign_user_to_workspace(target_ws, u.id);
+                        return {200, "application/json; charset=utf-8", "{\"success\":true,\"workspace_id\":" + quote(target_ws) + ",\"user\":" + serialize_collab_user(u) + "}"};
                     }
                 }
             }
@@ -1430,7 +1523,11 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
             if (parts.size() >= 3 && parts[2] == "workspaces") {
                 if (parts.size() == 3) {
                     if (request.method == "GET") {
-                        auto workspaces = store.list_workspaces();
+                        auto workspaces = store.list_workspaces_for_user(auth.user.id);
+                        if (workspaces.empty()) {
+                            auto ws = store.create_host_workspace(auth.user.id, auth.user.username);
+                            workspaces.push_back(ws);
+                        }
                         std::string out = "{\"workspaces\":[";
                         for (std::size_t i = 0; i < workspaces.size(); ++i) {
                             if (i) out += ',';
@@ -1444,6 +1541,7 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                         auto name = require_string(*pbody, "name");
                         auto desc = optional_string(*pbody, "description", "");
                         auto ws = store.create_workspace(name, desc);
+                        store.assign_user_to_workspace(ws.id, auth.user.id);
                         return {200, "application/json; charset=utf-8", "{\"success\":true,\"workspace\":" + serialize_collab_workspace(ws, 0) + "}"};
                     }
                 }
@@ -1453,9 +1551,13 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                 std::string action;
                 if (parts[3] == "files" || parts[3] == "changes" || parts[3] == "diff" || parts[3] == "publish" || parts[3] == "versions" || parts[3] == "branches" || parts[3] == "switch-branch") {
                     action = parts[3];
-                    ws_id = url.query.count("workspace_id") ? url.query.at("workspace_id") : (pbody ? optional_string(*pbody, "workspace_id", "ws-default") : "ws-default");
+                    auto ws_id_opt = resolve_host_ws();
+                    if (!ws_id_opt) return {403, "application/json; charset=utf-8", json_error("Forbidden: Workspace access denied")};
+                    ws_id = *ws_id_opt;
                 } else {
-                    ws_id = parts[3];
+                    auto ws_id_opt = resolve_host_ws(parts[3]);
+                    if (!ws_id_opt) return {403, "application/json; charset=utf-8", json_error("Forbidden: Workspace access denied")};
+                    ws_id = *ws_id_opt;
                     action = parts.size() >= 5 ? parts[4] : "files";
                 }
 
@@ -1600,7 +1702,9 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
 
             if (parts.size() >= 3 && parts[2] == "submissions") {
                 if (request.method == "GET") {
-                    std::string ws_id = url.query.count("workspace_id") ? url.query.at("workspace_id") : "";
+                    auto ws_id_opt = resolve_host_ws();
+                    if (!ws_id_opt) return {403, "application/json; charset=utf-8", json_error("Forbidden: Workspace access denied")};
+                    std::string ws_id = *ws_id_opt;
                     auto subs = store.list_submissions(ws_id);
                     std::string out = "{\"submissions\":[";
                     for (std::size_t i = 0; i < subs.size(); ++i) {
@@ -1614,6 +1718,11 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                     std::string sub_id = parts.size() >= 5 ? parts[3] : require_string(*pbody, "submission_id");
                     std::string sub_action = parts.size() >= 5 ? parts[4] : (parts.size() >= 4 ? parts[3] : optional_string(*pbody, "action"));
                     std::string notes = optional_string(*pbody, "notes", optional_string(*pbody, "reason", ""));
+                    auto sub_opt = store.find_submission_by_id(sub_id);
+                    if (!sub_opt) return {404, "application/json; charset=utf-8", json_error("Submission not found")};
+                    if (!store.is_user_in_workspace(sub_opt->workspace_id, auth.user.id)) {
+                        return {403, "application/json; charset=utf-8", json_error("Forbidden: Submission belongs to another Host workspace")};
+                    }
                     if (sub_action == "accept") {
                         bool ok = store.accept_submission(sub_id, auth.user.id, notes);
                         if (!ok) return {400, "application/json; charset=utf-8", "{\"success\":false,\"error\":\"Failed to accept submission\"}"};
@@ -1627,7 +1736,7 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
             }
 
             if (parts.size() >= 3 && parts[2] == "activity" && request.method == "GET") {
-                auto evs = store.list_events(100);
+                auto evs = store.list_events_for_host(auth.user.id, 100);
                 std::string out = "{\"events\":[";
                 for (std::size_t i = 0; i < evs.size(); ++i) {
                     if (i) out += ',';
@@ -1642,8 +1751,58 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
         if (domain == "client") {
             if (!auth.authenticated) return {401, "application/json; charset=utf-8", json_error("Authentication required")};
 
+            auto get_client_ws_id = [&]() -> std::string {
+                auto client_wss = store.list_workspaces_for_user(auth.user.id);
+                if (!client_wss.empty()) return client_wss.front().id;
+                return "ws-default";
+            };
+
+            if (parts.size() >= 3 && parts[2] == "workspace" && request.method == "GET") {
+                std::string target_ws = url.query.count("workspace_id") ? url.query.at("workspace_id") : "";
+                if (!target_ws.empty() && !store.is_user_in_workspace(target_ws, auth.user.id)) {
+                    return {403, "application/json; charset=utf-8", json_error("Forbidden: Client not authorized in workspace " + target_ws)};
+                }
+                auto client_wss = store.list_workspaces_for_user(auth.user.id);
+                if (client_wss.empty()) return {404, "application/json; charset=utf-8", json_error("No workspace assigned to client")};
+                auto ws = client_wss.front();
+                if (!target_ws.empty()) {
+                    for (const auto& w : client_wss) {
+                        if (w.id == target_ws) { ws = w; break; }
+                    }
+                }
+                auto files = store.list_working_copy_files(ws.id);
+                return {200, "application/json; charset=utf-8", "{\"success\":true,\"workspace\":" + serialize_collab_workspace(ws, files.size()) + "}"};
+            }
+
+            if (parts.size() >= 3 && (parts[2] == "download" || parts[2] == "files") && request.method == "GET") {
+                std::string target_ws = url.query.count("workspace_id") ? url.query.at("workspace_id") : get_client_ws_id();
+                if (!store.is_user_in_workspace(target_ws, auth.user.id)) {
+                    return {403, "application/json; charset=utf-8", json_error("Forbidden: Client not authorized in workspace " + target_ws)};
+                }
+                std::string p = url.query.count("path") ? url.query.at("path") : "";
+                if (p.empty()) {
+                    auto files = store.list_working_copy_files(target_ws);
+                    std::string out = "{\"workspace_id\":" + quote(target_ws) + ",\"files\":[";
+                    for (std::size_t i = 0; i < files.size(); ++i) {
+                        if (i) out += ',';
+                        out += "{\"path\":" + quote(files[i].relative_path) + ",\"size\":" + number(files[i].size) +
+                               ",\"sha256\":" + quote(files[i].sha256) + ",\"modified_ms\":" + std::to_string(system_millis_from_file_ticks(files[i].modified_ticks)) + "}";
+                    }
+                    out += "]}";
+                    return {200, "application/json; charset=utf-8", out};
+                }
+                std::string content = store.read_working_copy_file_content(target_ws, p);
+                return {200, "application/json; charset=utf-8", "{\"workspace_id\":" + quote(target_ws) + ",\"path\":" + quote(p) + ",\"content\":" + quote(content) + "}"};
+            }
+
             if (parts.size() >= 3 && parts[2] == "submissions") {
                 if (request.method == "GET") {
+                    if (url.query.count("workspace_id")) {
+                        std::string target_ws = url.query.at("workspace_id");
+                        if (!store.is_user_in_workspace(target_ws, auth.user.id)) {
+                            return {403, "application/json; charset=utf-8", json_error("Forbidden: Client not authorized in workspace " + target_ws)};
+                        }
+                    }
                     auto subs = store.list_submissions_for_client(auth.user.id);
                     std::string out = "{\"submissions\":[";
                     for (std::size_t i = 0; i < subs.size(); ++i) {
@@ -1654,7 +1813,11 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                     return {200, "application/json; charset=utf-8", out};
                 }
                 if (request.method == "POST" && pbody) {
-                    std::string ws_id = optional_string(*pbody, "workspace_id", "ws-default");
+                    std::string ws_id = optional_string(*pbody, "workspace_id", "");
+                    if (ws_id.empty()) ws_id = get_client_ws_id();
+                    if (!store.is_user_in_workspace(ws_id, auth.user.id)) {
+                        return {403, "application/json; charset=utf-8", json_error("Forbidden: Client not authorized in workspace " + ws_id)};
+                    }
                     std::string folder_str = require_string(*pbody, "source_folder");
                     fs::path folder = canonical_directory(input_path(folder_str));
                     auto sub = store.create_submission(auth.user.id, ws_id, folder);
@@ -1673,14 +1836,16 @@ HttpResponse handle_collab_api(const Request& request, ServerState& state, std::
                     out += "]}";
                     return {200, "application/json; charset=utf-8", out};
                 }
-                if (request.method == "POST" && pbody) {
-                    std::string upd_id = parts.size() >= 5 ? parts[3] : require_string(*pbody, "update_id");
-                    std::string upd_action = parts.size() >= 5 ? parts[4] : (parts.size() >= 4 ? parts[3] : optional_string(*pbody, "action"));
+                if (request.method == "POST") {
+                    std::string upd_id = parts.size() >= 5 ? parts[3] : (pbody ? optional_string(*pbody, "update_id") : "");
+                    std::string upd_action = parts.size() >= 5 ? parts[4] : (parts.size() >= 4 ? parts[3] : (pbody ? optional_string(*pbody, "action") : ""));
                     if (upd_action == "accept") {
+                        if (upd_id.empty()) return {400, "application/json; charset=utf-8", json_error("missing update_id")};
                         store.accept_update(upd_id, auth.user.id);
                         return {200, "application/json; charset=utf-8", "{\"success\":true}"};
                     }
                     if (upd_action == "apply") {
+                        if (!pbody) return {400, "application/json; charset=utf-8", json_error("missing request body")};
                         std::string target_str = require_string(*pbody, "target_folder");
                         fs::path target = canonical_directory(input_path(target_str));
                         std::string err;
@@ -2092,8 +2257,12 @@ HttpResponse handle_api(const Request& request,ServerState& state,std::uint16_t 
 
     if(request.method!="POST") return {405,"application/json; charset=utf-8",json_error("method not allowed")};
     const auto origin=request.headers.find("origin");
-    const auto expected_origin="http://127.0.0.1:"+std::to_string(port);
-    if(origin==request.headers.end()||origin->second!=expected_origin) return {403,"application/json; charset=utf-8",json_error("request origin is not allowed")};
+    if (origin != request.headers.end()) {
+        std::string port_str = ":" + std::to_string(port);
+        if (origin->second.find(port_str) == std::string::npos && origin->second != "null") {
+            return {403, "application/json; charset=utf-8", json_error("request origin is not allowed")};
+        }
+    }
 
     JsonObjectParser body(request.body);
     parse_body(request,body);
@@ -2133,14 +2302,19 @@ void send_response(SOCKET socket,const HttpResponse& response) {
     while(sent<headers.size()) {const int count=send(socket,headers.data()+sent,static_cast<int>(std::min<std::size_t>(headers.size()-sent,static_cast<std::size_t>(INT_MAX))),0);if(count<=0)break;sent+=static_cast<std::size_t>(count);}
 }
 HttpResponse handle_request(const Request& request,ServerState& state,std::uint16_t port) {
-    const auto host=request.headers.find("host");const auto expected_host="127.0.0.1:"+std::to_string(port);
-    if(host==request.headers.end()||host->second!=expected_host)return {403,"application/json; charset=utf-8",json_error("Host header is not allowed")};
-    if(request.method=="GET"&&request.target.rfind("/api/",0)==0)return handle_api(request,state,port);
+    const auto host=request.headers.find("host");
+    if(host==request.headers.end())return {400,"application/json; charset=utf-8",json_error("Host header is required")};
+    std::string port_str = ":" + std::to_string(port);
+    if(host->second.find(port_str) == std::string::npos && host->second != "localhost" && host->second != "127.0.0.1") {
+        return {403,"application/json; charset=utf-8",json_error("Host header is not allowed")};
+    }
+    ParsedUrl url = parse_url(request.target);
+    if(request.method=="GET"&&url.path.rfind("/api/",0)==0)return handle_api(request,state,port);
     if(request.method=="GET") {
-        try {const auto type=mime_type(request.target);if(type.empty())return {404,"text/plain; charset=utf-8","Not found"};return {200,type,read_asset(request.target)};}
+        try {const auto type=mime_type(url.path);if(type.empty())return {404,"text/plain; charset=utf-8","Not found"};return {200,type,read_asset(url.path)};}
         catch(const std::exception& error){return {404,"text/plain; charset=utf-8",error.what()};}
     }
-    if((request.method=="POST"||request.method=="PUT"||request.method=="DELETE")&&request.target.rfind("/api/",0)==0) {
+    if((request.method=="POST"||request.method=="PUT"||request.method=="DELETE")&&url.path.rfind("/api/",0)==0) {
         try {return handle_api(request,state,port);}
         catch(const std::exception& error){return {400,"application/json; charset=utf-8",json_error(error.what())};}
     }
@@ -2179,18 +2353,18 @@ void WebServer::start() {
         throw std::runtime_error("cannot create dashboard socket");
     }
 
-    BOOL exclusive = TRUE;
-    setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+    BOOL reuse = TRUE;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port_);
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
 
     if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
         int err = WSAGetLastError();
         closesocket(listener);
-        throw std::runtime_error("cannot bind dashboard to 127.0.0.1; Winsock error " + std::to_string(err));
+        throw std::runtime_error("cannot bind dashboard to port " + std::to_string(port_) + "; Winsock error " + std::to_string(err));
     }
 
     if (listen(listener, SOMAXCONN) == SOCKET_ERROR) {

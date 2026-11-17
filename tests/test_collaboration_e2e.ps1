@@ -91,7 +91,7 @@ try {
 
     # Verify clients list
     $clientsList = Invoke-RestMethod -Uri "$base/api/host/clients" -Headers $hostHeaders
-    Assert ($clientsList.clients.Count -ge 2) "Host client list contains newly added client (plus seeded client)"
+    Assert ($clientsList.clients.Count -ge 1) "Host client list contains newly added client"
     $aliceInfo = $clientsList.clients | Where-Object { $_.id -eq $clientId }
     Assert ($aliceInfo.username -eq $aliceUser) "Alice client record confirmed in database"
 

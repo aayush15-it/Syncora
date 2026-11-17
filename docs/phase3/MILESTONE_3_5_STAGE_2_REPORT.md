@@ -159,3 +159,4 @@ Milestone 3.5 Stage 2 is complete. Stage 3 will implement:
 1. **Three-Way Merge Engine:** Common ancestor identification, base manifest computation, and non-conflicting change reconciliation.
 2. **Vector Clock & Causality Tracking:** Logical clocks on branches and commits for deterministic conflict detection.
 3. **Merge Conflict Resolution UI:** Interactive web dashboard view to review, compare, and resolve content collisions before merge finalization.
+

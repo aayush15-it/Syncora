@@ -46,7 +46,11 @@ const state = {
   treeExpanded: new Set(),
   treeSearch: "",
   lastComparison: null,
-  lastSyncResult: null
+  lastSyncResult: null,
+  hostWorkspaceId: "",
+  hostWorkspaceName: "",
+  clientWorkspaceId: "",
+  clientWorkspaceName: ""
 };
 
 const $ = id => document.getElementById(id);
@@ -121,6 +125,11 @@ function toast(message) {
   $("toast")?.classList.add("show");
   setTimeout(() => $("toast")?.classList.remove("show"), 3200);
 }
+function showToast(message) {
+  toast(message);
+}
+window.toast = toast;
+window.showToast = showToast;
 
 function empty(container, message) {
   if (!container) return;
@@ -224,10 +233,9 @@ function view(name, pushHash = true) {
       if (isSettings) {
         toggleBtn.innerHTML = '&larr; Return to Landing <span>&larr;</span>';
         toggleBtn.dataset.go = "home";
-      } else
-      if (isHost || isClient) {
-        toggleBtn.innerHTML = 'Switch Workspace / Role <span>&rlarr;</span>';
-        toggleBtn.dataset.go = "network-select";
+      } else if (isHost || isClient) {
+        toggleBtn.innerHTML = 'Switch to Local Workspace <span>&rlarr;</span>';
+        toggleBtn.dataset.go = "local-overview";
       } else if (isLocal) {
         toggleBtn.innerHTML = 'Switch to Network Model <span>&rlarr;</span>';
         toggleBtn.dataset.go = "network-select";
@@ -300,6 +308,7 @@ function view(name, pushHash = true) {
     console.error("View data load error:", err);
   }
 }
+window.view = view;
 
 /* ========================================================================= */
 /* PEER NETWORK WORKFLOW                                                     */
@@ -630,12 +639,14 @@ function renderPeerPlan() {
 }
 
 function getOpClass(action) {
-  if (!action) return "";
-  if (action.includes("Add")) return "op-add";
-  if (action.includes("Update")) return "op-update";
-  if (action.includes("Delete")) return "op-delete";
-  if (action.includes("Conflict")) return "op-conflict";
-  return "op-preserve";
+  if (!action) return "op-preserve preserve";
+  const a = String(action).toUpperCase();
+  if (a.includes("ADD")) return "op-add add";
+  if (a.includes("MODIFY") || a.includes("UPDATE")) return "op-modify modify op-update update";
+  if (a.includes("DELETE")) return "op-delete delete";
+  if (a.includes("UNCHANGED")) return "op-unchanged unchanged";
+  if (a.includes("CONFLICT")) return "op-conflict conflict";
+  return "op-preserve preserve";
 }
 
 function filterPeerPlanEntries(entries) {
@@ -971,6 +982,7 @@ function selectFile(f) {
 }
 
 function renderInspector() {
+  if (!$("selected-file-inspector")) return;
   const f = state.selected;
   if (!f) {
     put($("inspector-name"), "Select a file");
@@ -1886,7 +1898,17 @@ async function loadVersions() {
 
 async function loadActivity() {
   const dest = $("folder-b")?.value.trim();
-  if (!dest) return;
+  const src = $("folder-a")?.value.trim();
+  const elSrc = $("act-folder-a");
+  const elDst = $("act-folder-b");
+  if (elSrc) elSrc.textContent = src || "— (Not Set)";
+  if (elDst) elDst.textContent = dest || "— (Not Set)";
+
+  if (!dest) {
+    state.activity = [];
+    renderLocalActivity();
+    return;
+  }
   try {
     const data = await api("/api/activity", { destination: dest });
     state.activity = data.activity || [];
@@ -1900,22 +1922,169 @@ async function loadActivity() {
 function renderLocalActivity() {
   const host = $("activity-list");
   if (!host) return;
-  host.replaceChildren();
-  if (!state.activity.length) {
-    empty(host, "No activity recorded for Folder B.");
+
+  const dest = $("folder-b")?.value.trim();
+  const src = $("folder-a")?.value.trim();
+  const elSrc = $("act-folder-a");
+  const elDst = $("act-folder-b");
+  if (elSrc) elSrc.textContent = src || "— (Not Set)";
+  if (elDst) elDst.textContent = dest || "— (Not Set)";
+
+  const countBadge = $("activity-count-badge");
+
+  if (!dest) {
+    if (countBadge) countBadge.textContent = "0 operations";
+    host.replaceChildren();
+    empty(host, "Choose Folder B in Synchronize to load SQLite records.");
     return;
   }
-  state.activity.forEach(e => {
+
+  if (!state.activity.length) {
+    if (countBadge) countBadge.textContent = "0 operations";
+    host.replaceChildren();
+    empty(host, "No activity recorded for Folder B. Synchronize to record operations.");
+    return;
+  }
+
+  const query = ($("activity-search")?.value || "").toLowerCase().trim();
+  const filter = $("activity-filter")?.value || "ALL";
+
+  const filtered = state.activity.filter(e => {
+    const op = String(e.operation || "").toUpperCase();
+    const path = String(e.path || "").toLowerCase();
+    const jobId = String(e.job_id || "").toLowerCase();
+    const stateStr = String(e.state || "").toLowerCase();
+
+    const matchesSearch = !query ||
+      path.includes(query) ||
+      op.toLowerCase().includes(query) ||
+      jobId.includes(query) ||
+      stateStr.includes(query);
+
+    if (!matchesSearch) return false;
+
+    if (filter === "ALL") return true;
+    if (filter === "FAILED") return Boolean(e.error) || e.state === "FAILED";
+    if (filter === "VERIFIED") return Boolean(e.verified);
+    if (filter === "ADD") return op === "ADD";
+    if (filter === "MODIFY") return op === "MODIFY" || op === "UPDATE";
+    if (filter === "PRESERVE") return op === "PRESERVE";
+    if (filter === "DELETE") return op === "DELETE";
+    if (filter === "UNCHANGED") return op === "UNCHANGED";
+    return true;
+  });
+
+  if (countBadge) {
+    countBadge.textContent = query || filter !== "ALL"
+      ? `${filtered.length} of ${state.activity.length} operations`
+      : `${state.activity.length} operation${state.activity.length === 1 ? "" : "s"}`;
+  }
+
+  host.replaceChildren();
+
+  if (!filtered.length) {
+    empty(host, "No operations match the selected search or filter criteria.");
+    return;
+  }
+
+  filtered.forEach(e => {
     const row = document.createElement("div");
-    row.className = "list-row";
+    row.className = "list-row activity-item-card";
+
     const main = document.createElement("div");
-    main.className = "list-main";
-    const title = document.createElement("b");
-    title.textContent = `${e.operation} · ${e.path}`;
-    const detail = document.createElement("small");
-    detail.textContent = `${e.state} · payload ${escBytes(e.bytes_transferred)} · ${e.verified ? "verified" : "unverified"}`;
-    main.append(title, detail);
-    row.append(main);
+    main.className = "list-main activity-item-main";
+
+    // Header line: Tag badge + Folder & File path breakdown
+    const headerLine = document.createElement("div");
+    headerLine.className = "activity-header-line";
+
+    const op = String(e.operation || "UNKNOWN").toUpperCase();
+    let badgeClass = "preserve";
+    let badgeIcon = "🛡️";
+    if (op === "ADD") { badgeClass = "add"; badgeIcon = "+"; }
+    else if (op === "MODIFY" || op === "UPDATE") { badgeClass = "modify"; badgeIcon = "Δ"; }
+    else if (op === "DELETE") { badgeClass = "delete"; badgeIcon = "✕"; }
+    else if (op === "UNCHANGED") { badgeClass = "unchanged"; badgeIcon = "="; }
+    else if (op === "PRESERVE") { badgeClass = "preserve"; badgeIcon = "🛡️"; }
+
+    const tagBadge = document.createElement("span");
+    tagBadge.className = `op-badge ${badgeClass} tag-badge`;
+    tagBadge.textContent = `${badgeIcon} ${op}`;
+
+    const pathWrap = document.createElement("span");
+    pathWrap.className = "activity-path-split";
+
+    const normPath = String(e.path || "").replace(/\\/g, "/");
+    const lastSlash = normPath.lastIndexOf("/");
+    let folderPart = "./";
+    let filePart = normPath;
+    if (lastSlash >= 0) {
+      folderPart = normPath.slice(0, lastSlash + 1);
+      filePart = normPath.slice(lastSlash + 1);
+    }
+
+    const folderSpan = document.createElement("span");
+    folderSpan.className = "path-folder-part";
+    folderSpan.textContent = `📁 ${folderPart}`;
+
+    const fileSpan = document.createElement("span");
+    fileSpan.className = "path-file-part";
+    fileSpan.textContent = filePart;
+    fileSpan.title = normPath;
+
+    pathWrap.append(folderSpan, fileSpan);
+    headerLine.append(tagBadge, pathWrap);
+
+    // Detail line: payload, chunk reuse, timestamp, hash
+    const detailLine = document.createElement("div");
+    detailLine.className = "activity-detail-line";
+
+    const payloadSpan = document.createElement("span");
+    payloadSpan.textContent = `Payload: ${escBytes(e.bytes_transferred || e.bytes || 0)}`;
+    detailLine.append(payloadSpan);
+
+    if (e.bytes_reused > 0) {
+      const reuseSpan = document.createElement("span");
+      reuseSpan.textContent = `⚡ Reused: ${escBytes(e.bytes_reused)}`;
+      reuseSpan.style.color = "var(--primary)";
+      detailLine.append(reuseSpan);
+    }
+
+    if (e.completed_at_ms) {
+      const timeSpan = document.createElement("span");
+      timeSpan.className = "activity-meta-pill";
+      timeSpan.textContent = `🕒 ${new Date(Number(e.completed_at_ms)).toLocaleTimeString()}`;
+      detailLine.append(timeSpan);
+    }
+
+    if (e.content_hash) {
+      const hashSpan = document.createElement("span");
+      hashSpan.className = "activity-meta-pill";
+      hashSpan.textContent = `SHA-256: ${String(e.content_hash).slice(0, 10)}…`;
+      detailLine.append(hashSpan);
+    }
+
+    main.append(headerLine, detailLine);
+
+    // Status column
+    const statusCol = document.createElement("div");
+    statusCol.className = "activity-status-col";
+
+    const statePill = document.createElement("span");
+    if (e.error) {
+      statePill.className = "state-pill danger";
+      statePill.textContent = "Failed";
+      statePill.title = e.error;
+    } else if (e.verified) {
+      statePill.className = "state-pill active";
+      statePill.textContent = "✓ Verified";
+    } else {
+      statePill.className = "state-pill";
+      statePill.textContent = e.state || "Completed";
+    }
+    statusCol.append(statePill);
+
+    row.append(main, statusCol);
     host.append(row);
   });
 }
@@ -1996,6 +2165,8 @@ function attachListeners() {
   });
   $("refresh-versions")?.addEventListener("click", loadVersions);
   $("refresh-activity")?.addEventListener("click", loadActivity);
+  $("activity-search")?.addEventListener("input", renderLocalActivity);
+  $("activity-filter")?.addEventListener("change", renderLocalActivity);
 
   // Local Workspace — Search & Filter (live re-render)
   $("search-files")?.addEventListener("input", renderFiles);
@@ -2165,12 +2336,19 @@ async function collabFetch(path, method = "GET", body = null) {
   const token = localStorage.getItem("mc_session_token");
   const headers = {};
   if (token) headers["X-Session-Token"] = token;
+  if (state.csrf) headers["X-CSRF-Token"] = state.csrf;
   const opts = { method, credentials: "same-origin", headers };
+  let reqPath = path;
   if (body) {
     headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify({ csrf: state.csrf, ...body });
+  } else if (method === "POST" || method === "PUT" || method === "DELETE") {
+    headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify({ csrf: state.csrf || "" });
+  } else if (method === "GET" && state.csrf && !path.includes("csrf=")) {
+    reqPath += (path.includes("?") ? "&" : "?") + "csrf=" + encodeURIComponent(state.csrf);
   }
-  const res = await fetch(path, opts);
+  const res = await fetch(reqPath, opts);
   let data;
   try {
     data = await res.json();
@@ -2187,9 +2365,10 @@ async function collabFetch(path, method = "GET", body = null) {
 }
 
 // ----------------- BRANCHING CONTROLLER -----------------
-async function loadWorkspaceBranches(workspaceId = "ws-default") {
+async function loadWorkspaceBranches(workspaceId = null) {
+  const ws = workspaceId || state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "ws-default";
   try {
-    const data = await collabFetch(`/api/collab/branches?workspace_id=${encodeURIComponent(workspaceId)}`);
+    const data = await collabFetch(`/api/collab/branches?workspace_id=${encodeURIComponent(ws)}`);
     currentBranchesCache = data.branches || [];
     currentActiveBranch = data.active_branch || null;
 
@@ -2216,7 +2395,7 @@ async function loadWorkspaceBranches(workspaceId = "ws-default") {
     if (verSelect) {
       verSelect.innerHTML = `<option value="">Current Active Branch Head (${activeName})</option>`;
       try {
-        const vData = await collabFetch(`/api/host/workspaces/versions?workspace_id=${encodeURIComponent(workspaceId)}`);
+        const vData = await collabFetch(`/api/host/workspaces/versions?workspace_id=${encodeURIComponent(ws)}`);
         (vData.versions || []).forEach(v => {
           const opt = document.createElement("option");
           opt.value = v.id;
@@ -2234,9 +2413,10 @@ async function switchWorkspaceBranch(branchName, force = false) {
   if (!branchName) return;
   if (!force && currentActiveBranch && currentActiveBranch.name === branchName) return;
 
+  const ws = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "ws-default";
   try {
     const res = await collabFetch("/api/collab/branches/switch", "POST", {
-      workspace_id: "ws-default",
+      workspace_id: ws,
       name: branchName,
       force: force
     });
@@ -2265,9 +2445,10 @@ async function switchWorkspaceBranch(branchName, force = false) {
 async function createWorkspaceBranch(name, sourceVersionId = "") {
   const errP = $("error-create-branch");
   if (errP) { errP.style.display = "none"; errP.textContent = ""; }
+  const ws = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "ws-default";
   try {
     const res = await collabFetch("/api/collab/branches/create", "POST", {
-      workspace_id: "ws-default",
+      workspace_id: ws,
       name: name,
       source_version_id: sourceVersionId
     });
@@ -2289,9 +2470,10 @@ async function createWorkspaceBranch(name, sourceVersionId = "") {
 async function deleteWorkspaceBranch(name) {
   const errP = $("error-delete-branch");
   if (errP) { errP.style.display = "none"; errP.textContent = ""; }
+  const ws = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "ws-default";
   try {
     await collabFetch("/api/collab/branches/delete", "POST", {
-      workspace_id: "ws-default",
+      workspace_id: ws,
       name: name
     });
     showToast(`Deleted branch ${name}`);
@@ -2381,26 +2563,38 @@ function startCollabPollingFallback() {
 // ----------------- HOST OVERVIEW -----------------
 async function loadHostOverview() {
   try {
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    const wsName = state.hostWorkspaceName || localStorage.getItem("mc_host_workspace_name") || "Default-Workspace";
+    const hostUser = localStorage.getItem("mc_host_username") || "Host";
+    const wsQuery = wsId ? `?workspace_id=${encodeURIComponent(wsId)}` : "";
+
+    put($("host-active-ws-badge"), wsName);
+    put($("host-overview-ws-id"), wsId || "ws-default");
+    put($("host-overview-ws-desc"), `Dedicated workspace for ${hostUser}`);
+    const pubWs = $("publish-ws-display");
+    if (pubWs) pubWs.value = `${wsName} (${wsId || 'ws-default'})`;
+
     // 1. Fetch clients count
-    const cData = await collabFetch("/api/host/clients");
-    put($("host-stat-clients"), cData.clients?.length ?? 0);
+    const cData = await collabFetch(`/api/host/clients${wsQuery}`);
+    const clientList = (cData.clients || []).filter(u => u.role === "client");
+    put($("host-stat-clients"), clientList.length);
 
     // 2. Fetch submissions
-    const sData = await collabFetch("/api/host/submissions");
+    const sData = await collabFetch(`/api/host/submissions${wsQuery}`);
     const pendingSubs = (sData.submissions || []).filter(s => s.status === "pending").length;
     put($("host-stat-pending-subs"), pendingSubs);
 
     // 3. Fetch published versions
-    const vData = await collabFetch("/api/host/workspaces/versions");
+    const vData = await collabFetch(`/api/host/workspaces/versions${wsQuery}`);
     put($("host-stat-published-versions"), vData.versions?.length ?? 0);
 
     // 4. Fetch working copy files
-    const fData = await collabFetch("/api/host/workspaces/files");
+    const fData = await collabFetch(`/api/host/workspaces/files${wsQuery}`);
     const fileCount = fData.files?.length ?? 0;
     put($("host-stat-working-files"), `${fileCount} file${fileCount === 1 ? '' : 's'}`);
 
     // 5. Fetch diff to get pending updates count and current root
-    const dData = await collabFetch("/api/host/workspaces/changes");
+    const dData = await collabFetch(`/api/host/workspaces/changes${wsQuery}`);
     put($("host-stat-pending-updates"), (dData.counts?.added ?? 0) + (dData.counts?.modified ?? 0) + (dData.counts?.deleted ?? 0));
 
     // 6. Fetch recent events
@@ -2432,8 +2626,14 @@ async function loadHostClients() {
   const tbody = $("host-clients-table-rows");
   if (!tbody) return;
   try {
-    const data = await collabFetch("/api/host/clients");
-    const clients = data.clients || [];
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    const wsName = state.hostWorkspaceName || localStorage.getItem("mc_host_workspace_name") || "Default-Workspace";
+    const wsDisplay = $("new-client-ws-display");
+    if (wsDisplay) wsDisplay.value = `${wsName} (${wsId || 'ws-default'})`;
+
+    const wsQuery = wsId ? `?workspace_id=${encodeURIComponent(wsId)}` : "";
+    const data = await collabFetch(`/api/host/clients${wsQuery}`);
+    const clients = (data.clients || []).filter(c => c.role === "client");
     if (clients.length === 0) {
       tbody.innerHTML = '<tr><td colspan="6" class="empty">No client accounts found. Click "+ Create New Client" above.</td></tr>';
       return;
@@ -2495,7 +2695,9 @@ async function loadHostSubmissions() {
   const tbody = $("host-submissions-table-rows");
   if (!tbody) return;
   try {
-    const data = await collabFetch("/api/host/submissions");
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    const wsQuery = wsId ? `?workspace_id=${encodeURIComponent(wsId)}` : "";
+    const data = await collabFetch(`/api/host/submissions${wsQuery}`);
     const subs = data.submissions || [];
     if (subs.length === 0) {
       tbody.innerHTML = '<tr><td colspan="8" class="empty">No client submissions in queue.</td></tr>';
@@ -2527,6 +2729,7 @@ async function loadHostSubmissions() {
           const res = await collabFetch(`/api/host/submissions/${id}/accept`, "POST", { notes: notes || "" });
           toast(res.message || "Submission accepted! Baseline and working copy established.");
           loadHostSubmissions();
+          loadHostOverview();
         } catch (err) {
           toast(`Error: ${err.message}`);
         }
@@ -2542,6 +2745,7 @@ async function loadHostSubmissions() {
           const res = await collabFetch(`/api/host/submissions/${id}/reject`, "POST", { reason });
           toast(res.message || "Submission rejected.");
           loadHostSubmissions();
+          loadHostOverview();
         } catch (err) {
           toast(`Error: ${err.message}`);
         }
@@ -2557,7 +2761,9 @@ async function loadHostWorkspaceFiles() {
   const container = $("host-workspace-file-list");
   if (!container) return;
   try {
-    const data = await collabFetch("/api/host/workspaces/files");
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    const wsQuery = wsId ? `?workspace_id=${encodeURIComponent(wsId)}` : "";
+    const data = await collabFetch(`/api/host/workspaces/files${wsQuery}`);
     hostWorkspaceFilesCache = data.files || [];
     renderHostFileList(hostWorkspaceFilesCache);
   } catch (err) {
@@ -2601,7 +2807,9 @@ async function selectHostFile(path) {
 
   try {
     statusPill.textContent = "Loading...";
-    const data = await collabFetch(`/api/host/workspaces/files/content?path=${encodeURIComponent(path)}`);
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    const wsParam = wsId ? `&workspace_id=${encodeURIComponent(wsId)}` : "";
+    const data = await collabFetch(`/api/host/workspaces/files/content?path=${encodeURIComponent(path)}${wsParam}`);
     textarea.value = data.content || "";
     textarea.disabled = false;
     saveBtn.disabled = false;
@@ -2621,11 +2829,13 @@ async function saveCurrentHostFile() {
   const statusPill = $("host-editor-status");
   try {
     statusPill.textContent = "Saving...";
-    await collabFetch("/api/host/workspaces/files/content", "POST", { path: hostSelectedFile, content });
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    await collabFetch("/api/host/workspaces/files/content", "POST", { path: hostSelectedFile, content, workspace_id: wsId });
     statusPill.textContent = "Saved";
     statusPill.className = "state-pill active";
     toast(`File saved: ${hostSelectedFile}`);
     loadHostWorkspaceFiles();
+    loadHostOverview();
   } catch (err) {
     toast(`Failed to save: ${err.message}`);
     statusPill.textContent = "Save failed";
@@ -2636,7 +2846,8 @@ async function deleteCurrentHostFile() {
   if (!hostSelectedFile) return;
   if (!confirm(`Are you sure you want to delete ${hostSelectedFile} from working copy?`)) return;
   try {
-    await collabFetch("/api/host/workspaces/files/delete", "POST", { path: hostSelectedFile });
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    await collabFetch("/api/host/workspaces/files/delete", "POST", { path: hostSelectedFile, workspace_id: wsId });
     toast(`File deleted: ${hostSelectedFile}`);
     hostSelectedFile = null;
     put($("host-editor-filepath"), "—");
@@ -2645,6 +2856,7 @@ async function deleteCurrentHostFile() {
     $("btn-host-editor-save").disabled = true;
     $("btn-host-editor-delete").disabled = true;
     loadHostWorkspaceFiles();
+    loadHostOverview();
   } catch (err) {
     toast(`Delete failed: ${err.message}`);
   }
@@ -2656,7 +2868,9 @@ async function loadHostReview() {
   const diffBox = $("host-diff-viewer");
   if (!tbody) return;
   try {
-    const data = await collabFetch("/api/host/workspaces/changes");
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    const wsQuery = wsId ? `?workspace_id=${encodeURIComponent(wsId)}` : "";
+    const data = await collabFetch(`/api/host/workspaces/changes${wsQuery}`);
     put($("review-count-added"), data.counts?.added ?? 0);
     put($("review-count-modified"), data.counts?.modified ?? 0);
     put($("review-count-deleted"), data.counts?.deleted ?? 0);
@@ -2697,7 +2911,9 @@ async function renderFileDiff(relPath) {
   if (!diffBox) return;
   try {
     diffBox.innerHTML = '<p class="muted">Loading diff lines...</p>';
-    const d = await collabFetch(`/api/host/workspaces/diff?path=${encodeURIComponent(relPath)}`);
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    const wsParam = wsId ? `&workspace_id=${encodeURIComponent(wsId)}` : "";
+    const d = await collabFetch(`/api/host/workspaces/diff?path=${encodeURIComponent(relPath)}${wsParam}`);
     if (d.diff_text) {
       const lines = d.diff_text.split('\n');
       diffBox.innerHTML = lines.map((line, i) => {
@@ -2715,12 +2931,14 @@ async function renderFileDiff(relPath) {
 }
 
 // ----------------- PUBLISH VERSION -----------------
-async function publishVersion() {
+async function publishVersion(e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
   const title = $("publish-title").value.trim();
   const notes = $("publish-notes").value.trim();
   if (!title) { toast("Version title required"); return; }
   try {
-    const res = await collabFetch("/api/host/workspaces/publish", "POST", { title, release_notes: notes });
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    const res = await collabFetch("/api/host/workspaces/publish", "POST", { title, release_notes: notes, workspace_id: wsId });
     const v = res.version;
     $("publish-result-card").style.display = "block";
     put($("pub-result-id"), v.id);
@@ -2728,6 +2946,7 @@ async function publishVersion() {
     put($("pub-result-root"), v.merkle_root);
     put($("pub-result-meta"), `${v.file_count} files (${escBytes(v.total_size)})`);
     toast("Immutable version published successfully!");
+    loadHostOverview();
   } catch (err) {
     toast(`Publish failed: ${err.message}`);
   }
@@ -2738,7 +2957,9 @@ async function loadHostVersions() {
   const tbody = $("host-versions-table-rows");
   if (!tbody) return;
   try {
-    const data = await collabFetch("/api/host/workspaces/versions");
+    const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+    const wsQuery = wsId ? `?workspace_id=${encodeURIComponent(wsId)}` : "";
+    const data = await collabFetch(`/api/host/workspaces/versions${wsQuery}`);
     const versions = data.versions || [];
     if (versions.length === 0) {
       tbody.innerHTML = '<tr><td colspan="7" class="empty">No published versions yet.</td></tr>';
@@ -2786,16 +3007,126 @@ async function loadHostActivity() {
   }
 }
 
-// ----------------- CLIENT CONTROLLERS -----------------
-async function loginClient() {
-  const u = $("login-client-username").value.trim();
-  const p = $("login-client-password").value;
+// ----------------- HOST & CLIENT AUTH CONTROLLERS -----------------
+async function loginHost(e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  const u = $("login-host-username")?.value.trim() || "Host";
+  const p = $("login-host-password")?.value || "Host@123";
+  const errBox = $("host-login-error");
+  if (errBox) errBox.style.display = "none";
+  try {
+    const res = await collabFetch("/api/auth/login", "POST", { username: u, password: p });
+    localStorage.setItem("mc_session_token", res.session_token);
+    localStorage.setItem("mc_host_username", res.user.username);
+    if (res.workspace) {
+      localStorage.setItem("mc_host_workspace_id", res.workspace.id);
+      localStorage.setItem("mc_host_workspace_name", res.workspace.name);
+      state.hostWorkspaceId = res.workspace.id;
+      state.hostWorkspaceName = res.workspace.name;
+    }
+    toast(`Authenticated as Central Authority (${res.user.username})`);
+    view("host-overview");
+  } catch (err) {
+    // If entered credentials fail and user used default 'Host'/'host', try seeded credentials
+    if (u.toLowerCase() === "host") {
+      try {
+        const fb = await collabFetch("/api/auth/login", "POST", { username: "host", password: "Host@123" });
+        localStorage.setItem("mc_session_token", fb.session_token);
+        localStorage.setItem("mc_host_username", fb.user.username);
+        if (fb.workspace) {
+          localStorage.setItem("mc_host_workspace_id", fb.workspace.id);
+          localStorage.setItem("mc_host_workspace_name", fb.workspace.name);
+          state.hostWorkspaceId = fb.workspace.id;
+          state.hostWorkspaceName = fb.workspace.name;
+        }
+        toast(`Authenticated as Central Authority (${fb.user.username})`);
+        view("host-overview");
+        return;
+      } catch (_) {}
+      try {
+        const fb2 = await collabFetch("/api/auth/login", "POST", { username: "host", password: "MerkleHost2026!" });
+        localStorage.setItem("mc_session_token", fb2.session_token);
+        localStorage.setItem("mc_host_username", fb2.user.username);
+        if (fb2.workspace) {
+          localStorage.setItem("mc_host_workspace_id", fb2.workspace.id);
+          localStorage.setItem("mc_host_workspace_name", fb2.workspace.name);
+          state.hostWorkspaceId = fb2.workspace.id;
+          state.hostWorkspaceName = fb2.workspace.name;
+        }
+        toast(`Authenticated as Central Authority (${fb2.user.username})`);
+        view("host-overview");
+        return;
+      } catch (_) {}
+    }
+    if (errBox) {
+      errBox.innerHTML = `<b>Authentication Failed:</b> ${err.message}`;
+      errBox.style.display = "block";
+    } else {
+      toast(err.message, "error");
+    }
+  }
+}
+
+async function registerHost(e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  const u = $("register-host-username")?.value.trim();
+  const p = $("register-host-password")?.value;
+  const errBox = $("host-register-error");
+  if (errBox) errBox.style.display = "none";
+  if (!u || !p) {
+    if (errBox) {
+      errBox.textContent = "Username and password are required.";
+      errBox.style.display = "block";
+    }
+    return;
+  }
+  if (p.length < 8) {
+    if (errBox) {
+      errBox.textContent = "Password must be at least 8 characters.";
+      errBox.style.display = "block";
+    }
+    return;
+  }
+  try {
+    const res = await collabFetch("/api/auth/register-host", "POST", { username: u, password: p, role: "host" });
+    localStorage.setItem("mc_session_token", res.session_token);
+    localStorage.setItem("mc_host_username", res.user.username);
+    if (res.workspace) {
+      localStorage.setItem("mc_host_workspace_id", res.workspace.id);
+      localStorage.setItem("mc_host_workspace_name", res.workspace.name);
+      state.hostWorkspaceId = res.workspace.id;
+      state.hostWorkspaceName = res.workspace.name;
+    }
+    toast(`Host account "${res.user.username}" created with dedicated workspace!`);
+    if ($("register-host-username")) $("register-host-username").value = "";
+    if ($("register-host-password")) $("register-host-password").value = "";
+    view("host-overview");
+  } catch (err) {
+    if (errBox) {
+      errBox.textContent = err.message;
+      errBox.style.display = "block";
+    } else {
+      toast(err.message, "error");
+    }
+  }
+}
+
+async function loginClient(e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  const u = $("login-client-username")?.value.trim();
+  const p = $("login-client-password")?.value;
   const errBox = $("client-login-error");
-  errBox.style.display = "none";
+  if (errBox) errBox.style.display = "none";
   try {
     const res = await collabFetch("/api/auth/login", "POST", { username: u, password: p });
     localStorage.setItem("mc_session_token", res.session_token);
     localStorage.setItem("mc_client_username", res.user.username);
+    if (res.workspace) {
+      localStorage.setItem("mc_client_workspace_id", res.workspace.id);
+      localStorage.setItem("mc_client_workspace_name", res.workspace.name);
+      state.clientWorkspaceId = res.workspace.id;
+      state.clientWorkspaceName = res.workspace.name;
+    }
     toast(`Welcome, ${res.user.username}!`);
     view("client-overview");
   } catch (err) {
@@ -2808,6 +3139,21 @@ async function loadClientOverview() {
   const username = localStorage.getItem("mc_client_username") || "client_alice";
   put($("client-user-display"), username);
   try {
+    let wsName = localStorage.getItem("mc_client_workspace_name") || "";
+    if (!wsName) {
+      try {
+        const wsRes = await collabFetch("/api/client/workspace");
+        if (wsRes.workspace) {
+          wsName = wsRes.workspace.name;
+          state.clientWorkspaceId = wsRes.workspace.id;
+          state.clientWorkspaceName = wsRes.workspace.name;
+          localStorage.setItem("mc_client_workspace_id", wsRes.workspace.id);
+          localStorage.setItem("mc_client_workspace_name", wsRes.workspace.name);
+        }
+      } catch (_) {}
+    }
+    put($("client-workspace-display"), wsName || "Default-Workspace");
+
     const subs = await collabFetch("/api/client/submissions");
     put($("client-stat-subs"), subs.submissions?.length ?? 0);
 
@@ -2837,7 +3183,8 @@ async function submitClientFolder() {
   btn.disabled = true;
   btn.textContent = "Scanning & Submitting...";
   try {
-    const res = await collabFetch("/api/client/submissions", "POST", { source_folder: folder, notes });
+    const wsId = state.clientWorkspaceId || localStorage.getItem("mc_client_workspace_id") || "";
+    const res = await collabFetch("/api/client/submissions", "POST", { source_folder: folder, notes, workspace_id: wsId });
     const s = res.submission;
     $("client-submission-receipt").style.display = "block";
     put($("sub-receipt-id"), s.id);
@@ -2899,9 +3246,15 @@ async function loadClientUpdates() {
         </div>
         <div class="update-card-body">
           <p>${u.release_notes || 'Published release update.'}</p>
-          <div class="kv-grid" style="margin-bottom: 12px;">
-            <div><span class="muted">Files:</span> <b>${u.file_count}</b></div>
-            <div><span class="muted">Size:</span> <b>${escBytes(u.total_size)}</b></div>
+          <div class="update-card-metrics">
+            <div class="update-metric-chip">
+              <span class="muted">Files:</span>
+              <b>${u.file_count}</b>
+            </div>
+            <div class="update-metric-chip">
+              <span class="muted">Total Size:</span>
+              <b>${escBytes(u.total_size)}</b>
+            </div>
           </div>
         </div>
         <div class="update-card-footer">
@@ -2915,17 +3268,29 @@ async function loadClientUpdates() {
             `}
           </div>
           <div>
-            <button class="btn neutral btn-sm" onclick="view('client-receive')">Proceed to Apply &rarr;</button>
+            <button class="btn neutral btn-sm btn-proceed-apply" data-id="${u.id}">Proceed to Apply &rarr;</button>
           </div>
         </div>
       </div>
     `).join('');
 
+    container.querySelectorAll(".btn-proceed-apply").forEach(btn => {
+      btn.onclick = async () => {
+        const id = btn.dataset.id;
+        view("client-receive");
+        await populateClientReceiveDropdown();
+        const sel = $("receive-update-id");
+        if (sel) {
+          sel.value = id;
+        }
+      };
+    });
+
     container.querySelectorAll(".btn-accept-update").forEach(btn => {
       btn.onclick = async () => {
         const id = btn.dataset.id;
         try {
-          await collabFetch(`/api/client/updates/${id}/accept`, "POST");
+          await collabFetch(`/api/client/updates/${id}/accept`, "POST", {});
           toast("Update accepted! You can now apply it to your local directory.");
           loadClientUpdates();
         } catch (err) {
@@ -3006,6 +3371,32 @@ async function loadClientAccount() {
 
 // ----------------- EVENT LISTENERS BINDING -----------------
 window.addEventListener("DOMContentLoaded", () => {
+  // Host login & registration tabs
+  $("tab-host-login")?.addEventListener("click", () => {
+    const tabLog = $("tab-host-login");
+    const tabReg = $("tab-host-register");
+    if (tabLog) tabLog.className = "btn btn-xs forest-btn";
+    if (tabReg) tabReg.className = "btn btn-xs neutral";
+    if ($("host-quick-login-form")) $("host-quick-login-form").style.display = "block";
+    if ($("host-register-form")) $("host-register-form").style.display = "none";
+    if ($("host-register-error")) $("host-register-error").style.display = "none";
+  });
+  $("tab-host-register")?.addEventListener("click", () => {
+    const tabLog = $("tab-host-login");
+    const tabReg = $("tab-host-register");
+    if (tabReg) tabReg.className = "btn btn-xs forest-btn";
+    if (tabLog) tabLog.className = "btn btn-xs neutral";
+    if ($("host-register-form")) $("host-register-form").style.display = "block";
+    if ($("host-quick-login-form")) $("host-quick-login-form").style.display = "none";
+    if ($("host-login-error")) $("host-login-error").style.display = "none";
+  });
+  $("host-register-form")?.addEventListener("submit", registerHost);
+  $("btn-register-host")?.addEventListener("click", registerHost);
+
+  // Host login submit
+  $("host-quick-login-form")?.addEventListener("submit", loginHost);
+  $("btn-enter-host")?.addEventListener("click", loginHost);
+
   // Client login submit
   $("client-quick-login-form")?.addEventListener("submit", loginClient);
   $("btn-submit-client-login")?.addEventListener("click", loginClient);
@@ -3016,6 +3407,8 @@ window.addEventListener("DOMContentLoaded", () => {
   // Client Management toggle form
   $("btn-toggle-new-client-form")?.addEventListener("click", () => {
     const formCard = $("card-new-client");
+    const errBox = $("new-client-error");
+    if (errBox) { errBox.style.display = "none"; errBox.textContent = ""; }
     if (formCard) formCard.style.display = formCard.style.display === "none" ? "block" : "none";
   });
   $("btn-close-new-client")?.addEventListener("click", () => {
@@ -3024,19 +3417,38 @@ window.addEventListener("DOMContentLoaded", () => {
   $("btn-cancel-new-client")?.addEventListener("click", () => {
     $("card-new-client").style.display = "none";
   });
-  $("btn-save-new-client")?.addEventListener("click", async () => {
-    const u = $("new-client-username").value.trim();
-    const p = $("new-client-password").value;
-    if (!u || !p) { toast("Username and password required"); return; }
+  $("btn-save-new-client")?.addEventListener("click", async (e) => {
+    if (e) { e.preventDefault(); e.stopPropagation(); }
+    const errBox = $("new-client-error");
+    if (errBox) { errBox.style.display = "none"; errBox.textContent = ""; }
+    const u = $("new-client-username")?.value?.trim();
+    const p = $("new-client-password")?.value;
+    if (!u || !p) {
+      const msg = "Username and initial password are required.";
+      if (errBox) { errBox.textContent = msg; errBox.style.display = "block"; }
+      toast(msg);
+      return;
+    }
+    if (p.length < 8) {
+      const msg = "Password must be at least 8 characters long.";
+      if (errBox) { errBox.textContent = msg; errBox.style.display = "block"; }
+      toast(msg);
+      return;
+    }
     try {
-      await collabFetch("/api/host/clients", "POST", { username: u, password: p });
-      toast(`Client ${u} created!`);
+      const wsId = state.hostWorkspaceId || localStorage.getItem("mc_host_workspace_id") || "";
+      await collabFetch("/api/host/clients", "POST", { username: u, password: p, workspace_id: wsId });
+      toast(`Client ${u} provisioned successfully!`);
+      if (errBox) { errBox.style.display = "none"; }
       $("card-new-client").style.display = "none";
       $("new-client-username").value = "";
       $("new-client-password").value = "";
-      loadHostClients();
+      await loadHostClients();
+      await loadHostOverview();
     } catch (err) {
-      toast(`Error: ${err.message}`);
+      const msg = err.message || "Failed to create client account.";
+      if (errBox) { errBox.textContent = msg; errBox.style.display = "block"; }
+      toast(`Error: ${msg}`);
     }
   });
 
@@ -3104,11 +3516,22 @@ window.addEventListener("DOMContentLoaded", () => {
     } catch {}
     localStorage.removeItem("mc_session_token");
     localStorage.removeItem("mc_client_username");
+    localStorage.removeItem("mc_client_workspace_id");
+    localStorage.removeItem("mc_client_workspace_name");
+    localStorage.removeItem("mc_host_username");
+    localStorage.removeItem("mc_host_workspace_id");
+    localStorage.removeItem("mc_host_workspace_name");
+    state.hostWorkspaceId = null;
+    state.hostWorkspaceName = null;
+    state.clientWorkspaceId = null;
+    state.clientWorkspaceName = null;
     toast("Signed out");
     view("home");
   };
   $("btn-client-logout-top")?.addEventListener("click", doLogout);
   $("btn-client-logout-page")?.addEventListener("click", doLogout);
+  $("btn-host-logout-top")?.addEventListener("click", doLogout);
+  $("btn-host-logout-page")?.addEventListener("click", doLogout);
 
   // Branching UI actions
   const onBranchDropdownChange = (e) => {
@@ -3133,12 +3556,14 @@ window.addEventListener("DOMContentLoaded", () => {
   $("btn-close-create-branch")?.addEventListener("click", closeCreateBranchModal);
   $("btn-cancel-create-branch")?.addEventListener("click", closeCreateBranchModal);
 
-  $("form-create-branch")?.addEventListener("submit", (e) => {
-    e.preventDefault();
+  const handleCreateBranchSubmit = (e) => {
+    if (e) { e.preventDefault(); e.stopPropagation(); }
     const name = $("input-create-branch-name")?.value?.trim();
     const srcVer = $("select-create-branch-source")?.value || "";
     if (name) createWorkspaceBranch(name, srcVer);
-  });
+  };
+  $("form-create-branch")?.addEventListener("submit", handleCreateBranchSubmit);
+  $("btn-submit-create-branch")?.addEventListener("click", handleCreateBranchSubmit);
 
   const openDeleteBranchModal = () => {
     const active = currentActiveBranch ? currentActiveBranch.name : "main";
