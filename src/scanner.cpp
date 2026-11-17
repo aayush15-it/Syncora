@@ -75,10 +75,8 @@ bool is_reparse_point_or_symlink(const fs::path& path) {
     return (!ec && fs::is_symlink(status));
 }
 
-bool is_path_within_boundary(const fs::path& base, const fs::path& target) {
+static bool is_canon_path_within_boundary(const fs::path& canon_base, const fs::path& target) {
     std::error_code ec;
-    auto canon_base = fs::weakly_canonical(base, ec);
-    if (ec) return false;
     auto canon_target = fs::weakly_canonical(target, ec);
     if (ec) return false;
 
@@ -109,6 +107,13 @@ bool is_path_within_boundary(const fs::path& base, const fs::path& target) {
     return true;
 }
 
+bool is_path_within_boundary(const fs::path& base, const fs::path& target) {
+    std::error_code ec;
+    auto canon_base = fs::weakly_canonical(base, ec);
+    if (ec) return false;
+    return is_canon_path_within_boundary(canon_base, target);
+}
+
 FileManifest scan_folder(const fs::path& input) {
     FileManifest manifest; std::error_code ec; auto root=fs::weakly_canonical(input,ec);
     if(ec || !fs::is_directory(root,ec) || ec) { manifest.complete=false; manifest.warnings.push_back("Folder is missing or inaccessible: "+input.string()); return manifest; }
@@ -120,7 +125,7 @@ FileManifest scan_folder(const fs::path& input) {
         auto p=it->path(); auto status=it->symlink_status(ec);
         if(ec){manifest.complete=false;manifest.warnings.push_back(p.string()+": "+ec.message());ec.clear();continue;}
         if(fs::is_symlink(status) || is_reparse_point_or_symlink(p)){ it.disable_recursion_pending(); continue; }
-        if(!is_path_within_boundary(root, p)){
+        if(!is_canon_path_within_boundary(root, p)){
             manifest.complete=false;
             manifest.warnings.push_back("Path escapes root boundary: "+p.string());
             it.disable_recursion_pending();
@@ -131,6 +136,16 @@ FileManifest scan_folder(const fs::path& input) {
         auto app_path=rel;std::transform(app_path.begin(),app_path.end(),app_path.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
         if(app_path==".merklechain" || app_path.rfind(".merklechain/",0)==0){if(it->is_directory(ec))it.disable_recursion_pending();continue;}
         if(app_path==".syncora_op_sentinel" || app_path.rfind(".syncora_op_sentinel/",0)==0){if(it->is_directory(ec))it.disable_recursion_pending();continue;}
+
+        // Auto-ignore transient system, lock, and OS cache files that cause sharing violations
+        std::string filename = p.filename().u8string();
+        std::string lower_fn = filename;
+        std::transform(lower_fn.begin(), lower_fn.end(), lower_fn.begin(), [](unsigned char c){return static_cast<char>(std::tolower(c));});
+        if (lower_fn == "thumbs.db" || lower_fn == "desktop.ini" || lower_fn == ".ds_store" ||
+            lower_fn.rfind(".lock") != std::string::npos || lower_fn.rfind(".guard") != std::string::npos) {
+            continue;
+        }
+
         if(!fs::is_regular_file(status)) continue;
         try {
             FileMetadata f; f.relative_path=rel; f.size=it->file_size(ec); if(ec)throw std::runtime_error(ec.message());

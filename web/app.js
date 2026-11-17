@@ -73,27 +73,39 @@ function escBytes(val) {
   return `${n.toFixed(n >= 10 ? 1 : 2)} ${units[i]}`;
 }
 
-async function api(path, body) {
-  const opts = body
-    ? {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ csrf: state.csrf, ...body })
-      }
-    : { credentials: "same-origin" };
-
-  const response = await fetch(path, opts);
-  let data;
+async function api(path, body, timeoutMs = 30000) {
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
-    data = await response.json();
-  } catch {
-    throw new Error(`HTTP ${response.status}: invalid server response`);
+    const opts = body
+      ? {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ csrf: state.csrf, ...body }),
+          signal: controller ? controller.signal : undefined
+        }
+      : { credentials: "same-origin", signal: controller ? controller.signal : undefined };
+
+    const response = await fetch(path, opts);
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+      throw new Error(`HTTP ${response.status}: invalid server response`);
+    }
+    if (!response.ok || data.error) {
+      throw new Error(data.error || `HTTP ${response.status}`);
+    }
+    return data;
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error("Scan request timed out. The folder may be too large or contains locked system files.");
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  if (!response.ok || data.error) {
-    throw new Error(data.error || `HTTP ${response.status}`);
-  }
-  return data;
 }
 
 
@@ -1757,7 +1769,13 @@ async function compare() {
     $("step-verify")?.classList.remove("complete");
     toast("Comparison complete · review the exact plan");
   } catch (e) {
-    put($("folder-error"), e.message);
+    let msg = e.message || "Failed to compare folders.";
+    if (msg.includes("timed out")) {
+      msg = "Scan timed out: The selected folder is too large or contains locked system files. Please choose a project folder.";
+    } else if (msg.includes("scan incomplete")) {
+      msg = "Scan incomplete: One of the selected folders contains locked or inaccessible system files. Please choose a project folder.";
+    }
+    put($("folder-error"), msg);
     $("comparison-section").classList.add("hidden");
     ["step-compare", "step-review", "step-apply", "step-verify"].forEach(id => $(id)?.classList.remove("complete"));
   } finally {
