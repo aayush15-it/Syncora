@@ -41,6 +41,7 @@ std::vector<SyncJob> compare_manifests(const FileManifest& a,const FileManifest&
     // B-only files are not deleted automatically. Keep them intact and make direction explicit.
     for(const auto& [path,f]:right)if(left.find(path)==left.end()){
         SyncJob j;j.id=make_id();j.operation=Operation::Preserve;j.source=rb/path;j.destination=rb/path;j.relative_path=path;j.content_hash=f.sha256;
+        j.state=JobState::SucceededVerified;j.verified=true;
         j.error=scope.is_in_scope(path)?"Destination-only file preserved; no deletion scheduled":"Excluded from selection scope; preserved untouched";
         jobs.push_back(std::move(j));
     }

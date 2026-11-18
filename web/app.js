@@ -1982,8 +1982,8 @@ function renderLocalActivity() {
     if (!matchesSearch) return false;
 
     if (filter === "ALL") return true;
-    if (filter === "FAILED") return Boolean(e.error) || e.state === "FAILED";
-    if (filter === "VERIFIED") return Boolean(e.verified);
+    if (filter === "FAILED") return op !== "PRESERVE" && op !== "UNCHANGED" && (Boolean(e.error) || e.state === "FAILED");
+    if (filter === "VERIFIED") return Boolean(e.verified) || op === "PRESERVE" || op === "UNCHANGED";
     if (filter === "ADD") return op === "ADD";
     if (filter === "MODIFY") return op === "MODIFY" || op === "UPDATE";
     if (filter === "PRESERVE") return op === "PRESERVE";
@@ -2089,7 +2089,16 @@ function renderLocalActivity() {
     statusCol.className = "activity-status-col";
 
     const statePill = document.createElement("span");
-    if (e.error) {
+    const opUpper = String(e.operation || "UNKNOWN").toUpperCase();
+    if (opUpper === "PRESERVE") {
+      statePill.className = "state-pill active";
+      statePill.textContent = "✓ Preserved";
+      statePill.title = e.error || "Destination-only file preserved untouched";
+    } else if (opUpper === "UNCHANGED") {
+      statePill.className = "state-pill";
+      statePill.textContent = "Unchanged";
+      statePill.title = "File already identical between source and destination";
+    } else if (e.error) {
       statePill.className = "state-pill danger";
       statePill.textContent = "Failed";
       statePill.title = e.error;
